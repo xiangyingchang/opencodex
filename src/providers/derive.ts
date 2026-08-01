@@ -14,8 +14,9 @@ export interface DerivedKeyLoginProvider {
   defaultModel?: string;
   contextWindow?: number;
   modelContextWindows?: Record<string, number>;
-  modelInputModalities?: Record<string, string[]>;
-  modelMaxInputTokens?: Record<string, number>;
+ modelInputModalities?: Record<string, string[]>;
+  modelDisplayNames?: Record<string, string>;
+ modelMaxInputTokens?: Record<string, number>;
   defaultMaxOutputTokens?: number;
   modelMaxOutputTokens?: Record<string, number>;
   reasoningEfforts?: string[];
@@ -128,8 +129,9 @@ export function providerConfigSeed(entry: ProviderRegistryEntry): OcxProviderCon
     ...(entry.liveModels !== undefined ? { liveModels: entry.liveModels } : {}),
     ...(entry.contextWindow !== undefined ? { contextWindow: entry.contextWindow } : {}),
     ...(entry.modelContextWindows ? { modelContextWindows: { ...entry.modelContextWindows } } : {}),
-    ...(entry.modelInputModalities ? { modelInputModalities: cloneRecordOfArrays(entry.modelInputModalities) } : {}),
-    ...(entry.modelMaxInputTokens ? { modelMaxInputTokens: { ...entry.modelMaxInputTokens } } : {}),
+   ...(entry.modelInputModalities ? { modelInputModalities: cloneRecordOfArrays(entry.modelInputModalities) } : {}),
+    ...(entry.modelDisplayNames ? { modelDisplayNames: { ...entry.modelDisplayNames } } : {}),
+   ...(entry.modelMaxInputTokens ? { modelMaxInputTokens: { ...entry.modelMaxInputTokens } } : {}),
     ...(entry.defaultMaxOutputTokens !== undefined ? { defaultMaxOutputTokens: entry.defaultMaxOutputTokens } : {}),
     ...(entry.modelMaxOutputTokens ? { modelMaxOutputTokens: { ...entry.modelMaxOutputTokens } } : {}),
     ...(entry.reasoningEfforts ? { reasoningEfforts: [...entry.reasoningEfforts] } : {}),
@@ -177,8 +179,9 @@ export function deriveKeyLoginMap(): Record<string, DerivedKeyLoginProvider> {
       ...(entry.defaultModel ? { defaultModel: entry.defaultModel } : {}),
       ...(entry.contextWindow !== undefined ? { contextWindow: entry.contextWindow } : {}),
       ...(entry.modelContextWindows ? { modelContextWindows: { ...entry.modelContextWindows } } : {}),
-      ...(entry.modelInputModalities ? { modelInputModalities: cloneRecordOfArrays(entry.modelInputModalities) } : {}),
-      ...(entry.modelMaxInputTokens ? { modelMaxInputTokens: { ...entry.modelMaxInputTokens } } : {}),
+     ...(entry.modelInputModalities ? { modelInputModalities: cloneRecordOfArrays(entry.modelInputModalities) } : {}),
+      ...(entry.modelDisplayNames ? { modelDisplayNames: { ...entry.modelDisplayNames } } : {}),
+     ...(entry.modelMaxInputTokens ? { modelMaxInputTokens: { ...entry.modelMaxInputTokens } } : {}),
       ...(entry.defaultMaxOutputTokens !== undefined ? { defaultMaxOutputTokens: entry.defaultMaxOutputTokens } : {}),
       ...(entry.modelMaxOutputTokens ? { modelMaxOutputTokens: { ...entry.modelMaxOutputTokens } } : {}),
       ...(entry.reasoningEfforts ? { reasoningEfforts: [...entry.reasoningEfforts] } : {}),
@@ -252,8 +255,9 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
   if (prov.liveModels === undefined && seed.liveModels !== undefined) prov.liveModels = seed.liveModels;
   if (prov.contextWindow === undefined && seed.contextWindow !== undefined) prov.contextWindow = seed.contextWindow;
   if (!prov.modelContextWindows && seed.modelContextWindows) prov.modelContextWindows = { ...seed.modelContextWindows };
-  if (seed.modelInputModalities) prov.modelInputModalities = fillRecordOfArrays(seed.modelInputModalities, prov.modelInputModalities);
-  if (prov.defaultMaxOutputTokens === undefined && seed.defaultMaxOutputTokens !== undefined) prov.defaultMaxOutputTokens = seed.defaultMaxOutputTokens;
+ if (seed.modelInputModalities) prov.modelInputModalities = fillRecordOfArrays(seed.modelInputModalities, prov.modelInputModalities);
+  if (!prov.modelDisplayNames && seed.modelDisplayNames) prov.modelDisplayNames = { ...seed.modelDisplayNames };
+ if (prov.defaultMaxOutputTokens === undefined && seed.defaultMaxOutputTokens !== undefined) prov.defaultMaxOutputTokens = seed.defaultMaxOutputTokens;
   if (!prov.modelMaxOutputTokens && seed.modelMaxOutputTokens) prov.modelMaxOutputTokens = { ...seed.modelMaxOutputTokens };
   if (!prov.reasoningEfforts && seed.reasoningEfforts) prov.reasoningEfforts = [...seed.reasoningEfforts];
   if (!prov.modelReasoningEfforts && seed.modelReasoningEfforts) prov.modelReasoningEfforts = cloneRecordOfArrays(seed.modelReasoningEfforts);

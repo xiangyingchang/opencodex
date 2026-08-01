@@ -562,8 +562,12 @@ export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, 
   }
   const reasoningEfforts = configuredReasoningEfforts(prov, model.id);
   const defaultReasoningEffort = modelRecordValue(prov.modelDefaultReasoningEfforts, model.id) ?? model.defaultReasoningEffort;
-  const supportsReasoningSummaries = configuredReasoningSummarySupport(prov, model.id);
-  const hinted = {
+ const supportsReasoningSummaries = configuredReasoningSummarySupport(prov, model.id);
+  // Display-only picker label override. Never feeds routing - the catalog slug stays
+  // `<provider>/<model>`. Lets a provider drop a redundant prefix (e.g. deepseek/deepseek-v4-flash
+  // -> show "deepseek-v4-flash") without touching the callable id.
+  const displayName = modelRecordValue(prov.modelDisplayNames, model.id);
+ const hinted = {
     ...model,
     ...(configuredCap !== undefined
       ? {
@@ -582,8 +586,9 @@ export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, 
       }
       : {}),
     ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
-    ...(typeof supportsReasoningSummaries === "boolean" ? { supportsReasoningSummaries } : {}),
-    ...(prov.adapter === "kiro" ? { supportsVerbosity: false } : {}),
+   ...(typeof supportsReasoningSummaries === "boolean" ? { supportsReasoningSummaries } : {}),
+    ...(displayName !== undefined ? { displayName } : {}),
+   ...(prov.adapter === "kiro" ? { supportsVerbosity: false } : {}),
     // Default-on for openai-chat providers (explicit false opts out); other adapters
     // advertise only on explicit opt-in.
     ...(prov.parallelToolCalls === true || (prov.adapter === "openai-chat" && prov.parallelToolCalls !== false)

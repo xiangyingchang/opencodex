@@ -200,6 +200,11 @@ export interface ProviderRegistryEntry {
   contextWindow?: number;
   modelContextWindows?: Record<string, number>;
   modelInputModalities?: Record<string, string[]>;
+  /**
+   * Display-only Codex catalog `display_name` overrides per model id. See OcxProviderConfig.modelDisplayNames.
+   * Relabels the picker row only - routing slug is untouched.
+   */
+  modelDisplayNames?: Record<string, string>;
   defaultMaxOutputTokens?: number;
   modelMaxOutputTokens?: Record<string, number>;
   reasoningEfforts?: string[];
@@ -238,6 +243,7 @@ export type ProviderConfigSeed = Pick<
   OcxProviderConfig,
   "adapter" | "baseUrl" | "apiKeyTransport" | "responsesPath" | "authMode" | "keyOptional" | "freeTier" | "modelSuffixBracketStrip" | "defaultModel" | "models"
   | "liveModels" | "contextWindow" | "modelContextWindows" | "modelInputModalities"
+  | "modelDisplayNames"
   | "modelMaxInputTokens" | "defaultMaxOutputTokens" | "modelMaxOutputTokens"
   | "reasoningEfforts" | "modelReasoningEfforts" | "modelDefaultReasoningEfforts" | "reasoningEffortMap" | "modelReasoningEffortMap" | "reasoningWireFormat"
   | "noVisionModels" | "noReasoningModels" | "noTemperatureModels" | "noTopPModels" | "noPenaltyModels"
@@ -1240,6 +1246,10 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     models: ["deepseek-chat", "deepseek-reasoner", ...DEEPSEEK_THINKING_MODELS],
     defaultModel: "deepseek-v4-flash",
     modelContextWindows: { "deepseek-v4-flash": 1_000_000, "deepseek-v4-pro": 1_000_000 },
+    // Display-only: the `deepseek/` prefix duplicates the model id for the V4 family, so relabel
+    // the picker row to the bare id. The routing slug `deepseek/deepseek-v4-flash` is unchanged -
+    // only the Codex model selector label drops the redundant provider prefix.
+    modelDisplayNames: { "deepseek-v4-flash": "deepseek-v4-flash", "deepseek-v4-pro": "deepseek-v4-pro" },
     // DeepSeek documents V4-Flash as a native Responses API model adapted for Codex. The
     // API id is `deepseek-v4-flash`; `DeepSeek-V4-Flash-0731` is a release/version label.
     modelWireDefaults: {

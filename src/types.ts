@@ -1145,6 +1145,14 @@ export interface OcxProviderConfig {
   modelContextWindows?: Record<string, number>;
   /** Model-specific Codex catalog input modalities, e.g. ["text"] or ["text", "image"]. */
   modelInputModalities?: Record<string, string[]>;
+  /**
+   * Display-only Codex catalog `display_name` overrides per model id. Relabels the picker row ONLY
+   * - the routing slug (`<provider>/<model>`) is untouched, so upstream calls keep using the full
+   * namespaced id. Useful when the provider prefix duplicates the model id
+   * (e.g. `deepseek/deepseek-v4-flash` -> show `deepseek-v4-flash`). Empty/undefined = fall back to
+   * the slug. Values must not contain "/" (validated at the CLI/management API boundaries).
+   */
+  modelDisplayNames?: Record<string, string>;
   /** Model-specific max input token limits. Values cap auto_compact_token_limit. */
   modelMaxInputTokens?: Record<string, number>;
   /**
