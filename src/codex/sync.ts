@@ -2,6 +2,7 @@ import { currentExternalCodexModelProvider, injectCodexConfig } from "./inject";
 import { printProjectCodexConfigWarnings, groupProjectCodexConfigWarningsByPath, type ProjectCodexConfigWarning } from "./project-config-warnings";
 import { refreshCodexModelCatalog } from "./refresh";
 import { applyProxyEnv, loadConfig } from "../config";
+import { codexSyncPort } from "./desired-state";
 import type { OcxConfig } from "../types";
 import { collectOrcaCodexHomeDiagnostic } from "./home";
 import { summarizeComboCatalogOmissions, type ComboCatalogOmission } from "./catalog/aggregation";
@@ -52,7 +53,7 @@ export async function syncModelsToCodex(
   log: Pick<Console, "log" | "error"> | null = console,
   deps: CodexSyncDeps = defaultDeps,
 ): Promise<CodexSyncResult> {
-  const p = port ?? config.port ?? 10100;
+  const p = codexSyncPort(config, port);
   const externalProvider = (deps.currentExternalCodexModelProvider ?? currentExternalCodexModelProvider)();
   if (externalProvider) {
     const result = await deps.injectCodexConfig(p, config, {});

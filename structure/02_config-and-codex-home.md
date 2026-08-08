@@ -77,7 +77,7 @@ matters for maintainers is which groups exist and who resolves them:
 | Group | Keys | Resolution rule |
 | --- | --- | --- |
 | Listener | `port`, `hostname` | The listener owns the port; `runtime-port.json` reports where it actually landed. |
-| Routing | `defaultProvider`, `providers`, per-provider `selectedModels` | Explicit `provider/model` wins over `defaultProvider`. |
+| Routing | `defaultProvider`, `providers`, per-provider `selectedModels`, `codexRoutingMode` | Explicit `provider/model` wins over `defaultProvider`; missing `codexRoutingMode` remains `legacy-local`, while `split` selects the isolated 10101 Codex entry point. |
 | Catalog | `disabledModels`, `customModels`, `modelCacheTtlMs`, `providerContextCaps`, `contextCapValue` | Catalog state is derived; config only records intent. |
 | Retained state | `appOwnedMemoryBudgetMb` | Process-wide eviction target for app-owned logs, caches, blobs, and continuation payloads. Default 256 MiB, valid 64..4096; pinned state may temporarily exceed the target, but every pin-capable store has a finite local cap and their documented aggregate stays below `APP_OWNED_WORST_CASE_PINNED_BYTES` (512 MiB). Neither value caps RSS or native runtime memory. |
 | Transport | stream mode, timeouts, proxy settings, `websockets` | `streamMode` persists in config.json; Windows services need a persisted input, and macOS uses it for explicit eager-relay opt-in. |
@@ -184,13 +184,15 @@ Legacy nonempty config directories are deliberately not retroactively claimed. I
 file is missing, malformed, or bound to another root, uninstall refuses config deletion and reports
 the residual directory for manual review; there is no recursive-delete fallback.
 
-## Provider Split Bridge state (planned)
+## Provider Split Bridge state (implemented, activation-gated)
 
-Split mode will add a marker-owned state that points Codex's single client entry at
-`http://127.0.0.1:10101/v1`; the bridge, not Codex TOML, will map the selected catalog slug to the
+Split mode now has a marker-owned state that points Codex's single client entry at
+`http://127.0.0.1:10101/v1`; the bridge, not Codex TOML, maps the selected catalog slug to the
 official or third-party physical channel. The existing 10100 loopback form remains the legacy-local
-state and must never be overwritten blindly. A migration must first prove journal ownership, preserve
-user-owned `openai_base_url`, and write the bridge target atomically. Restore removes only bridge-owned
-keys and catalog/cache changes; it must not depend on an `exit` handler, because SIGKILL and power loss
-can leave files behind. The target state, backup manifest, and failure recovery contract are recorded
-in [`docs/协议文档.md`](../docs/协议文档.md).
+state and is never overwritten blindly. Migration first proves journal/marker ownership, preserves
+user-owned `openai_base_url`, and writes the bridge target atomically. Restore removes only
+bridge-owned keys and catalog/cache changes; it does not depend on an `exit` handler, because SIGKILL
+and power loss can leave files behind. The target state, backup manifest, and failure recovery
+contract are recorded in [`docs/协议文档.md`](../docs/协议文档.md). The 10101 listener, LaunchAgent
+installation, and Codex routing switch remain activation-gated and are not performed by these docs
+or static builders.

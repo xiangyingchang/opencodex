@@ -11,13 +11,24 @@ import { displayCodexRuntimePath, effortClampAppliesToRuntime, loadLastEffortCla
 import { redactSecretString, redactUserPath } from "../lib/redact";
 import { collectOrcaCodexHomeDiagnostic, type OrcaCodexHomeDiagnostic } from "../codex/home";
 import { grokFenceEndpointDrift, readGrokStatus } from "../grok/status";
+import { buildProviderSplitCatalog } from "../codex/split-catalog";
+import { readCatalog, readCodexCatalogPath } from "../codex/catalog/parsing";
+import { visibleCodexAccountSelectors } from "../codex/catalog/account-models";
+import { desiredCodexRoutingMode } from "../codex/desired-state";
+import { deriveSplitBridgeStatus, type SplitBridgeStatus } from "../codex/split-status";
 
-type HealthCheck = {
+export type HealthCheck = {
   ok: boolean;
   url: string;
   message: string;
   label: string;
 };
+
+export interface StatusCollectionDeps {
+  readonly checkProxyHealth?: (target: ListenTarget) => Promise<HealthCheck>;
+  readonly checkSplitBridgeHealth?: () => Promise<boolean>;
+  readonly catalogGenerationForStatus?: (config: OcxConfig) => string | null;
+}
 
 export type CliStatusJson = {
   schemaVersion: 1;
@@ -47,6 +58,7 @@ export type CliStatusJson = {
   };
   codexAutostart: boolean;
   startup: StartupHealth;
+  splitBridge: SplitBridgeStatus;
   defaultProvider: string | null;
   config: {
     source: "default" | "file" | "fallback";
@@ -137,7 +149,40 @@ async function checkProxyHealth(target: ListenTarget): Promise<HealthCheck> {
   }
 }
 
-export async function collectStatus(): Promise<CliStatusView> {
+async function checkSplitBridgeHealth(): Promise<boolean> {
+  const url = "http://127.0.0.1:10101/healthz";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 400);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) return false;
+    const body = await response.json().catch(() => null) as { service?: unknown; status?: unknown } | null;
+    return body?.service === "opencodex-split-bridge" && body.status === "ok";
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function catalogGenerationForStatus(config: OcxConfig): string | null {
+  try {
+    const catalog = readCatalog(readCodexCatalogPath());
+    if (!catalog?.models) return null;
+    return buildProviderSplitCatalog({
+      entries: catalog.models,
+      officialAccountNamespaces: visibleCodexAccountSelectors(config),
+      disabledModels: config.disabledModels,
+    }).generation;
+  } catch {
+    return null;
+  }
+}
+
+export async function collectStatus(deps: StatusCollectionDeps = {}): Promise<CliStatusView> {
+  const checkHealth = deps.checkProxyHealth ?? checkProxyHealth;
+  const checkSplitHealth = deps.checkSplitBridgeHealth ?? checkSplitBridgeHealth;
+  const getCatalogGeneration = deps.catalogGenerationForStatus ?? catalogGenerationForStatus;
   const configDiagnostics = readConfigDiagnostics();
   const config = configDiagnostics.config;
   // Prefer identity-verified liveness (runtime-port + /healthz) over ocx.pid alone (#618).
@@ -166,7 +211,29 @@ export async function collectStatus(): Promise<CliStatusView> {
       message: `ok (pid ${live.pid ?? "unknown"})`,
       label: `${listen.healthUrl} ok (live)`,
     }
-    : await checkProxyHealth(listen);
+    : await checkHealth(listen);
+  const desiredMode = desiredCodexRoutingMode(config);
+  const splitModeActive = desiredMode === "split";
+  const gatewayHealth = splitModeActive
+    ? listen.port === 10100
+      ? health
+      : await checkHealth({
+        port: 10100,
+        hostname: "127.0.0.1",
+        source: "config",
+        healthUrl: "http://127.0.0.1:10100/healthz",
+        dashboardUrl: "http://127.0.0.1:10100/",
+      })
+    : {
+      ...health,
+      label: `${health.label} (legacy-local gateway)`,
+    };
+  const splitBridge = deriveSplitBridgeStatus({
+    desiredMode,
+    splitBridgeRunning: splitModeActive ? await checkSplitHealth() : false,
+    gatewayReachable: gatewayHealth.ok,
+    catalogGeneration: getCatalogGeneration(config),
+  });
   const bunRuntime = durableBunRuntime();
   const service = diagnoseService();
   // A service can be registered and still not serve: the manager reports the job
@@ -306,6 +373,7 @@ export async function collectStatus(): Promise<CliStatusView> {
       },
       codexAutostart: codexAutoStartEnabled(config),
       startup,
+      splitBridge,
       defaultProvider: typeof config.defaultProvider === "string" ? config.defaultProvider : null,
       config: {
         source: configDiagnostics.source,

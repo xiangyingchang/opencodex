@@ -16,6 +16,9 @@ import { loadConfig, saveConfig } from "../src/config";
 import {
   codexIntegrationEnabled,
   codexIntegrationEnabledNow,
+  codexInjectionHostname,
+  codexSyncPort,
+  desiredCodexRoutingMode,
   setCodexIntegrationEnabled,
   setGrokIntegrationEnabled,
   grokIntegrationEnabled,
@@ -30,6 +33,27 @@ let previousOpencodexHome: string | undefined;
 function baseConfig(): OcxConfig {
   return { port: 10100, providers: {}, defaultProvider: "openai" };
 }
+
+describe("Codex routing mode", () => {
+  test("defaults to legacy-local and keeps the split port opt-in", () => {
+    expect(desiredCodexRoutingMode({})).toBe("legacy-local");
+    expect(codexSyncPort({ port: 10100 })).toBe(10100);
+  });
+
+  test("split mode owns 10101 even when an old caller supplies a live port", () => {
+    const config = { port: 10100, codexRoutingMode: "split" as const };
+    expect(desiredCodexRoutingMode(config)).toBe("split");
+    expect(codexSyncPort(config)).toBe(10101);
+    expect(codexSyncPort(config, 43210)).toBe(10101);
+    expect(codexInjectionHostname({ codexRoutingMode: "split", hostname: "0.0.0.0" })).toBe("127.0.0.1");
+    expect(codexInjectionHostname({ codexRoutingMode: "split", hostname: "203.0.113.10" })).toBe("127.0.0.1");
+    expect(codexInjectionHostname({ codexRoutingMode: "legacy-local", hostname: "192.0.2.10" })).toBe("192.0.2.10");
+  });
+
+  test("malformed or unknown hand-edited mode fails closed to legacy-local", () => {
+    expect(desiredCodexRoutingMode({ codexRoutingMode: "unexpected" as never })).toBe("legacy-local");
+  });
+});
 
 beforeEach(() => {
   previousOpencodexHome = process.env.OPENCODEX_HOME;

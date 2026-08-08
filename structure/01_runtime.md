@@ -78,15 +78,18 @@ The server exposes `POST /api/stop` which restores native Codex config, stops an
 - 다른 대안 대신 이 방식을 선택한 이유: Absolute dotenv expansion bypasses a relative-path check, global dotenv removal breaks supported configuration, and an environment-only marker can itself come from dotenv.
 - 장점, 단점 및 영향: Normal npm launches preserve genuine shell overrides. Direct Bun or legacy launches have no provenance signal and fail closed for all three ambient Anthropic slots — credentials included, because subscription mode leaves `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` unset by design (#253) and a `settings.env` merge can still replace the destination after launch, so a preserved key would travel with it. The cost is that `bun src/cli/index.ts` loses ambient Anthropic values; the escape hatch is running through the published `ocx` bin, where genuine shell exports are preserved by proof. Durable artifacts use the running or bundled Bun.
 
-## Provider Split Bridge (planned runtime boundary)
+## Provider Split Bridge (runtime boundary)
 
-The planned split runtime is two independent local data planes rather than an `if` branch inside the
+The split runtime boundary is two independent local data planes rather than an `if` branch inside the
 existing proxy. `com.opencodex.proxy` remains the third-party gateway on 10100; a separate
 `com.opencodex.split-bridge` process owns 10101 and dispatches official-native models directly to
 ChatGPT/Codex while forwarding third-party models to 10100. The direct branch must not wait on gateway
 health, gateway admission, retry state, or gateway queues. The gateway branch is fail-closed when 10100
 is unavailable. Both services have independent PIDs, logs, health state, launchd KeepAlive policy, and
-resource limits. Until activation, the current single-listener lifecycle remains the shipped behavior.
+resource limits. The foreground entry is `ocx split-bridge start`; that dedicated command bypasses the
+ordinary CLI Codex-shim auto-restore hook. `src/codex/split-bridge-launchd.ts` only builds the separate
+plist, and no installer/load action is performed until activation is approved.
+Until activation, the current single-listener lifecycle remains the shipped behavior.
 
 ## Providers and adapters
 

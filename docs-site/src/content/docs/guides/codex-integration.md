@@ -36,6 +36,21 @@ The proxy listens on port `10100` by default and serves `POST /v1/responses`,
 `POST /v1/responses/compact`, `POST /v1/images/generations`, `POST /v1/images/edits`,
 `GET /v1/models`, `GET /healthz`, and the `/api/*` management surface.
 
+## Provider Split Bridge (activation-gated)
+
+When `codexRoutingMode` is explicitly set to `"split"`, the Codex entry point is the independent
+`http://127.0.0.1:10101/v1` Split Bridge. It routes official native/account/API-key models directly
+to their native upstream and sends only explicitly classified third-party models to the existing
+`127.0.0.1:10100` gateway. Unknown models fail closed; there is no cross-plane fallback.
+
+The default remains `"legacy-local"`, which preserves the existing `10100` injection. The uninstalled foreground entry is `ocx split-bridge start`. It requires an explicit
+`OCX_SPLIT_NATIVE_BASE_URL` and an owner-only
+`OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE`; the generated LaunchAgent carries only the file path,
+never the admission value. No install or launchd load occurs from this documentation change. Use
+`ocx status --json` to inspect `splitBridge.splitBridgeRunning`, `gatewayReachable`,
+`catalogGeneration`, and the distinct `bridge-unavailable` versus `gateway-unavailable` readiness
+states.
+
 ### Built-in image generation (`image_gen`)
 
 Codex's built-in `image_gen` tool does not go through `/v1/responses` — the codex-rs extension

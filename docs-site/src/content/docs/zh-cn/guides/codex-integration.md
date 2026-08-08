@@ -35,6 +35,20 @@ proxy 默认监听 `10100` 端口，并提供 `POST /v1/responses`、`POST /v1/r
 `POST /v1/images/generations`、`POST /v1/images/edits`、`GET /v1/models`、`GET /healthz`，
 以及 `/api/*` 管理面。
 
+## Provider Split Bridge（需显式激活）
+
+当显式设置 `codexRoutingMode = "split"` 时，Codex 入口会切换到独立的
+`http://127.0.0.1:10101/v1` Split Bridge。它把官方原生/账户/API-key 模型直接发送到对应原生
+上游，只把明确分类为第三方的模型发送到现有 `127.0.0.1:10100` gateway。未知模型 fail closed，
+两个平面之间没有 fallback。
+
+缺省仍是 `"legacy-local"`，继续使用现有的 `10100` 注入路径。未安装的 foreground 入口是
+`ocx split-bridge start`；它要求显式设置 `OCX_SPLIT_NATIVE_BASE_URL`，并提供 owner-only 权限的
+`OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE`。生成的 LaunchAgent 只携带 token 文件路径，不会嵌入
+token 值；本文档不会安装或加载 launchd。可用 `ocx status --json` 查看
+`splitBridge.splitBridgeRunning`、`gatewayReachable`、`catalogGeneration`，以及互相独立的
+`bridge-unavailable` 和 `gateway-unavailable` readiness 状态。
+
 ### 内置图像生成（`image_gen`）
 
 Codex 内置的 `image_gen` 工具不会经过 `/v1/responses` —— codex-rs 扩展会直接 POST

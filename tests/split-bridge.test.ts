@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createSplitBridgeHandler, type SplitBridgeOptions } from "../src/split-bridge";
+import { createSplitBridgeHandler, startSplitBridge, type SplitBridgeOptions } from "../src/split-bridge";
 import type { ProviderSplitCatalog } from "../src/providers/split-map";
 
 const catalog: ProviderSplitCatalog = {
@@ -231,8 +231,25 @@ describe("Provider Split Bridge", () => {
     const response = await handler(new Request("http://127.0.0.1:10101/healthz"));
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ status: "ok" });
+    expect(await response.json()).toEqual({ status: "ok", service: "opencodex-split-bridge" });
     expect(calls).toHaveLength(0);
+  });
+
+  test("starts independently on an ephemeral port without consulting the gateway", async () => {
+    const server = startSplitBridge({
+      catalog,
+      nativeBaseUrl: "https://native.example",
+      gatewayBaseUrl: "http://127.0.0.1:10100/v1",
+      gatewayAdmissionToken: "[REDACTED]",
+      port: 0,
+    });
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/healthz`);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ status: "ok", service: "opencodex-split-bridge" });
+    } finally {
+      server.stop();
+    }
   });
 
   test("does not forward unsupported paths or methods", async () => {

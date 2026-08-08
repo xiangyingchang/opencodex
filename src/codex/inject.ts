@@ -66,10 +66,19 @@ import {
   type ManagedSubagentDefaults,
 } from "./subagent-defaults";
 import type { OcxConfig } from "../types";
+import { codexInjectionHostname, desiredCodexRoutingMode } from "./desired-state";
+import {
+  classifyCodexSplitState,
+  restoreBridgeOwnedRouting,
+  type CodexSplitState,
+  type CodexSplitStateObservation,
+} from "./split-state";
 
 // Ownership predicates live in `./injected-marker` so `journal.ts` can reach them
 // without importing this module back. Re-exported for existing external callers.
 export { hasInjectedCodexRouting, hasInjectedOpenaiBaseUrl };
+export { classifyCodexSplitState, restoreBridgeOwnedRouting };
+export type { CodexSplitState, CodexSplitStateObservation };
 
 export function externalCodexModelProvider(content: string): string | null {
   const provider = resolveEffectiveProjectModelProvider(content).provider;
@@ -721,7 +730,9 @@ export async function injectCodexConfig(
     ? setRootModelCatalogPath(content, catalogPath)
     : stripOpencodexCatalogPath(content);
 
-  const legacyMode = shouldInjectApiAuthHeader(config);
+  const injectionHostname = codexInjectionHostname(config);
+  const legacyMode = desiredCodexRoutingMode(config ?? {}) !== "split"
+    && shouldInjectApiAuthHeader(config);
   let keptUserBaseUrl = false;
   if (legacyMode) {
     // Legacy (non-loopback) injection: the built-in openai provider cannot carry the
@@ -736,13 +747,13 @@ export async function injectCodexConfig(
         port,
         websocketsEnabled(config ?? {}),
         true,
-        config?.hostname,
+        injectionHostname,
       );
   } else {
     // Design B (loopback): a single root override; codex keeps its native `openai` provider id
     // so thread history is never remapped. Any legacy form was already stripped above.
     content = stripInjectedOpenaiBaseUrl(content); // normalize before idempotent re-insert
-    const result = setRootOpenaiBaseUrl(content, port, config?.hostname);
+    const result = setRootOpenaiBaseUrl(content, port, injectionHostname);
     content = result.content;
     keptUserBaseUrl = result.keptUserBaseUrl;
   }
@@ -778,7 +789,7 @@ export async function injectCodexConfig(
     managedDefaultsMessage = `  ⚠️ ${nativeSubagentDefaultsWarning}\n`;
   }
 
-  const profileContent = buildProfileFile(port, catalogPath, websocketsEnabled(config ?? {}), legacyMode, config?.hostname, config?.fastMode);
+  const profileContent = buildProfileFile(port, catalogPath, websocketsEnabled(config ?? {}), legacyMode, injectionHostname, config?.fastMode);
   content = applyEol(content, eol);
 
   /*
@@ -1123,6 +1134,27 @@ function stripOpencodexConfigResult(
   };
 }
 
+function stripBridgeOwnedSplitConfigResult(
+  content: string,
+): StripOpencodexConfigResult {
+  const routing = restoreBridgeOwnedRouting(content);
+  if (routing.refused || !routing.changed) {
+    return {
+      content,
+      managedDefaultsError: "bridge-owned split routing could not be removed with a complete ownership proof",
+    };
+  }
+  let out = routing.content;
+  if (out.includes("[profiles.opencodex]")) out = removeProfileSection(out);
+  const managedDefaults = transformManagedSubagentDefaults(out, null);
+  if (managedDefaults.ok) out = managedDefaults.content;
+  out = stripOpencodexCatalogPath(out);
+  return {
+    content: out.replace(/\n{3,}/g, "\n\n").trimEnd() + "\n",
+    managedDefaultsError: !managedDefaults.ok ? managedDefaults.error : null,
+  };
+}
+
 /** Pure transform: strip the opencodex provider block + `model_provider = "opencodex"` lines. */
 export function stripOpencodexConfig(content: string): string {
   return stripOpencodexConfigResult(content).content;
@@ -1152,8 +1184,19 @@ export function removeCodexConfig(
   // The unchanged fast path compares in LF space so an untouched file is never rewritten.
   const eol = dominantEol(rawContent);
   const content = applyEol(rawContent, "\n");
+  const splitState = classifyCodexSplitState(content);
+  if (splitState.state === "legacy-local" && !splitState.owned) {
+    return {
+      success: false,
+      message:
+        "Refusing to restore an unverified legacy-local Codex route: the OpenCodex ownership marker is missing or mismatched. " +
+        "No files were changed; inspect config.toml and recover from the saved journal if appropriate.",
+    };
+  }
   const had = hasOpencodexRouting(content);
-  const stripped = stripOpencodexConfigResult(content);
+  const stripped = splitState.state === "split"
+    ? stripBridgeOwnedSplitConfigResult(content)
+    : stripOpencodexConfigResult(content);
   if (had || stripped.content !== content) {
     atomicWriteFile(CODEX_CONFIG_PATH, applyEol(stripped.content, eol));
   }

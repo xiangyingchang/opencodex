@@ -10,6 +10,7 @@ description: 默认提供方选择、模型解析顺序、组合别名、目标�
 | 字段 | 类型 | 默认值 | 含义 |
 | --- | --- | --- | --- |
 | `defaultProvider` | `string` | `"openai"` | 当没有更早的模型规则匹配时使用的最终提供方。它必须是一个已启用且已配置的提供方名称。 |
+| `codexRoutingMode?` | `"split" \| "legacy-local"` | `"legacy-local"` | Codex 注入目标。`split` 使用独立的 `127.0.0.1:10101` bridge；在显式批准激活前，缺省值保留现有 `10100` loopback 路径。 |
 | `combos?` | `Record<string, OcxComboConfig>` | `{}` | 由有序的提供方/模型目标构建出来的虚拟 `combo/<id>` 模型。 |
 
 ## 模型解析顺序

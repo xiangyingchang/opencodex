@@ -42,6 +42,7 @@ describe("Codex shim CLI auto-restore policy", () => {
     }
     expect(skipsCodexShimAutoRestore("codex-shim", ["codex-shim", "status"])).toBe(false);
     expect(skipsCodexShimAutoRestore("status", ["status"])).toBe(false);
+    expect(skipsCodexShimAutoRestore("split-bridge", ["split-bridge", "start"])).toBe(true);
   });
 
   test("restore failure -> warning only, command succeeds", () => {

@@ -548,6 +548,8 @@ export interface OcxApiKeyEntry {
  * write path. A one-key object keeps the extension point without letting this
  * phase claim ownership over a client it does not implement.
  */
+export type CodexRoutingMode = "split" | "legacy-local";
+
 export interface OcxClientIntegrationsConfig {
   /** Durable desired state for native Codex. MISSING MEANS ON. */
   codex?: boolean;
@@ -572,6 +574,8 @@ export interface OcxConfig {
    * one key at a time rather than widening a shared union.
    */
   clientIntegrations?: OcxClientIntegrationsConfig;
+  /** Codex routing target. Absent preserves the pre-split legacy-local behavior. */
+  codexRoutingMode?: CodexRoutingMode;
   /**
    * Up to 5 Codex-facing catalog ids to feature first. Values may be bare catalog ids,
    * exact account-qualified "<selector>/<native-openai-model>" ids, or routed

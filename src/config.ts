@@ -1011,6 +1011,8 @@ const configSchema = z.object({
   // pre-migration so startup can safely re-run the one-time normalization.
   googleAntigravityStaticCatalogVersion: z.literal(1).optional().catch(undefined),
   clientIntegrations: clientIntegrationsSchema.optional().catch(undefined),
+  // Missing means legacy-local until the explicit split activation gate is approved.
+  codexRoutingMode: z.enum(["split", "legacy-local"]).optional().catch(undefined),
   providerContextCaps: z.record(z.string(), z.number().int().positive()).optional(),
   contextCapValue: z.number().int().positive().optional(),
   multiAgentGuidanceEnabled: z.boolean().optional(),

@@ -694,6 +694,10 @@ async function handleStatus() {
   console.log(`   Default provider: ${status.json.defaultProvider}`);
   console.log(`   Codex autostart: ${status.json.codexAutostart ? "enabled" : "disabled"}`);
   console.log(`   Restart safety: ${startupHealthSummary(status.json.startup)}`);
+  const splitBridgeLabel = status.json.splitBridge.desiredMode === "split"
+    ? `10101 ${status.json.splitBridge.splitBridgeRunning ? "running" : "not running"}; gateway ${status.json.splitBridge.gatewayReachable ? "reachable" : "unreachable"}`
+    : `inactive (legacy-local; gateway ${status.json.splitBridge.gatewayReachable ? "reachable" : "unreachable"})`;
+  console.log(`   Split bridge: ${status.json.splitBridge.readiness} (${splitBridgeLabel})`);
   console.log(`   Service: ${status.json.service.summary}`);
   console.log(`   ${status.json.codexShim.summary}`);
   console.log(`   Codex runtime: ${status.json.codexRuntime.path}`);
@@ -922,6 +926,16 @@ switch (command) {
     console.log(`Opening ${guiUrl}`);
     const { openUrl } = await import("../lib/open-url");
     openUrl(guiUrl);
+    break;
+  }
+  case "split-bridge": {
+    if (args[1] !== "start" || args.length > 2) {
+      console.error("Usage: ocx split-bridge start");
+      process.exitCode = 2;
+      break;
+    }
+    const { runConfiguredSplitBridge } = await import("../codex/split-bridge-runtime");
+    await runConfiguredSplitBridge();
     break;
   }
   case "service":

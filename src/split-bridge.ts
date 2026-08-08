@@ -134,6 +134,14 @@ function targetUrl(base: URL, incoming: URL): string {
   return target.toString();
 }
 
+export function assertSplitBridgeTargetUrls(nativeBaseUrl: string, gatewayBaseUrl: string): void {
+  const nativeBase = parseBaseUrl(nativeBaseUrl, "nativeBaseUrl");
+  const gatewayBase = parseBaseUrl(gatewayBaseUrl, "gatewayBaseUrl");
+  if (physicalOrigin(nativeBase) === physicalOrigin(gatewayBase)) {
+    throw new TypeError("nativeBaseUrl and gatewayBaseUrl must use different physical origins");
+  }
+}
+
 function requestHeaders(incoming: Headers, decision: ProviderSplitDecision, gatewayAdmissionToken: string): Headers {
   const selected = new Headers();
   const allowed = decision.channel === "third-party-gateway"
@@ -234,7 +242,7 @@ export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBrid
     if (incoming.pathname === HEALTH_PATH) {
       if (request.method !== "GET") return errorResponse(405, "method_not_allowed", "Only GET is supported for healthz");
       // Liveness only: probing an upstream here would couple the two failure domains.
-      return Response.json({ status: "ok" });
+      return Response.json({ status: "ok", service: "opencodex-split-bridge" });
     }
     if (!RESPONSE_PATHS.has(incoming.pathname)) {
       return errorResponse(404, "not_found", "Split bridge endpoint not found");

@@ -21,10 +21,36 @@
  * Design record: devlog/_plan/260803_codex_desktop_toggle/030_desired_state.md.
  */
 import { loadConfig, mutatePersistedConfig } from "../config";
-import type { OcxClientIntegrationsConfig, OcxConfig } from "../types";
+import type { OcxClientIntegrationsConfig, OcxConfig, CodexRoutingMode } from "../types";
 
 /** Clients whose durable intent this module owns. */
 export type DurableIntentClientId = keyof OcxClientIntegrationsConfig;
+
+export const DEFAULT_CODEX_ROUTING_MODE: CodexRoutingMode = "legacy-local";
+export const DEFAULT_SPLIT_BRIDGE_PORT = 10101;
+
+/** Missing mode is intentionally backward-compatible until split activation is approved. */
+export function desiredCodexRoutingMode(
+  config: Pick<OcxConfig, "codexRoutingMode">,
+): CodexRoutingMode {
+  return config.codexRoutingMode === "split" ? "split" : DEFAULT_CODEX_ROUTING_MODE;
+}
+
+/** Split mode owns the dedicated bridge port; legacy mode preserves explicit live-port recovery. */
+export function codexSyncPort(
+  config: Pick<OcxConfig, "port" | "codexRoutingMode">,
+  explicitPort?: number,
+): number {
+  if (desiredCodexRoutingMode(config) === "split") return DEFAULT_SPLIT_BRIDGE_PORT;
+  if (explicitPort !== undefined) return explicitPort;
+  return config.port;
+}
+
+export function codexInjectionHostname(
+  config?: Pick<OcxConfig, "codexRoutingMode" | "hostname">,
+): string | undefined {
+  return desiredCodexRoutingMode(config ?? {}) === "split" ? "127.0.0.1" : config?.hostname;
+}
 
 /** Injectable for tests; production passes the real sync. */
 /**

@@ -43,6 +43,15 @@ const helpEntries: Record<string, HelpEntry> = {
       "Config cleanup requires ownership metadata created by a fresh install; legacy or shared directories are left in place.",
     ],
   },
+  "split-bridge": {
+    usage: "ocx split-bridge start",
+    summary: "Run the isolated Provider Split Bridge in the foreground.",
+    details: [
+      "The dedicated launchd service uses this command on port 10101.",
+      "It requires OCX_SPLIT_NATIVE_BASE_URL and a permission-hardened OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE.",
+      "This command does not install or load a service.",
+    ],
+  },
   service: {
     usage: "ocx service [install|start|stop|status|uninstall|remove]",
     summary: "Run as a background service.",

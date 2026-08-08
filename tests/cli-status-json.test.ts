@@ -12,7 +12,7 @@ const cliPath = join(repoRoot, "src", "cli", "index.ts");
 function runStatusJson(opencodexHome: string) {
   return spawnSync(process.execPath, [cliPath, "status", "--json"], {
     cwd: repoRoot,
-    env: { ...process.env, OPENCODEX_HOME: opencodexHome },
+    env: { ...process.env, OPENCODEX_HOME: opencodexHome, CODEX_HOME: opencodexHome },
     encoding: "utf8",
   });
 }
@@ -64,6 +64,17 @@ describe("CLI status JSON", () => {
           serviceSupported?: unknown;
           commands?: unknown;
         };
+        splitBridge?: {
+          desiredMode?: unknown;
+          splitBridgeRunning?: unknown;
+          splitBridgePort?: unknown;
+          officialPath?: unknown;
+          thirdPartyPath?: unknown;
+          gatewayReachable?: unknown;
+          catalogGeneration?: unknown;
+          routingDependency?: unknown;
+          readiness?: unknown;
+        };
         defaultProvider?: unknown;
         config?: { source?: unknown; error?: unknown };
         service?: { summary?: unknown };
@@ -108,6 +119,15 @@ describe("CLI status JSON", () => {
       expect(["full", "cli-only", "none"]).toContain(parsed.startup?.shimCoverage);
       expect(typeof parsed.startup?.serviceSupported).toBe("boolean");
       expect(typeof parsed.startup?.commands).toBe("object");
+      expect(parsed.splitBridge?.desiredMode).toBe("legacy-local");
+      expect(parsed.splitBridge?.splitBridgeRunning).toBe(false);
+      expect(parsed.splitBridge?.splitBridgePort).toBe(10101);
+      expect(parsed.splitBridge?.officialPath).toBe("legacy-local");
+      expect(parsed.splitBridge?.thirdPartyPath).toBe("gateway");
+      expect(parsed.splitBridge?.gatewayReachable).toBe(false);
+      expect(parsed.splitBridge?.catalogGeneration).toBeNull();
+      expect(parsed.splitBridge?.routingDependency).toBe("legacy-local");
+      expect(parsed.splitBridge?.readiness).toBe("legacy-mode");
       expect(parsed.defaultProvider).toBe("openai");
       expect(parsed.config?.source).toBe("file");
       expect(parsed.config?.error).toBeNull();

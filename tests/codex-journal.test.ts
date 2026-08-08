@@ -152,6 +152,57 @@ describe("codex-journal", () => {
     expect(existsSync(join(testDir, "opencodex.config.toml"))).toBe(false);
   });
 
+  test("removeCodexConfig split restore removes only marker-owned routing and preserves user root state", () => {
+    writeFileSync(join(testDir, "config.toml"), [
+      "# Auto-injected by opencodex",
+      'openai_base_url = "http://127.0.0.1:10101/v1"',
+      'model = "user/custom-model"',
+      'user_note = "keep me"',
+      "",
+      "[user.table]",
+      'endpoint = "https://user.example.invalid/v1"',
+      "",
+    ].join("\n"), "utf8");
+
+    const r = runScript(testDir, `
+      const { removeCodexConfig } = require("./src/codex/inject");
+      console.log(JSON.stringify(removeCodexConfig()));
+    `);
+
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout).success).toBe(true);
+    const after = readFileSync(join(testDir, "config.toml"), "utf8");
+    expect(after).not.toContain("openai_base_url");
+    expect(after).not.toContain("Auto-injected by opencodex");
+    expect(after).toContain('model = "user/custom-model"');
+    expect(after).toContain('user_note = "keep me"');
+    expect(after).toContain('[user.table]');
+    expect(after).toContain('endpoint = "https://user.example.invalid/v1"');
+  });
+
+  test("removeCodexConfig refuses an unmarked legacy provider route without changing it", () => {
+    const original = [
+      'model_provider = "opencodex"',
+      "",
+      "[model_providers.opencodex]",
+      'base_url = "http://127.0.0.1:10100/v1"',
+      'name = "user-owned"',
+      "",
+    ].join("\n");
+    writeFileSync(join(testDir, "config.toml"), original, "utf8");
+
+    const r = runScript(testDir, `
+      const { removeCodexConfig } = require("./src/codex/inject");
+      console.log(JSON.stringify(removeCodexConfig()));
+    `);
+
+    expect(r.status).toBe(0);
+    const result = JSON.parse(r.stdout);
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("ownership marker");
+    expect(readFileSync(join(testDir, "config.toml"), "utf8")).toBe(original);
+  });
+
   test("removeCodexConfig reports damaged managed-default cleanup and preserves the ambiguous value", () => {
     writeFileSync(join(testDir, "config.toml"), [
       "# Auto-injected by opencodex",

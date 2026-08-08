@@ -83,7 +83,28 @@ describe("GUI/CLI Codex sync backend", () => {
     expect(errors).toEqual([]);
   });
 
-  test("surfaces combo catalog omissions in sync result and CLI stderr (#484)", async () => {
+  test("split mode pins sync to 10101 even when called with the live gateway port", async () => {
+    let injectedPort = 0;
+    await syncModelsToCodex(10100, { ...config, codexRoutingMode: "split" }, { log: () => {}, error: () => {} }, {
+      refreshCodexModelCatalog: async () => ({
+        added: 0,
+        path: "/tmp/opencodex-catalog.json",
+        catalogExists: true,
+        catalogWritten: false,
+        cacheSynced: false,
+        comboOmissions: [],
+      }),
+      injectCodexConfig: async (port) => {
+        injectedPort = port;
+        return { success: true, message: "injected" };
+      },
+      currentExternalCodexModelProvider: () => null,
+      collectCodexHomeDiagnostic: () => homeDiagnostic(),
+    });
+    expect(injectedPort).toBe(10101);
+  });
+
+  test("surfaces combo catalog omissions in sync result and CLI stderr", async () => {
     const logs: string[] = [];
     const errors: string[] = [];
     const omission = {

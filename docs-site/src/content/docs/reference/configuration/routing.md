@@ -10,6 +10,7 @@ Routing turns the model id sent by a client into one concrete provider and upstr
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `defaultProvider` | `string` | `"openai"` | Final provider used when no earlier model rule matches. It must name an enabled configured provider. |
+| `codexRoutingMode?` | `"split" \| "legacy-local"` | `"legacy-local"` | Selects the Codex injection target. `split` uses the independent `127.0.0.1:10101` bridge; the default preserves the existing `10100` loopback path until activation is explicitly approved. |
 | `combos?` | `Record<string, OcxComboConfig>` | `{}` | Virtual `combo/<id>` models built from ordered provider/model targets. |
 | `routingProfiles?` | `Record<string, OcxRoutingProfileConfig>` | `{}` | Virtual `policy/<id>` models that select among an explicit candidate allowlist using hard capability requirements and deterministic scoring. |
 
