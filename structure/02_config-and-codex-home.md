@@ -183,3 +183,14 @@ uninstall with their exact paths.
 Legacy nonempty config directories are deliberately not retroactively claimed. If either ownership
 file is missing, malformed, or bound to another root, uninstall refuses config deletion and reports
 the residual directory for manual review; there is no recursive-delete fallback.
+
+## Provider Split Bridge state (planned)
+
+Split mode will add a marker-owned state that points Codex's single client entry at
+`http://127.0.0.1:10101/v1`; the bridge, not Codex TOML, will map the selected catalog slug to the
+official or third-party physical channel. The existing 10100 loopback form remains the legacy-local
+state and must never be overwritten blindly. A migration must first prove journal ownership, preserve
+user-owned `openai_base_url`, and write the bridge target atomically. Restore removes only bridge-owned
+keys and catalog/cache changes; it must not depend on an `exit` handler, because SIGKILL and power loss
+can leave files behind. The target state, backup manifest, and failure recovery contract are recorded
+in [`docs/协议文档.md`](../docs/协议文档.md).

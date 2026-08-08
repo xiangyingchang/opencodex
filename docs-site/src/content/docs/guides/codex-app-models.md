@@ -164,3 +164,13 @@ ocx sync
 
 opencodex rewrites `models_cache.json` with a deliberately stale cache wrapper whenever catalog
 visibility, priority, or metadata changes, so the next Codex model refresh reads the new catalog.
+
+## Provider Split Bridge (planned)
+
+The model picker is a shared catalog surface, not a live gateway-health list. In the planned split
+mode, native entries such as `gpt-5.6-luna` and routed entries such as
+`deepseek/deepseek-v4-flash` remain visible together. Selecting a native entry uses the official
+OpenAI/Codex path; selecting a routed entry uses the local gateway path. If the gateway is down, the
+routed row remains selectable but its request fails closed with `gateway_unavailable`; the native row
+must remain unaffected. App request success still requires separate HTTP/SSE and WebSocket/app-server
+verification, so catalog visibility alone is not a transport compatibility claim.

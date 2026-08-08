@@ -586,3 +586,14 @@ On the OpenAI path there is one deterministic `openai` sidecar candidate and its
 owns credential selection; API-key OpenAI is not a ChatGPT forward sidecar candidate.
 
 Sidecar failures must degrade to text markers or skipped capability, not abort the main request.
+
+## Provider Split Bridge (planned)
+
+The split bridge is a separate transport boundary from the existing adapter bridge. Its first supported
+surface is HTTP/SSE `POST /v1/responses`: official-native requests reuse the canonical ChatGPT/Codex
+forward semantics without entering the 10100 listener, while explicit third-party slugs are forwarded
+to 10100 with OpenAI/Codex authorization headers removed. Each channel owns its timeout, cancellation,
+stream budget, concurrency, and breaker. WebSocket/app-server, compact, Images, search, Live/Realtime,
+and continuation/replay paths require separate compatibility tests; an unimplemented surface must fail
+closed rather than silently taking the other channel. Until the split service is activated, the current
+single-listener transport inventory remains authoritative.

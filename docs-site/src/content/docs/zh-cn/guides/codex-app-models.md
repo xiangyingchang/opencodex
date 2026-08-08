@@ -109,3 +109,12 @@ ocx sync
 ```
 
 每当目录可见性、priority 或元数据发生变化时，opencodex 都会用一个刻意标记为过期的缓存 wrapper 重写 `models_cache.json`，这样 Codex 下次刷新模型时就会读取新目录。
+
+## Provider Split Bridge（计划中）
+
+模型选择器是共享 catalog 界面，不是实时的网关健康列表。在计划中的 split mode 中，
+`gpt-5.6-luna` 这样的原生条目和 `deepseek/deepseek-v4-flash` 这样的路由条目会继续同时可见。
+选择原生条目使用 OpenAI/Codex 官方路径；选择路由条目使用本地网关路径。如果网关关闭，
+路由条目仍可选择，但请求会以 `gateway_unavailable` fail-closed；原生条目必须不受影响。
+Codex App 请求能否成功还必须分别验证 HTTP/SSE 和 WebSocket/app-server，因此 catalog 能显示
+不等于 transport 已经兼容。

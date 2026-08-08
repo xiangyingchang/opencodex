@@ -112,3 +112,18 @@ CLI：`ocx logs explain <request-id>`、`ocx logs rebuild-index`、`ocx logs ind
 ## 迁移
 
 `routingProfiles` 是可选的增量配置：现有配置文件与旧 `usage.jsonl` 行均可原样加载。索引是一次性的——删除后会在下次查询时从 `usage.jsonl` 自动重建。系统不会自动调优。
+
+## Provider Split Bridge（计划中）
+
+当前 2.10.2 的 loopback 注入会把 Codex 内置 `openai` provider 指向 `127.0.0.1:10100`，
+官方模型和第三方模型共享同一个进程。计划中的 split mode 会让共享 catalog 通过独立的
+`127.0.0.1:10101` bridge：
+
+- 原生 `gpt-*` 和账户限定的原生条目使用 OpenAI/Codex 官方路径；
+- 显式 `provider/model` 条目必须依赖 10100 第三方网关；
+- 未知或有歧义的 slug fail-closed；
+- 网关失败只返回第三方 `503 gateway_unavailable`，不会回退到 GPT；
+- catalog 可见性保持稳定，网关 ready 状态单独报告。
+
+本节描述的是目标协议，不表示 split mode 已启用。正式启用需要独立 bridge 服务、注入 journal
+迁移、fake-upstream 故障测试、备份和明确的操作员确认。

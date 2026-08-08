@@ -302,3 +302,20 @@ ocx restore back # point plain Codex at the running proxy again
 当 opencodex 作为受管的 [background service](/reference/cli/#ocx-service) 运行时，它会设置
 `OCX_SERVICE=1`，这样由服务驱动的重启**不会**反复改写 Codex config——只有显式的
 `ocx stop` / `ocx service stop` 才会恢复原生 Codex。
+
+## Provider Split Bridge（计划中，尚未启用）
+
+当前版本仍使用上面的单 loopback 形式：Codex 把请求发送到 `10100`，再由 opencodex 在同一
+进程内部分流。计划中的 Provider Split Bridge 会新增独立的 `10101` listener，使 Codex 模型
+选择器可以继续同时保留原生条目和路由条目，同时把数据面拆开：
+
+```text
+Codex -> 127.0.0.1:10101
+  原生 GPT -> ChatGPT/Codex 官方上游
+  provider/model -> OpenCodex 127.0.0.1:10100
+```
+
+当 `10100` 停止或崩溃时，原生 GPT 必须继续走直连路径；第三方选择只能返回
+`503 gateway_unavailable`，不能跨 provider 回退。模型目录保持稳定，网关 ready 状态单独报告，
+这样 Codex App 不会因为网关暂时不可用而丢失第三方条目。该行为在 bridge、catalog/injection
+journal、fake-upstream 故障矩阵和回滚门禁完成前，仍只作为待实现协议。

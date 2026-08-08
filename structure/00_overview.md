@@ -106,3 +106,13 @@ opencodex state root does not undo those writes. Putting native Codex back is th
 Keep this directory flat. Add or extend lexicographically ordered `NN_topic.md` files; do not add
 subdirectories. If one file grows too broad, split the next stable topic into the next unused number
 instead of creating nested folders.
+
+## Provider Split Bridge (implementation in progress)
+
+The current loopback injection sends the built-in Codex `openai` provider to one OpenCodex listener,
+so native GPT and third-party traffic share a process and failure domain. The target split design adds
+an independent `com.opencodex.split-bridge` listener on `127.0.0.1:10101`: native OpenAI/Codex models
+use the official upstream path, while explicit `provider/model` entries use the existing third-party
+listener on `127.0.0.1:10100`. Gateway failure must return a third-party-only 503 and never change the
+native path. This is not active until the implementation, fake-upstream matrix, backup, and explicit
+activation gate pass; see [`docs/协议文档.md`](../docs/协议文档.md).

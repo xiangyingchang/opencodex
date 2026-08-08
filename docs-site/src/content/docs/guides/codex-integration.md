@@ -327,3 +327,22 @@ ocx restore back # point plain Codex at the running proxy again
 When opencodex runs as a managed [background service](/reference/cli/#ocx-service), it sets
 `OCX_SERVICE=1` so a service-driven restart does **not** thrash the Codex config — only an explicit
 `ocx stop` / `ocx service stop` restores native Codex.
+
+## Provider Split Bridge (planned, not active)
+
+The current release still uses the single loopback form above: Codex sends requests to `10100`, and
+opencodex routes them internally. A planned Provider Split Bridge will add an independent `10101`
+listener so the Codex model picker can keep native and routed entries together while the data plane is
+separated:
+
+```text
+Codex -> 127.0.0.1:10101
+  native GPT -> ChatGPT/Codex official upstream
+  provider/model -> OpenCodex 127.0.0.1:10100
+```
+
+When `10100` is stopped or crashes, native GPT must remain on its direct path and third-party selection
+must fail with `503 gateway_unavailable`; there is no cross-provider fallback. The model catalog stays
+stable while gateway readiness is reported separately, so Codex App does not lose its third-party rows
+when the gateway is temporarily unavailable. This behavior is intentionally documented as pending
+until the bridge, catalog/injection journal, fake-upstream fault matrix, and rollback gate are shipped.
