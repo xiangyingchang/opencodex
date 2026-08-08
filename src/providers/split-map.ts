@@ -20,12 +20,14 @@ export interface ProviderSplitDecision {
   readonly reason: string;
 }
 
+export type ProviderSplitCatalogOwnership = Omit<ProviderSplitCatalog, "generation">;
+
 /**
  * Reject catalog identities that could be claimed by more than one physical channel.
  * The classifier keeps an official-first defensive order, but a production catalog
  * must not rely on that order to resolve an ownership conflict.
  */
-export function assertProviderSplitCatalogDisjoint(catalog: ProviderSplitCatalog): void {
+export function assertProviderSplitCatalogDisjoint(catalog: ProviderSplitCatalogOwnership): void {
   const owners = new Map<string, string>();
   const claim = (identity: string, owner: string): void => {
     const previous = owners.get(identity);

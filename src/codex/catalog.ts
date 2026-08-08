@@ -11,3 +11,5 @@ export type { ComboCatalogOmission, ComboCatalogOmissionReason } from "./catalog
 export { MAX_SPAWN_AGENT_MODEL_OVERRIDES, effectiveSubagentRoster, buildCatalogEntries, resetCatalogRuntimeStateForTests, orderForSubagents, mergeCatalogEntriesForSync, syncCatalogModels, restoreCodexCatalog, invalidateCodexModelsCache } from "./catalog/sync";
 export type { SpawnAgentSurface, SubagentRosterExclusionReason, EffectiveSubagentModel, SubagentRosterExclusion, EffectiveSubagentRoster } from "./catalog/sync";
 export { accountBoundNativeDisplayName, accountBoundNativeModelSlugs, CODEX_ACCOUNT_BOUND_CATALOG_KIND, trustedAccountBoundNativeCatalogSlug, visibleCodexAccountSelectors } from "./catalog/account-models";
+export { buildProviderSplitCatalog } from "./split-catalog";
+export type { BuildProviderSplitCatalogOptions, SplitCatalogEntry } from "./split-catalog";
