@@ -20,6 +20,31 @@ export interface ProviderSplitDecision {
   readonly reason: string;
 }
 
+/**
+ * Reject catalog identities that could be claimed by more than one physical channel.
+ * The classifier keeps an official-first defensive order, but a production catalog
+ * must not rely on that order to resolve an ownership conflict.
+ */
+export function assertProviderSplitCatalogDisjoint(catalog: ProviderSplitCatalog): void {
+  const owners = new Map<string, string>();
+  const claim = (identity: string, owner: string): void => {
+    const previous = owners.get(identity);
+    if (previous !== undefined && previous !== owner) {
+      throw new Error(`Provider split catalog overlap for ${identity}: ${previous} vs ${owner}`);
+    }
+    owners.set(identity, owner);
+  };
+
+  for (const model of catalog.officialModels) claim(model, "official-native");
+  for (const model of catalog.officialApiKeyModels) claim(model, "official-api-key");
+  for (const model of catalog.thirdPartyModels) claim(model, "third-party-gateway");
+  for (const namespace of catalog.officialAccountNamespaces) {
+    for (const model of catalog.officialModels) {
+      claim(`${namespace}/${model}`, "official-native-account");
+    }
+  }
+}
+
 function invalidDecision(reason = "unknown-model"): ProviderSplitDecision {
   return {
     channel: "invalid",
