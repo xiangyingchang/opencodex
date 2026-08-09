@@ -31,6 +31,7 @@ interface RestoreJournalResult {
   profileRestored: boolean;
   configChanged: boolean;
   profileChanged: boolean;
+  journalRemoved: boolean;
   complete: boolean;
 }
 
@@ -99,8 +100,14 @@ export function markJournalInjectedState(config: string, profile: string | null)
   atomicWriteFile(JOURNAL_PATH, JSON.stringify(journal));
 }
 
-export function removeJournal(): void {
-  try { unlinkSync(JOURNAL_PATH); } catch { /* ignore */ }
+export function removeJournal(): boolean {
+  if (!existsSync(JOURNAL_PATH)) return true;
+  try {
+    unlinkSync(JOURNAL_PATH);
+    return !existsSync(JOURNAL_PATH);
+  } catch {
+    return false;
+  }
 }
 
 function readJournal(): Journal | null {
@@ -118,7 +125,7 @@ function readJournal(): Journal | null {
 export function restoreJournalState(): RestoreJournalResult {
   const journal = readJournal();
   if (!journal) {
-    return { configRestored: false, profileRestored: false, configChanged: false, profileChanged: false, complete: false };
+    return { configRestored: false, profileRestored: false, configChanged: false, profileChanged: false, journalRemoved: false, complete: false };
   }
   const currentConfig = existsSync(CODEX_CONFIG_PATH) ? readFileSync(CODEX_CONFIG_PATH, "utf-8") : "";
   const currentProfile = existsSync(CODEX_PROFILE_PATH) ? readFileSync(CODEX_PROFILE_PATH, "utf-8") : null;
@@ -135,17 +142,22 @@ export function restoreJournalState(): RestoreJournalResult {
     if (journal.originalProfile !== null) {
       atomicWriteFile(CODEX_PROFILE_PATH, Buffer.from(journal.originalProfile, "base64").toString("utf-8"));
     } else if (existsSync(CODEX_PROFILE_PATH)) {
-      try { unlinkSync(CODEX_PROFILE_PATH); } catch { /* ignore */ }
+      try {
+        unlinkSync(CODEX_PROFILE_PATH);
+      } catch {
+        profileRestored = false;
+      }
     }
-    profileRestored = true;
+    if (existsSync(CODEX_PROFILE_PATH) === (journal.originalProfile !== null)) profileRestored = true;
   }
-  const complete = configRestored && profileRestored;
-  if (complete) removeJournal();
+  const journalRemoved = configRestored && profileRestored ? removeJournal() : false;
+  const complete = configRestored && profileRestored && journalRemoved;
   return {
     configRestored,
     profileRestored,
     configChanged: !configUnchanged,
     profileChanged: !profileUnchanged,
+    journalRemoved,
     complete,
   };
 }

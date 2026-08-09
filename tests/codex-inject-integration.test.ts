@@ -584,4 +584,22 @@ describe("injectCodexConfig integration (Design B)", () => {
     expect(config).not.toContain("multi_agent_v2 = true");
     expect(config).not.toContain("multi_agent_v2 = {");
   });
+
+  test("restore does not report success when the journaled config no longer matches", () => {
+    writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+
+    expect(runInject(codexHome, ocxHome).status).toBe(0);
+    const configPath = join(codexHome, "config.toml");
+    const changed = readFileSync(configPath, "utf8").replace('model = "gpt-5.5"', 'model = "user-owned/model"');
+    writeFileSync(configPath, changed, "utf8");
+
+    const restored = runRestore(codexHome, ocxHome);
+    expect(restored.status).toBe(0);
+    const result = JSON.parse(restored.stdout);
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("journal restore was incomplete");
+    const after = readFileSync(configPath, "utf8");
+    expect(after).not.toContain("openai_base_url");
+    expect(existsSync(join(codexHome, "opencodex-journal.json"))).toBe(true);
+  });
 });

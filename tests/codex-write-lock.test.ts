@@ -22,6 +22,7 @@ import {
   canonicalizeCodexHome,
   withCodexWriteLock,
 } from "../src/codex/codex-write-lock";
+import { codexWriteCoordinationEligibility } from "../src/codex/inject-coordination";
 import type { AdmissionSnapshot } from "../src/codex/convergence-types";
 
 let root = "";
@@ -137,6 +138,19 @@ describe("canonical home identity", () => {
     const result = canonicalizeCodexHome(file);
     expect(result.ok).toBe(false);
     expect(result.ok === false && result.reason).toBe("codex_home_unsafe");
+  });
+});
+
+describe("coordination adoption", () => {
+  test("refuses to seed a coordinator over indeterminate native state", () => {
+    expect(codexWriteCoordinationEligibility({
+      coordinatorPath: () => join(codexHome, "missing-coordinator.sqlite"),
+      residue: () => ({ kind: "indeterminate" }),
+      integrationRecord: () => ({ kind: "read" }),
+    })).toEqual({
+      kind: "refused",
+      reason: "the existing native Codex state is ambiguous and cannot seed a coordinator row",
+    });
   });
 });
 

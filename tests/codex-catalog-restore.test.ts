@@ -46,7 +46,7 @@ describe("Codex catalog restore", () => {
     writeFileSync(catalogPath, JSON.stringify({
       models: [
         { slug: "gpt-5.5" },
-        { slug: "opencode-go/deepseek-v4-pro" },
+        { slug: "opencode-go/deepseek-v4-pro", description: "Routed via opencodex → opencode-go (OpenAI)." },
         { slug: "user-native" },
       ],
     }, null, 2) + "\n");
@@ -104,8 +104,8 @@ describe("Codex catalog restore", () => {
     expect(r.status).toBe(0);
     const resolvedCatalogPath = join(realpathSync.native(codexHome), "catalog.json");
     expect(JSON.parse(r.stdout)).toEqual({
-      first: { removed: 4, kept: 4, path: resolvedCatalogPath },
-      second: { removed: 0, kept: 4, path: resolvedCatalogPath },
+      first: { removed: 3, kept: 5, path: resolvedCatalogPath },
+      second: { removed: 0, kept: 5, path: resolvedCatalogPath },
     });
     const restored = JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<Record<string, unknown>>;
     expect(restored.find(model => model.slug === "gpt-5.5")).toMatchObject({
@@ -115,7 +115,7 @@ describe("Codex catalog restore", () => {
     expect(restored.find(model => model.slug === "gpt-5.4")?.visibility).toBe("hide");
     expect(restored.find(model => model.slug === "gpt-5.3-codex-spark")?.visibility).toBe("hide");
     expect(restored.find(model => model.slug === "user-native")?.visibility).toBe("hide");
-    expect(restored.some(model => String(model.slug).includes("/"))).toBe(false);
+    expect(restored.find(model => model.slug === "provider/gpt-5.3-codex-spark")).toBeDefined();
   }, { timeout: 15_000 });
 
   test("fallback restore leaves hidden natives untouched when current config is unreadable", () => {
@@ -223,12 +223,13 @@ describe("Codex catalog restore", () => {
     `);
 
     expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout)).toMatchObject({ removed: 1, kept: 3 });
+    expect(JSON.parse(r.stdout)).toMatchObject({ removed: 0, kept: 4 });
     const restored = JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<Record<string, unknown>>;
-    expect(restored).toEqual([
-      { slug: "gpt-5.5", priority: 50 },
-      { slug: "codex-mini", priority: 60 },
-      { slug: "user-native", priority: 10 },
+    expect(restored.map(model => model.slug)).toEqual([
+      "gpt-5.5",
+      "codex-mini",
+      "user-native",
+      "umans/umans-kimi-k2.7",
     ]);
   }, { timeout: 15_000 });
 
@@ -253,9 +254,9 @@ describe("Codex catalog restore", () => {
     `);
 
     expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout)).toMatchObject({ removed: 1, kept: 2 });
+    expect(JSON.parse(r.stdout)).toMatchObject({ removed: 0, kept: 3 });
     const restored = JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<Record<string, unknown>>;
-    expect(restored.map(m => m.slug)).toEqual(["gpt-5.5", "user-native"]);
+    expect(restored.map(m => m.slug)).toEqual(["gpt-5.5", "umans/umans-kimi-k2.7", "user-native"]);
   }, { timeout: 15_000 });
 
   test("sync applies native-only subagent priority selections", () => {

@@ -29,7 +29,7 @@ import type {
 } from "./convergence-types";
 import { resolveCodexHomeDir } from "./home";
 import { readIntegrationRecord } from "./integration-record";
-import { classifyNativeRoutedResidue } from "./native-residue";
+import { classifyNativeRoutedResidue, isUnmarkedProfileResidue } from "./native-residue";
 import {
   CodexUserIdentityRefusal,
   resolveCodexCoordinatorDatabasePath,
@@ -265,21 +265,37 @@ function validateHistoryWrite(expected: CodexTransitionVersion, history: CodexHi
  * `{0,null}` over a legacy JSON pair or routed native bytes loses the only
  * evidence that an interrupted transition still needs salvage.
  */
-function assertInitialStateCanBeCreated(): void {
+function assertInitialStateCanBeCreated(
+  allowLegacyResidue = false,
+  allowIndeterminateResidue = false,
+  allowIndeterminateProfile = false,
+): void {
   const integration = readIntegrationRecord();
   if (integration.kind === "invalid") {
     throw new CodexCoordinatorLegacyAmbiguousError(
       "A missing coordinator row cannot be initialized over legacy or invalid Codex integration state.",
     );
   }
-  if (classifyNativeRoutedResidue().kind !== "clean") {
+  const residue = classifyNativeRoutedResidue();
+  // Restore may explicitly authorize an indeterminate surface only after it has
+  // found journal or external-provider evidence. Injection never sets that flag.
+  if (allowLegacyResidue && residue.kind === "residue") return;
+  if (allowIndeterminateProfile && isUnmarkedProfileResidue(residue)) return;
+  if (allowIndeterminateResidue && residue.kind === "indeterminate") return;
+  if (residue.kind !== "clean") {
     throw new CodexCoordinatorLegacyAmbiguousError(
       "A missing coordinator row cannot be initialized while native Codex routing residue exists.",
     );
   }
 }
 
-function initialize(database: Database, databaseWasAbsent: boolean): void {
+function initialize(
+  database: Database,
+  databaseWasAbsent: boolean,
+  allowLegacyResidue: boolean,
+  allowIndeterminateResidue: boolean,
+  allowIndeterminateProfile: boolean,
+): void {
   const version = database.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version;
   if (version !== 0 && version !== COORDINATOR_SCHEMA_VERSION) {
     throw new CodexCoordinatorTransactionError("The coordinator database schema version is unsupported.");
@@ -297,7 +313,11 @@ function initialize(database: Database, databaseWasAbsent: boolean): void {
     );
   }
   if (!existing) {
-    assertInitialStateCanBeCreated();
+    assertInitialStateCanBeCreated(
+      allowLegacyResidue,
+      allowIndeterminateResidue,
+      allowIndeterminateProfile,
+    );
     database.query(INITIALIZE_TRANSITION_ROW).run(new Date().toISOString());
   }
   if (version === 0) database.exec(`PRAGMA user_version = ${COORDINATOR_SCHEMA_VERSION}`);
@@ -345,7 +365,14 @@ function createCapability(
   };
 }
 
-export function openCodexCoordinatorTransaction(finalDatabasePath: string): CodexCoordinatorTransactionController {
+export function openCodexCoordinatorTransaction(
+  finalDatabasePath: string,
+  options: {
+    allowLegacyResidue?: boolean;
+    allowIndeterminateResidue?: boolean;
+    allowIndeterminateProfile?: boolean;
+  } = {},
+): CodexCoordinatorTransactionController {
   let database: Database | undefined;
   let transactionOpen = false;
   let closed = false;
@@ -415,7 +442,13 @@ export function openCodexCoordinatorTransaction(finalDatabasePath: string): Code
     initialIdentity = `${opened.dev}:${opened.ino}`;
     database.exec("PRAGMA busy_timeout = 0; PRAGMA locking_mode = NORMAL; BEGIN IMMEDIATE");
     transactionOpen = true;
-    initialize(database, databaseWasAbsent);
+    initialize(
+      database,
+      databaseWasAbsent,
+      options.allowLegacyResidue === true,
+      options.allowIndeterminateResidue === true,
+      options.allowIndeterminateProfile === true,
+    );
   } catch (cause) {
     if (transactionOpen) {
       try { database?.exec("ROLLBACK"); } catch { /* close releases the transaction */ }

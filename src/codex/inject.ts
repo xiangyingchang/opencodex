@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   atomicWriteFile,
   loadConfig,
@@ -7,7 +7,7 @@ import {
   subagentDefaultSyncEffective,
   websocketsEnabled,
 } from "../config";
-import { withCodexWriteLock } from "./codex-write-lock";
+import { withCodexWriteLock, withCodexWriteLockSync } from "./codex-write-lock";
 import { resolveCodexHistoryTransition } from "./history-transition";
 import {
   buildInjectWitness,
@@ -21,7 +21,7 @@ import {
   restoreCodexPreImages,
 } from "./inject-coordination";
 import { readIntegrationRecord } from "./integration-record";
-import { classifyNativeRoutedResidue } from "./native-residue";
+import { classifyNativeRoutedResidue, isUnmarkedProfileResidue } from "./native-residue";
 import {
   resolveCodexCoordinatorDatabasePath,
   resolveEffectiveUserIdentity,
@@ -31,6 +31,7 @@ import {
   removeJournal,
   restoreJournalState,
   writeJournal,
+  JOURNAL_PATH,
 } from "./journal";
 import { withCatalogWriteSerialization } from "./catalog-write-serialization";
 import { restoreCodexCatalogWithPermit } from "./catalog/sync";
@@ -69,6 +70,7 @@ import type { OcxConfig } from "../types";
 import { codexInjectionHostname, desiredCodexRoutingMode } from "./desired-state";
 import {
   classifyCodexSplitState,
+  isSplitBridgeRoutingInjected,
   restoreBridgeOwnedRouting,
   type CodexSplitState,
   type CodexSplitStateObservation,
@@ -79,6 +81,15 @@ import {
 export { hasInjectedCodexRouting, hasInjectedOpenaiBaseUrl };
 export { classifyCodexSplitState, restoreBridgeOwnedRouting };
 export type { CodexSplitState, CodexSplitStateObservation };
+
+export function isCodexSplitBridgeRoutingInjected(): boolean {
+  if (!existsSync(CODEX_CONFIG_PATH)) return false;
+  try {
+    return isSplitBridgeRoutingInjected(readFileSync(CODEX_CONFIG_PATH, "utf8"));
+  } catch {
+    return false;
+  }
+}
 
 export function externalCodexModelProvider(content: string): string | null {
   const provider = resolveEffectiveProjectModelProvider(content).provider;
@@ -834,20 +845,21 @@ export async function injectCodexConfig(
   /*
    * Eligibility BEFORE acquisition, never "try and fall back".
    *
-   * A home routed before this substrate existed cannot have its first
-   * coordinator row created — the guard that refuses is correct — and that
-   * describes every pre-substrate install. Attempting the lock there would enter
-   * a refusal path on the entire installed base, so the decision happens first
-   * and those homes keep the write sequence they have always used.
+   * A home routed before this substrate existed needs the explicit residue
+   * adoption exception on first lock acquisition. Decide that before opening
+   * the lock so the lock never has to guess whether legacy residue is safe.
    */
+  const residue = classifyNativeRoutedResidue();
+  const allowIndeterminateProfile = isUnmarkedProfileResidue(residue);
   const eligibility = codexWriteCoordinationEligibility({
     coordinatorPath: () =>
       resolveCodexCoordinatorDatabasePath(
         resolveEffectiveUserIdentity(),
         getCodexHome(),
       ),
-    residue: () => classifyNativeRoutedResidue(),
+    residue: () => residue,
     integrationRecord: () => readIntegrationRecord(),
+    allowIndeterminateProfile,
   });
   if (eligibility.kind === "refused") {
     return {
@@ -867,33 +879,29 @@ export async function injectCodexConfig(
   };
 
   /*
-   * Set only on the coordinated path: the generation/txId the transition just
-   * committed. The terminal history update CASes against this, so a job that
-   * was overtaken cannot overwrite the winner. Stays undefined for a
-   * legacy-uncoordinated home, which publishes no transition to resolve.
+   * The generation/txId the transition just committed. The terminal history
+   * update CASes against this, so a job that was overtaken cannot overwrite the
+   * winner. Legacy homes use the same lock with an explicit one-time residue
+   * adoption instead of bypassing coordination.
    */
   let transitionReceipt: { nativeGeneration: number; currentTxId: string } | undefined;
-
-  if (eligibility.kind === "legacy-uncoordinated") {
-    // Unchanged behavior for homes the coordinator cannot yet adopt. Stated
-    // rather than implied: this is the boundary, and adoption is its own phase.
-    applyNativeArtifacts();
-  } else {
-    const coordinated = await withCodexWriteLock(
-      {
-        timeoutMs: options.lockTimeoutMs ?? DEFAULT_INJECT_LOCK_TIMEOUT_MS,
-        admitted: { authoritySnapshotId: witness.comparisonId },
-        readAdmissionUnderLock: () => ({
-          authoritySnapshotId: recomputeInjectWitness({
-            candidate: witness.candidate,
-            canonicalTargets: witness.evidence.canonicalTargets,
-            persistedIdentity,
-            generation,
-            observedOwnership: witness.observedOwnership,
-          }).comparisonId,
-        }),
-      },
-      (ctx) => {
+  const coordinated = await withCodexWriteLock(
+    {
+      timeoutMs: options.lockTimeoutMs ?? DEFAULT_INJECT_LOCK_TIMEOUT_MS,
+      admitted: { authoritySnapshotId: witness.comparisonId },
+      allowLegacyResidue: eligibility.kind === "legacy-uncoordinated",
+      allowIndeterminateProfile,
+      readAdmissionUnderLock: () => ({
+        authoritySnapshotId: recomputeInjectWitness({
+          candidate: witness.candidate,
+          canonicalTargets: witness.evidence.canonicalTargets,
+          persistedIdentity,
+          generation,
+          observedOwnership: witness.observedOwnership,
+        }).comparisonId,
+      }),
+    },
+    (ctx) => {
         /*
          * Publish BEFORE touching the filesystem. `assertPublished` runs after this
          * callback returns and throws unless a transition was recorded, so writing
@@ -943,27 +951,26 @@ export async function injectCodexConfig(
           }
           throw error;
         }
-        return {
-          kind: "applied" as const,
-          /*
-           * The receipt the terminal update matches on. The transition commits
-           * when the callback returns, so this pair is what the post-job
-           * `updateCodexHistoryTransition` CASes against — an overtaken job
-           * cannot overwrite a winner.
-           */
-          receipt: {
-            nativeGeneration: ctx.expectation.nativeAfter,
-            currentTxId: ctx.expectation.txId,
-          },
-        };
-      },
-    );
+      return {
+        kind: "applied" as const,
+        /*
+         * The receipt the terminal update matches on. The transition commits
+         * when the callback returns, so this pair is what the post-job
+         * `updateCodexHistoryTransition` CASes against — an overtaken job
+         * cannot overwrite a winner.
+         */
+        receipt: {
+          nativeGeneration: ctx.expectation.nativeAfter,
+          currentTxId: ctx.expectation.txId,
+        },
+      };
+    },
+  );
 
-    if (coordinated.status !== "acquired") {
-      return codexInjectLockOutcome(coordinated);
-    }
-    transitionReceipt = coordinated.value.receipt;
+  if (coordinated.status !== "acquired") {
+    return codexInjectLockOutcome(coordinated);
   }
+  transitionReceipt = coordinated.value.receipt;
   // Legacy mode still forward-tags history so re-tagged threads stay listable. Design B needs
   // the opposite: a one-time migration of previously re-tagged threads BACK to openai (restore
   // machinery; cheap no-op when there is nothing to migrate).
@@ -1168,7 +1175,7 @@ function hasOpencodexRouting(content: string): boolean {
   );
 }
 
-export function removeCodexConfig(
+function removeCodexConfigUnlocked(
   options: { preserveProfile?: boolean } = {},
 ): { success: boolean; message: string } {
   if (!existsSync(CODEX_CONFIG_PATH)) {
@@ -1222,6 +1229,267 @@ export function removeCodexConfig(
   };
 }
 
+type RestoreConfigResult = { success: boolean; message: string };
+type RestoreConfigLockedResult = RestoreConfigResult & {
+  receipt?: { nativeGeneration: number; currentTxId: string };
+  catalog?: { removed: number; kept: number; path: string };
+};
+
+function readRestoreSurface(): { config: string | null; profile: string | null } {
+  return {
+    config: existsSync(CODEX_CONFIG_PATH) ? readFileSync(CODEX_CONFIG_PATH, "utf8") : null,
+    profile: existsSync(CODEX_PROFILE_PATH) ? readFileSync(CODEX_PROFILE_PATH, "utf8") : null,
+  };
+}
+
+function restoreSurfaceIdentity(surface: { config: string | null; profile: string | null }): string {
+  return JSON.stringify([surface.config, surface.profile]);
+}
+
+/** Test-only pause used to prove a restore holds the same lock as injection. */
+function waitForRestoreTestHook(): void {
+  const holdPath = process.env.OCX_RESTORE_RACE_HOLD?.trim();
+  const releasePath = process.env.OCX_RESTORE_RACE_RELEASE?.trim();
+  if (!holdPath || !releasePath) return;
+  try { writeFileSync(holdPath, "held\n", { mode: 0o600 }); } catch { return; }
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(releasePath) && Date.now() < deadline) Bun.sleepSync(10);
+}
+
+function restoreAdmissionWitness(): {
+  candidate: { configBytes: string; profileBytes: string; catalogPath: string | null };
+  persistedIdentity: string;
+  generation: { present: boolean; value: number };
+  witness: ReturnType<typeof buildInjectWitness>;
+} {
+  const surface = readRestoreSurface();
+  const persisted = readConfigAdmissionSnapshot();
+  const persistedIdentity = persisted.kind === "read" ? persisted.contentSha256 : "unreadable";
+  const observedGeneration = observeConfigGeneration();
+  const generation = observedGeneration.kind === "ready"
+    ? { present: true, value: observedGeneration.generation.value }
+    : { present: false, value: 0 };
+  const candidate = {
+    configBytes: surface.config ?? "",
+    profileBytes: surface.profile ?? "",
+    catalogPath: null,
+  };
+  return {
+    candidate,
+    persistedIdentity,
+    generation,
+    witness: buildInjectWitness(
+      candidate,
+      restoreSurfaceIdentity(surface),
+      persistedIdentity,
+      generation,
+      "unknown",
+    ),
+  };
+}
+
+function restoreConfigLocked(
+  acquire: "async" | "sync",
+  options: { preserveProfile?: boolean; lockTimeoutMs?: number; restoreCatalog?: boolean } = {},
+): Promise<RestoreConfigLockedResult> | RestoreConfigLockedResult {
+  const admitted = restoreAdmissionWitness();
+  const restoreSurface = readRestoreSurface();
+  const ownedRouting = restoreSurface.config !== null
+    && classifyCodexSplitState(restoreSurface.config).owned;
+  const externalRouting = restoreSurface.config !== null
+    && externalCodexModelProvider(restoreSurface.config) !== null;
+  const journalPresent = existsSync(JOURNAL_PATH);
+  const residue = classifyNativeRoutedResidue();
+  const allowIndeterminateProfile = isUnmarkedProfileResidue(residue);
+  const eligibility = codexWriteCoordinationEligibility({
+    coordinatorPath: () => resolveCodexCoordinatorDatabasePath(resolveEffectiveUserIdentity(), getCodexHome()),
+    residue: () => residue,
+    integrationRecord: () => readIntegrationRecord(),
+    allowIndeterminateResidue: residue.kind === "indeterminate" && (externalRouting || journalPresent),
+    allowIndeterminateProfile,
+  });
+  if (eligibility.kind === "refused") {
+    return {
+      success: false,
+      message: `Codex restore was not coordinated: ${eligibility.reason}.`,
+    };
+  }
+  // A missing config has no native routing bytes to adopt. A profile-only residue is
+  // handled by the existing profile cleanup path; history/catalog residue is never
+  // allowed to create a coordinator row without a config or valid journal proof.
+  const noConfigSafe = restoreSurface.config === null
+    && (residue.kind === "clean" || residue.surface === "profile");
+  const residueAllowsLegacy = restoreSurface.config !== null && residue.kind === "residue";
+  const allowLegacyResidue = eligibility.kind === "legacy-uncoordinated"
+    && (residueAllowsLegacy
+      || ownedRouting
+      || externalRouting
+      || journalPresent
+      || noConfigSafe);
+  if (eligibility.kind === "legacy-uncoordinated" && !allowLegacyResidue) {
+    return {
+      success: false,
+      message: `Codex restore was not coordinated: ${eligibility.reason}. Refusing an ambiguous native state.`,
+    };
+  }
+
+  const commit = (ctx: Parameters<Parameters<typeof withCodexWriteLock>[1]>[0]) => {
+    const published = ctx.coordinator.beginTransition(
+      {
+        nativeGeneration: ctx.expectation.nativeBefore,
+        currentTxId: ctx.currentTxId,
+      },
+      {
+        txId: ctx.expectation.txId,
+        direction: "remove",
+        authoritySnapshotId: ctx.admission.authoritySnapshotId,
+        nextRetryAt: new Date().toISOString(),
+      },
+    );
+    if (published.kind !== "updated") {
+      throw new CodexWriteConflictError(`The Codex restore transition could not be published: ${published.kind}.`);
+    }
+
+    waitForRestoreTestHook();
+    const preImages = captureCodexPreImages();
+    try {
+      const currentConfig = existsSync(CODEX_CONFIG_PATH)
+        ? readFileSync(CODEX_CONFIG_PATH, "utf8")
+        : null;
+      const activeProvider = currentConfig ? externalCodexModelProvider(currentConfig) : null;
+      let result: RestoreConfigResult;
+      if (activeProvider) {
+        const journalRemoved = removeJournal();
+        result = journalRemoved
+          ? {
+            success: true,
+            message: `External Codex provider ${tomlString(activeProvider)} preserved; no native restore was needed.`,
+          }
+          : {
+            success: false,
+            message: `External Codex provider ${tomlString(activeProvider)} preserved, but the OpenCodex journal could not be removed.`,
+          };
+      } else {
+        const journalWasPresent = existsSync(JOURNAL_PATH);
+        const journal = restoreJournalState();
+        result = journal.complete
+          ? {
+            success: true,
+            message: "Codex config restored from opencodex journal.",
+          }
+          : journalWasPresent
+            ? journal.configRestored
+              ? {
+                success: false,
+                message: "Codex journal restore was incomplete; the config was restored but the profile or journal could not be finalized.",
+              }
+              : (() => {
+                const fallback = removeCodexConfigUnlocked({
+                  preserveProfile: options.preserveProfile === true || journal.profileRestored || journal.profileChanged,
+                });
+                return fallback.success
+                  ? {
+                    success: false,
+                    message: `${fallback.message} Codex journal restore was incomplete; the journal was not finalized.`,
+                  }
+                  : fallback;
+              })()
+            : removeCodexConfigUnlocked({
+              preserveProfile: options.preserveProfile === true || journal.profileRestored || journal.profileChanged,
+            });
+      }
+      if (!result.success) {
+        const after = captureCodexPreImages();
+        const changed = after.config !== preImages.config
+          || after.profile !== preImages.profile
+          || after.journal !== preImages.journal;
+        if (!changed) throw new CodexWriteConflictError(result.message);
+      }
+      let catalog: RestoreConfigLockedResult["catalog"];
+      if (options.restoreCatalog) {
+        // Keep K inside the native write transaction: an injection must not win the
+        // config lock between routing restore and catalog cleanup. K contention throws
+        // before the lock commits, so the pre-image compensation restores the config.
+        const restoredCatalog = withCatalogWriteSerialization(ctx.canonicalCodexHome, permit =>
+          restoreCodexCatalogWithPermit(permit, ctx.canonicalCodexHome));
+        if (restoredCatalog.kind !== "completed") {
+          throw new CodexWriteConflictError(`Codex catalog restore could not be completed (${restoredCatalog.reason}).`);
+        }
+        catalog = restoredCatalog.value;
+      }
+      return {
+        result,
+        ...(catalog ? { catalog } : {}),
+        receipt: {
+          nativeGeneration: ctx.expectation.nativeAfter,
+          currentTxId: ctx.expectation.txId,
+        },
+      };
+    } catch (error) {
+      const restored = restoreCodexPreImages(preImages);
+      if (!restored.complete) throw new CodexPartialWriteError(restored.unrestored);
+      throw error;
+    }
+  };
+
+  const lockOptions = {
+    timeoutMs: options.lockTimeoutMs ?? DEFAULT_INJECT_LOCK_TIMEOUT_MS,
+    admitted: { authoritySnapshotId: admitted.witness.comparisonId },
+    allowLegacyResidue,
+    allowIndeterminateResidue: allowLegacyResidue
+      && residue.kind === "indeterminate"
+      && !allowIndeterminateProfile,
+    allowIndeterminateProfile,
+    readAdmissionUnderLock: () => {
+      const current = restoreAdmissionWitness();
+      return { authoritySnapshotId: current.witness.comparisonId };
+    },
+  };
+
+  if (acquire === "sync") {
+    try {
+      const locked = withCodexWriteLockSync(lockOptions, commit);
+      if (locked.status !== "acquired") return codexInjectLockOutcome(locked);
+      return {
+        ...locked.value.result,
+        ...(locked.value.catalog ? { catalog: locked.value.catalog } : {}),
+        receipt: locked.value.receipt,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  return withCodexWriteLock(lockOptions, commit)
+    .then(locked => {
+      if (locked.status !== "acquired") return codexInjectLockOutcome(locked);
+      return {
+        ...locked.value.result,
+        ...(locked.value.catalog ? { catalog: locked.value.catalog } : {}),
+        receipt: locked.value.receipt,
+      };
+    })
+    .catch(error => ({
+      success: false,
+      message: error instanceof Error ? error.message : String(error),
+    }));
+}
+
+function resolveSkippedRestoreTransition(receipt: RestoreConfigLockedResult["receipt"]): void {
+  if (receipt) resolveCodexHistoryTransition(receipt, { kind: "skipped" });
+}
+
+export function removeCodexConfig(
+  options: { preserveProfile?: boolean; lockTimeoutMs?: number } = {},
+): RestoreConfigResult {
+  const result = restoreConfigLocked("sync", options) as RestoreConfigLockedResult;
+  resolveSkippedRestoreTransition(result.receipt);
+  return { success: result.success, message: result.message };
+}
+
 /**
  * Recover native Codex: strip opencodex from config.toml AND drop proxy-routed catalog entries,
  * so plain `codex` works when the proxy is stopped. Called by `ocx stop`, the proxy shutdown
@@ -1237,7 +1505,11 @@ export async function restoreNativeCodexAsync(): Promise<{
   success: boolean;
   message: string;
 }> {
-  const inline = restoreNativeCodex({ skipHistory: true });
+  // The old synchronous equivalent was restoreNativeCodex({ skipHistory: true });
+  const inline = await restoreConfigLocked("async", { restoreCatalog: true }) as RestoreConfigLockedResult;
+  if (!inline.success) return { success: false, message: inline.message };
+  const cat = inline.catalog;
+  if (!cat) return { success: false, message: `${inline.message} Codex catalog restore was not coordinated.` };
   const outcome = await runCodexHistoryJob({
     ...resolveCodexHistoryJobTarget(),
     operation: deriveCodexHistoryOperation({
@@ -1248,6 +1520,7 @@ export async function restoreNativeCodexAsync(): Promise<{
       legacyMode: false,
     }),
   });
+  if (inline.receipt) resolveCodexHistoryTransition(inline.receipt, outcome);
   const historyMsg =
     outcome.kind === "converged"
       ? outcome.rows > 0
@@ -1257,36 +1530,20 @@ export async function restoreNativeCodexAsync(): Promise<{
         ? ""
         : // A lock we could not take is reported, never counted as nothing to do.
           ` ⚠️ Codex resume history could NOT be restored — the Codex app appears to be holding the history database. Close Codex and run \`ocx restore\` again.`;
-  return { success: inline.success, message: `${inline.message}${historyMsg}` };
+  const catalogMsg = cat.removed > 0
+    ? ` Catalog restored to ${cat.kept} native model(s) (dropped ${cat.removed} proxy-routed).`
+    : "";
+  return { success: true, message: `${inline.message}${catalogMsg}${historyMsg}` };
 }
 
 export function restoreNativeCodex(options: { skipHistory?: boolean } = {}): {
   success: boolean;
   message: string;
 } {
-  const activeProvider = currentExternalCodexModelProvider();
-  if (activeProvider) {
-    removeJournal();
-    return {
-      success: true,
-      message: `External Codex provider ${tomlString(activeProvider)} preserved; no native restore was needed.`,
-    };
-  }
-  const journal = restoreJournalState();
-  const cfg = journal.configRestored
-    ? {
-        success: true,
-        message: "Codex config restored from opencodex journal.",
-      }
-    : removeCodexConfig({
-        preserveProfile: journal.profileRestored || journal.profileChanged,
-      });
-  const owningCodexHome = getCodexHome();
-  const restoredCatalog = withCatalogWriteSerialization(owningCodexHome, permit => restoreCodexCatalogWithPermit(permit, owningCodexHome));
-  const cat =
-    restoredCatalog.kind === "completed"
-      ? restoredCatalog.value
-      : { removed: 0, kept: 0, path: DEFAULT_CATALOG_PATH };
+  const cfg = restoreConfigLocked("sync", { restoreCatalog: true }) as RestoreConfigLockedResult;
+  if (!cfg.success) return { success: false, message: cfg.message };
+  const cat = cfg.catalog;
+  if (!cat) return { success: false, message: `${cfg.message} Codex catalog restore was not coordinated.` };
   // Design B (loopback) steady state: threads are already tagged openai, so prove the
   // no-op with a readonly probe instead of write-opening a DB the Codex app may hold
   // (Windows: WAL writer lock -> seconds of stalling + a false warning on every stop).
@@ -1304,6 +1561,16 @@ export function restoreNativeCodex(options: { skipHistory?: boolean } = {}): {
     : syncCodexHistoryProvider("openai", undefined, undefined, {
         skipWhenProvablyNoop,
       });
+  if (cfg.receipt) {
+    resolveCodexHistoryTransition(
+      cfg.receipt,
+      options.skipHistory
+        ? { kind: "skipped" }
+        : history.failed
+          ? { kind: "blocked", reason: "database" }
+          : { kind: "converged", rows: history.rows, files: history.files },
+    );
+  }
   const msg =
     cat.removed > 0
       ? `${cfg.message} Catalog restored to ${cat.kept} native model(s) (dropped ${cat.removed} proxy-routed).`
@@ -1315,7 +1582,7 @@ export function restoreNativeCodex(options: { skipHistory?: boolean } = {}): {
       : history.ejectedRows
         ? ` ${history.ejectedRows} opencodex history thread(s) were ejected to openai so native Codex can resume them.`
         : "";
-  return { success: cfg.success, message: `${msg}${historyMsg}` };
+  return { success: true, message: `${msg}${historyMsg}` };
 }
 
 export function getCodexConfigPath(): string {

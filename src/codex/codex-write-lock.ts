@@ -92,6 +92,12 @@ export interface CodexWriteLockOptions {
   admitted: CodexWriteWitness;
   /** Authoritative synchronous re-read while N and C are both held. */
   readAdmissionUnderLock(): CodexWriteWitness;
+  /** Restore may adopt a recognized pre-substrate routed residue while holding N. */
+  allowLegacyResidue?: boolean;
+  /** Restore-only proof may explicitly adopt an ambiguous state with journal/provider evidence. */
+  allowIndeterminateResidue?: boolean;
+  /** A valid, unmarked profile is safe to snapshot before replacing. */
+  allowIndeterminateProfile?: boolean;
 }
 
 /**
@@ -295,7 +301,11 @@ export async function withCodexWriteLock<T>(
 
     let transaction: ReturnType<typeof openCodexCoordinatorTransaction> | undefined;
     try {
-      transaction = openCodexCoordinatorTransaction(databasePath);
+      transaction = openCodexCoordinatorTransaction(databasePath, {
+        allowLegacyResidue: options.allowLegacyResidue,
+        allowIndeterminateResidue: options.allowIndeterminateResidue,
+        allowIndeterminateProfile: options.allowIndeterminateProfile,
+      });
     } catch (error) {
       // Only contention retries. A malformed database, an unsafe path, or an
       // identity failure will fail identically forever; telling a caller to retry
@@ -354,6 +364,130 @@ export async function withCodexWriteLock<T>(
           return { status: "busy", reason: "deadline", retryable: true, waitedMs: waited() };
         }
         await sleepJittered(deadline - performance.now(), signal);
+        continue;
+      }
+      throw error;
+    } finally {
+      transaction.close();
+    }
+  }
+}
+
+function sleepSync(remainingMs: number): void {
+  const span = RETRY_MAX_MS - RETRY_MIN_MS;
+  const wait = Math.min(remainingMs, RETRY_MIN_MS + Math.floor(Math.random() * (span + 1)));
+  if (wait <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
+}
+
+/**
+ * Synchronous companion for shutdown paths that cannot await a promise.
+ *
+ * It uses the same SQLite N -> C transaction and publication protocol as the async form. Callers
+ * should pass a zero timeout when running from a forced process-exit path so contention fails closed
+ * instead of blocking the event loop.
+ */
+export function withCodexWriteLockSync<T>(
+  options: Omit<CodexWriteLockOptions, "signal">,
+  commit: (context: CodexWriteCommitContext) => Synchronous<T>,
+): CodexWriteLockResult<T> {
+  const { timeoutMs } = options;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > CODEX_WRITE_LOCK_MAX_TIMEOUT_MS) {
+    return refuse("authority_not_proven",
+      `timeoutMs must be an integer between 0 and ${CODEX_WRITE_LOCK_MAX_TIMEOUT_MS}.`);
+  }
+
+  const ambient = canonicalizeCodexHome(getCodexHome());
+  if (!ambient.ok) return refuse(ambient.reason, ambient.message);
+  let target = ambient.home;
+  if (options.codexHome !== undefined) {
+    const trimmed = options.codexHome.trim();
+    if (!trimmed) return refuse("codex_home_unsafe", "An explicit codexHome must not be blank.");
+    const explicit = canonicalizeCodexHome(trimmed);
+    if (!explicit.ok) return refuse(explicit.reason, explicit.message);
+    if (explicit.home.path !== ambient.home.path) {
+      return refuse("authority_not_proven",
+        "The requested CODEX_HOME is not the one this process would inspect for safety.");
+    }
+    target = explicit.home;
+  }
+
+  const held = heldHomes.getStore();
+  if (held?.has(target.lockId)) {
+    return refuse("reentrant", "This task already holds the Codex write lock for this CODEX_HOME.");
+  }
+
+  let databasePath: string;
+  try {
+    databasePath = resolveCodexCoordinatorDatabasePath(resolveEffectiveUserIdentity(), target.path);
+  } catch (error) {
+    return refuse("namespace_unsafe",
+      error instanceof CodexUserIdentityRefusal ? error.message : "The lock namespace could not be resolved.");
+  }
+
+  const started = performance.now();
+  const deadline = started + timeoutMs;
+  const waited = (): number => Math.round(performance.now() - started);
+
+  for (;;) {
+    let transaction: ReturnType<typeof openCodexCoordinatorTransaction> | undefined;
+    try {
+      transaction = openCodexCoordinatorTransaction(databasePath, {
+        allowLegacyResidue: options.allowLegacyResidue,
+        allowIndeterminateResidue: options.allowIndeterminateResidue,
+        allowIndeterminateProfile: options.allowIndeterminateProfile,
+      });
+    } catch (error) {
+      if (!isBusyError(error)) {
+        if (error instanceof CodexUserIdentityRefusal) return refuse("lock_path_unsafe", error.message);
+        return refuse("lock_unavailable",
+          error instanceof Error ? error.message : "The Codex write lock could not be opened.");
+      }
+      if (performance.now() >= deadline) {
+        return { status: "busy", reason: "deadline", retryable: true, waitedMs: waited() };
+      }
+      sleepSync(deadline - performance.now());
+      continue;
+    }
+
+    try {
+      const expectation = transaction.expectation();
+      const version = transaction.version();
+      const nextHeld = new Set(held ?? []);
+      nextHeld.add(target.lockId);
+      const value = heldHomes.run(nextHeld, () => withConfigMutationLockSync(() => {
+        const current = options.readAdmissionUnderLock();
+        if (current.authoritySnapshotId !== options.admitted.authoritySnapshotId) {
+          throw new CodexWriteLockStaleAdmission();
+        }
+        const result = commit({
+          canonicalCodexHome: target.path,
+          lockId: target.lockId,
+          admission: current,
+          expectation,
+          currentTxId: version.currentTxId,
+          coordinator: transaction!.capability,
+        });
+        if (result && typeof (result as { then?: unknown }).then === "function") {
+          throw new TypeError("The Codex write-lock commit callback must be synchronous.");
+        }
+        return result;
+      }));
+
+      transaction.assertPublished(expectation);
+      transaction.commit();
+      return { status: "acquired", value: value as T, waitedMs: waited(), lockId: target.lockId };
+    } catch (error) {
+      transaction.rollback();
+      if (error instanceof CodexWriteLockStaleAdmission) {
+        return refuse("authority_not_proven",
+          "The admitted state changed before the commit could be made under the lock.");
+      }
+      if (isBusyError(error)) {
+        if (performance.now() >= deadline) {
+          return { status: "busy", reason: "deadline", retryable: true, waitedMs: waited() };
+        }
+        sleepSync(deadline - performance.now());
         continue;
       }
       throw error;

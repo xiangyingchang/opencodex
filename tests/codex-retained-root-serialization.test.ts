@@ -213,8 +213,8 @@ test("native restore cannot read-transform-write the catalog while another proce
     expect(restored.exitCode).toBe(0);
     expect(readFileSync(catalogPath, "utf8")).toBe(before);
     const source = readFileSync(join(repoRoot, "src/codex/inject.ts"), "utf8");
-    const restoreRoot = source.slice(source.indexOf("const owningCodexHome"), source.indexOf("// Design B", source.indexOf("const owningCodexHome")));
-    expect(restoreRoot).toContain("withCatalogWriteSerialization(owningCodexHome");
+    const restoreRoot = source.slice(source.indexOf("if (options.restoreCatalog)"), source.indexOf("return {", source.indexOf("if (options.restoreCatalog)")));
+    expect(restoreRoot).toContain("withCatalogWriteSerialization(ctx.canonicalCodexHome");
     expect(restoreRoot).toContain("restoreCodexCatalogWithPermit");
   } finally {
     holder.release();

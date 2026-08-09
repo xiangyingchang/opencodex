@@ -37,6 +37,17 @@ export type NativeRoutedResidueResult =
   | { kind: "residue"; surface: NativeResidueSurface; path: string }
   | { kind: "indeterminate"; surface: NativeResidueSurface; path: string; reason: string };
 
+const UNMARKED_PROFILE_REASON = "OpenCodex-shaped TOML does not match a complete routed grammar";
+
+/** A valid profile with no ownership marker can be snapshotted safely; malformed surfaces cannot. */
+export function isUnmarkedProfileResidue(
+  residue: { kind: string; surface?: string; reason?: string },
+): boolean {
+  return residue.kind === "indeterminate"
+    && residue.surface === "profile"
+    && residue.reason === UNMARKED_PROFILE_REASON;
+}
+
 type ReadResult =
   | { kind: "absent" }
   | { kind: "content"; content: string; path: string }

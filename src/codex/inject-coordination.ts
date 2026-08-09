@@ -10,6 +10,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { atomicWriteFile } from "../config";
 import type { CodexWriteLockResult } from "./codex-write-lock";
 import { JOURNAL_PATH } from "./journal";
+import { isUnmarkedProfileResidue } from "./native-residue";
 import { CODEX_CONFIG_PATH, CODEX_PROFILE_PATH } from "./paths";
 import {
   codexWriteCoordination,
@@ -33,10 +34,9 @@ export const DEFAULT_INJECT_LOCK_TIMEOUT_MS = 5_000;
  * lock, fall back on refusal" shape would attempt acquisition on the entire
  * installed base. Deciding first means that refusal path is never entered.
  *
- * `legacy-uncoordinated` is a temporary boundary, not a design: the
- * compatibility-adoption contract (`005_contract.md:709-779`) records an
- * existing routed home into the coordinator, and once that lands this branch
- * narrows to homes not yet adopted.
+ * `legacy-uncoordinated` is the explicit input to a first-lock residue
+ * adoption. The caller still takes N -> C; this result only selects whether
+ * the coordinator may initialize over already-routed bytes.
  */
 export type CodexWriteCoordinationEligibility =
   | { kind: "coordinated" }
@@ -45,8 +45,10 @@ export type CodexWriteCoordinationEligibility =
 
 export function codexWriteCoordinationEligibility(deps: {
   coordinatorPath: () => string;
-  residue: () => { kind: string };
+  residue: () => { kind: string; surface?: string; reason?: string };
   integrationRecord: () => { kind: string };
+  allowIndeterminateResidue?: boolean;
+  allowIndeterminateProfile?: boolean;
 }): CodexWriteCoordinationEligibility {
   let coordinatorExists: boolean;
   try {
@@ -66,26 +68,34 @@ export function codexWriteCoordinationEligibility(deps: {
 
   const residue = deps.residue();
   if (residue.kind === "clean") return { kind: "coordinated" };
+  if (residue.kind === "indeterminate") {
+    if (deps.allowIndeterminateProfile && isUnmarkedProfileResidue(residue)) {
+      return {
+        kind: "legacy-uncoordinated",
+        reason: "this valid unmarked Codex profile will be snapshotted before replacement",
+      };
+    }
+    if (deps.allowIndeterminateResidue) {
+      return {
+        kind: "legacy-uncoordinated",
+        reason: "this restore has explicit evidence for adopting an ambiguous pre-substrate state",
+      };
+    }
+    return {
+      kind: "refused",
+      reason: "the existing native Codex state is ambiguous and cannot seed a coordinator row",
+    };
+  }
   /*
-   * Everything else keeps the path it has always had.
+   * Recognized routed residue keeps the path it has always had.
    *
-   * `residue` is a pre-substrate routed home; `indeterminate` means the
-   * classifier could not read what is there — a profile it cannot parse, for
-   * instance, which is an ordinary re-injection over an older file rather than
-   * a hazard.
-   *
-   * Neither may CREATE a coordinator row: doing that over unclassified or
-   * routed bytes would erase the evidence an interrupted transition needs. But
-   * refusing the injection outright, which an earlier draft of this function
-   * did for `indeterminate`, breaks re-injection on homes that work today —
-   * caught by the shipped restore tests rather than by review. Declining to
-   * coordinate is the correct scope of the refusal; declining to write is not.
+   * The explicit adoption exception is limited to a recognized pre-substrate
+   * routed home. Unknown or unreadable surfaces must remain recoverable instead
+   * of being converted into an apparently authoritative empty coordinator row.
    */
   return {
     kind: "legacy-uncoordinated",
-    reason: residue.kind === "residue"
-      ? "this home was routed before write coordination existed and has not been adopted yet"
-      : "the existing native Codex state could not be classified, so it cannot seed a coordinator row",
+    reason: "this home was routed before write coordination existed and has not been adopted yet",
   };
 }
 
@@ -211,8 +221,10 @@ export function recomputeInjectWitness(options: {
   persistedIdentity: string;
   generation: CodexWriteEvidence["generation"];
   observedOwnership: CodexWriteCoordination["observedOwnership"];
+  /** Restore uses a combined config/profile snapshot; injection keeps the default config read. */
+  nativeInput?: string;
 }): CodexWriteCoordination {
-  const nativeInput = readOrNull(options.canonicalTargets.config) ?? "";
+  const nativeInput = options.nativeInput ?? readOrNull(options.canonicalTargets.config) ?? "";
   return codexWriteCoordination(
     options.candidate,
     {

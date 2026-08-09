@@ -937,6 +937,11 @@ function currentDisabledModelsForRestore(): Set<string> | null {
   }
 }
 
+function isOcxOwnedCatalogEntry(entry: RawEntry): boolean {
+  return trustedAccountBoundNativeCatalogSlug(entry) !== undefined
+    || isOcxAuthoredRoutedEntry(entry);
+}
+
 export async function syncCatalogModels(config: OcxConfig): Promise<RetainedCatalogSyncResult> {
   const owningCodexHome = getCodexHome();
   const preflightRead = readRetainedCatalogSync(config);
@@ -996,7 +1001,6 @@ export function restoreCodexCatalogWithPermit(
   const replacementVisibility = visibleAccountReplacementNatives(catalog.models, disabledModels);
   const backup = readCatalogBackup(catalogPath);
   if (backup && Array.isArray(backup.models)) {
-    const removed = (catalog.models ?? []).filter(m => typeof m.slug === "string" && m.slug.includes("/")).length;
     const backupSlugs = new Set(backup.models.flatMap(m => typeof m.slug === "string" ? [m.slug] : []));
     const userNativeAdditions = restoreAccountHiddenBareNatives(
       (catalog.models ?? []).filter(m =>
@@ -1005,9 +1009,24 @@ export function restoreCodexCatalogWithPermit(
       replacementVisibility,
       disabledModels,
     );
+    const foreignRoutedAdditions = (catalog.models ?? []).filter(m =>
+      typeof m.slug === "string"
+      && m.slug.includes("/")
+      && !backupSlugs.has(m.slug)
+      && !isOcxOwnedCatalogEntry(m),
+    );
+    const restoredAdditionSlugs = new Set([
+      ...userNativeAdditions.flatMap(entry => typeof entry.slug === "string" ? [entry.slug] : []),
+      ...foreignRoutedAdditions.flatMap(entry => typeof entry.slug === "string" ? [entry.slug] : []),
+    ]);
+    const removed = (catalog.models ?? []).filter(m =>
+      typeof m.slug === "string"
+      && !backupSlugs.has(m.slug)
+      && !restoredAdditionSlugs.has(m.slug),
+    ).length;
     const restored = {
       ...backup,
-      models: [...backup.models, ...userNativeAdditions],
+      models: [...backup.models, ...userNativeAdditions, ...foreignRoutedAdditions],
     };
     replaceActiveCodexCatalog(permit, owningCodexHome, {
       path: catalogPath,
@@ -1017,7 +1036,9 @@ export function restoreCodexCatalogWithPermit(
   }
   const before = catalog.models.length;
   const native = restoreAccountHiddenBareNatives(
-    catalog.models.filter(m => !(typeof m.slug === "string" && m.slug.includes("/"))),
+    catalog.models.filter(m =>
+      typeof m.slug !== "string" || !m.slug.includes("/") || !isOcxOwnedCatalogEntry(m),
+    ),
     replacementVisibility,
     disabledModels,
   );
