@@ -13,6 +13,7 @@ const TEST_DIR = join(import.meta.dir, ".tmp-service-test");
 const previousOpenCodexHome = process.env.OPENCODEX_HOME;
 const previousCodexHome = process.env.CODEX_HOME;
 const previousApiAuthToken = process.env.OPENCODEX_API_AUTH_TOKEN;
+const previousSplitAdmissionPath = process.env.OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE;
 
 afterEach(() => {
   if (previousOpenCodexHome === undefined) delete process.env.OPENCODEX_HOME;
@@ -21,6 +22,8 @@ afterEach(() => {
   else process.env.CODEX_HOME = previousCodexHome;
   if (previousApiAuthToken === undefined) delete process.env.OPENCODEX_API_AUTH_TOKEN;
   else process.env.OPENCODEX_API_AUTH_TOKEN = previousApiAuthToken;
+  if (previousSplitAdmissionPath === undefined) delete process.env.OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE;
+  else process.env.OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE = previousSplitAdmissionPath;
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -80,6 +83,17 @@ describe("service listen-port bake", () => {
     expect(script).toContain("start --port 13337");
     expect(buildPlist()).toContain("start --port 13337");
     expect(buildUnit()).toContain("start --port 13337");
+  });
+
+  test("launchd service carries the split admission token file path, never its value", () => {
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    mkdirSync(TEST_DIR, { recursive: true });
+    saveConfig({ port: 13337, hostname: "127.0.0.1", defaultProvider: "openai", providers: {} } as OcxConfig);
+    process.env.OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE = "/private/tmp/split-bridge.token";
+    const plist = buildPlist();
+    expect(plist).toContain("OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE");
+    expect(plist).toContain("/private/tmp/split-bridge.token");
+    expect(plist).not.toContain("bridge-secret");
   });
 });
 

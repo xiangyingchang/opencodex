@@ -5,7 +5,9 @@ import type { ProviderSplitCatalog } from "../src/providers/split-map";
 const catalog: ProviderSplitCatalog = {
   generation: "catalog-test-1",
   officialModels: new Set(["gpt-5.6-luna", "gpt-5.5"]),
+  officialAccountSlugs: new Set(["side/gpt-5.5"]),
   officialAccountNamespaces: new Set(["side"]),
+  officialAccountModels: new Set(["gpt-5.5"]),
   officialApiKeyModels: new Set(["openai-apikey/gpt-5.6-luna"]),
   thirdPartyModels: new Set(["deepseek/deepseek-v4-flash"]),
 };
@@ -84,7 +86,8 @@ describe("Provider Split Bridge", () => {
     const response = await handler(postRequest("gpt-5.6-luna", "/v1/responses?stream=true"));
 
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.url).toBe("https://native.example/v1/responses?stream=true");
+    expect(calls[0]?.url).toBe("https://native.example/responses?stream=true");
+    expect((calls[0]?.init?.headers as Headers).has("x-opencodex-bridge-admission")).toBe(false);
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/event-stream");
     expect(response.headers.get("cache-control")).toBe("no-cache");
@@ -96,7 +99,7 @@ describe("Provider Split Bridge", () => {
     expect(await response.text()).toBe("data: native\n\n");
   });
 
-  test("routes official account and API-key models to the native channel", async () => {
+  test("delegates exact account models through the gateway and keeps API-key models on gateway policy", async () => {
     const requests: string[] = [];
     const { handler, calls } = makeBridge(async (input, init) => {
       requests.push(await new Request(input, init).text());
@@ -107,11 +110,69 @@ describe("Provider Split Bridge", () => {
     await handler(postRequest("openai-apikey/gpt-5.6-luna"));
 
     expect(calls.map(call => call.url)).toEqual([
-      "https://native.example/v1/responses",
-      "https://native.example/v1/responses",
+      "http://gateway.example/v1/responses",
+      "http://gateway.example/v1/responses",
     ]);
-    expect(JSON.parse(requests[0] ?? "{}")).toMatchObject({ model: "gpt-5.5" });
+    expect(JSON.parse(requests[0] ?? "{}")).toMatchObject({ model: "side/gpt-5.5" });
     expect(JSON.parse(requests[1] ?? "{}")).toMatchObject({ model: "openai-apikey/gpt-5.6-luna" });
+    const accountHeaders = calls[0]?.init?.headers as Headers;
+    expect(accountHeaders.get("x-opencodex-bridge-admission")).toBe("test-gateway-admission");
+    expect(accountHeaders.get("x-opencodex-bridge-account-selector")).toBe("side/gpt-5.5");
+    expect(accountHeaders.has("authorization")).toBe(false);
+    expect(accountHeaders.has("chatgpt-account-id")).toBe(false);
+  });
+
+  test("maps the canonical native base and compact route without leaking the inbound /v1 prefix", async () => {
+    const { handler, calls } = makeBridge(async () => jsonResponse({ ok: true }), {
+      nativeBaseUrl: "https://chatgpt.example/backend-api/codex/",
+    });
+
+    await handler(postRequest("gpt-5.6-luna", "/v1/responses?stream=true&turn=2"));
+    await handler(postRequest("gpt-5.6-luna", "/v1/responses/compact?source=codex"));
+
+    expect(calls.map(call => call.url)).toEqual([
+      "https://chatgpt.example/backend-api/codex/responses?stream=true&turn=2",
+      "https://chatgpt.example/backend-api/codex/responses/compact?source=codex",
+    ]);
+  });
+
+  test("reuses forward normalization for native bodies but leaves gateway bodies untouched", async () => {
+    const oversizedCallId = "call_" + "x".repeat(80);
+    const { handler, calls } = makeBridge(async () => jsonResponse({ ok: true }));
+
+    await handler(postRequest("gpt-5.6-luna", "/v1/responses", {}, {
+      previous_response_id: "resp-native",
+      metadata: { source: "client" },
+      max_output_tokens: 32000,
+      input: [
+        { type: "reasoning", encrypted_content: "ocxr1:proxy-envelope", content: [{ type: "reasoning_text", text: "private" }] },
+        { type: "compaction", encrypted_content: `ocx1:${Buffer.from("summary").toString("base64")}` },
+        { type: "function_call", call_id: oversizedCallId, name: "ping", arguments: "{}" },
+        { type: "function_call_output", call_id: oversizedCallId, output: "pong" },
+      ],
+    }));
+    await handler(postRequest("deepseek/deepseek-v4-flash", "/v1/responses", {}, {
+      previous_response_id: "resp-gateway",
+      metadata: { source: "client" },
+      max_output_tokens: 32000,
+    }));
+
+    const nativeBody = JSON.parse(String(calls[0]?.init?.body)) as Record<string, unknown>;
+    expect(nativeBody).not.toHaveProperty("previous_response_id");
+    expect(nativeBody).not.toHaveProperty("metadata");
+    expect(nativeBody).not.toHaveProperty("max_output_tokens");
+    const nativeInput = nativeBody.input as Record<string, unknown>[];
+    expect(nativeInput.some(item => item.type === "reasoning")).toBe(false);
+    expect(nativeInput.some(item => item.type === "message" && JSON.stringify(item).includes("summary"))).toBe(true);
+    const nativeCall = nativeInput.find(item => item.type === "function_call");
+    const nativeOutput = nativeInput.find(item => item.type === "function_call_output");
+    expect(nativeCall?.call_id).toBe(nativeOutput?.call_id);
+    expect(String(nativeCall?.call_id).length).toBeLessThanOrEqual(64);
+
+    const gatewayBody = JSON.parse(String(calls[1]?.init?.body)) as Record<string, unknown>;
+    expect(gatewayBody.previous_response_id).toBe("resp-gateway");
+    expect(gatewayBody.metadata).toEqual({ source: "client" });
+    expect(gatewayBody.max_output_tokens).toBe(32000);
   });
 
   test("forwards the native Codex allowlist but preserves request metadata", async () => {
@@ -183,6 +244,28 @@ describe("Provider Split Bridge", () => {
     }
   });
 
+  test("decodes Codex zstd-compressed HTTP fallback bodies before classification", async () => {
+    const requests: string[] = [];
+    const { handler, calls } = makeBridge(async (input, init) => {
+      requests.push(await new Request(input, init).text());
+      return jsonResponse({ ok: true });
+    });
+    const body = JSON.stringify({ model: "deepseek/deepseek-v4-flash", input: "hello", stream: true });
+
+    const response = await handler(new Request("http://127.0.0.1:10101/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-encoding": "zstd",
+      },
+      body: Bun.zstdCompressSync(new TextEncoder().encode(body)),
+    }));
+
+    expect(response.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(requests[0] ?? "{}")).toEqual(JSON.parse(body));
+  });
+
   test("returns a deterministic unknown_model 400 without calling either upstream", async () => {
     const { handler, calls } = makeBridge(async () => {
       throw new Error("must not be called");
@@ -231,8 +314,79 @@ describe("Provider Split Bridge", () => {
     const response = await handler(new Request("http://127.0.0.1:10101/healthz"));
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ status: "ok", service: "opencodex-split-bridge" });
+    const body = await response.json() as { status?: string; service?: string; port?: number; pid?: number };
+    expect(body).toMatchObject({ status: "ok", service: "opencodex-split-bridge", port: 10101 });
+    expect(typeof body.pid).toBe("number");
     expect(calls).toHaveLength(0);
+  });
+
+  test("serves static transport capabilities without consulting either upstream", async () => {
+    const { handler, calls } = makeBridge(async () => {
+      throw new Error("must not be called");
+    });
+
+    const response = await handler(new Request("http://127.0.0.1:10101/capabilities"));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      service: "opencodex-split-bridge",
+      transports: {
+        responsesHttp: true,
+        responsesCompactHttp: true,
+        responsesWebSocketFallback: true,
+      },
+      gatewayAdmissionConfigured: true,
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("rejects a Responses WebSocket upgrade with 426 without calling upstream", async () => {
+    const { handler, calls } = makeBridge(async () => {
+      throw new Error("must not be called");
+    });
+
+    const response = await handler(new Request("http://127.0.0.1:10101/v1/responses", {
+      method: "GET",
+      headers: { connection: "Upgrade", upgrade: "websocket" },
+    }));
+
+    expect(response.status).toBe(426);
+    expect(await response.json()).toMatchObject({
+      error: { type: "upgrade_required", code: "upgrade_required" },
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("recognizes a WebSocket upgrade when Connection is absent", async () => {
+    const { handler, calls } = makeBridge(async () => {
+      throw new Error("must not be called");
+    });
+
+    const response = await handler(new Request("http://127.0.0.1:10101/v1/responses", {
+      method: "GET",
+      headers: { upgrade: "websocket" },
+    }));
+
+    expect(response.status).toBe(426);
+    expect(await response.json()).toMatchObject({
+      error: { type: "upgrade_required", code: "upgrade_required" },
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("keeps the handler usable for HTTP POST after a rejected upgrade", async () => {
+    const { handler, calls } = makeBridge(async () => jsonResponse({ ok: "http-fallback" }));
+
+    const upgrade = await handler(new Request("http://127.0.0.1:10101/v1/responses", {
+      method: "GET",
+      headers: { connection: "Upgrade", upgrade: "websocket" },
+    }));
+    const post = await handler(postRequest("gpt-5.6-luna"));
+
+    expect(upgrade.status).toBe(426);
+    expect(post.status).toBe(200);
+    expect(await post.json()).toEqual({ ok: "http-fallback" });
+    expect(calls).toHaveLength(1);
   });
 
   test("starts independently on an ephemeral port without consulting the gateway", async () => {
@@ -246,7 +400,7 @@ describe("Provider Split Bridge", () => {
     try {
       const response = await fetch(`http://127.0.0.1:${server.port}/healthz`);
       expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({ status: "ok", service: "opencodex-split-bridge" });
+      expect(await response.json()).toMatchObject({ status: "ok", service: "opencodex-split-bridge", port: 0 });
     } finally {
       server.stop();
     }

@@ -38,6 +38,7 @@ import { hardenSecretDir, hardenSecretPath } from "./lib/windows-secret-acl";
 import { windowsEnvIndirectBatchPathList, windowsEnvIndirectBatchValue } from "./lib/win-paths";
 import { recordOwnedConfigPath } from "./lib/config-ownership";
 import { maybeShowStarPrompt } from "./cli/star-prompt";
+import { SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV } from "./server/bridge-admission";
 
 const LABEL = "com.opencodex.proxy";
 const TASK = "opencodex-proxy";
@@ -364,6 +365,7 @@ export function buildPlist(): string {
   const path = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
   const codexHome = process.env.CODEX_HOME?.trim();
   const opencodexHome = process.env.OPENCODEX_HOME?.trim();
+  const splitBridgeAdmissionTokenFile = process.env[SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV]?.trim();
   const envLines = [
     `    <key>OCX_SERVICE</key><string>1</string>`,
     `    <key>${BUN_RUNTIME_SOURCE_ENV}</key><string>${bunRuntimeSource}</string>`,
@@ -371,6 +373,9 @@ export function buildPlist(): string {
     `    <key>PATH</key><string>${plistString(path)}</string>`,
     codexHome ? `    <key>CODEX_HOME</key><string>${plistString(codexHome)}</string>` : null,
     opencodexHome ? `    <key>OPENCODEX_HOME</key><string>${plistString(opencodexHome)}</string>` : null,
+    splitBridgeAdmissionTokenFile
+      ? `    <key>${SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV}</key><string>${plistString(splitBridgeAdmissionTokenFile)}</string>`
+      : null,
   ].filter((line): line is string => Boolean(line)).join("\n");
   const command = buildServiceShellCommand(bun, cli);
   return `<?xml version="1.0" encoding="UTF-8"?>

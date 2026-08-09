@@ -152,6 +152,12 @@ export function classifyCodexSplitState(
   };
 }
 
+/** Read-only proof that Codex is pointed at the bridge's owned 10101 route. */
+export function isSplitBridgeRoutingInjected(content: string, options: CodexSplitStateOptions = {}): boolean {
+  const observation = classifyCodexSplitState(content, options);
+  return observation.state === "split" && observation.owned;
+}
+
 function removeOwnedSplitRoot(content: string, expectedBase: string): { content: string; changed: boolean } {
   const { lines, eol } = normalizedLines(content);
   const rootEnd = firstTableIndex(lines);

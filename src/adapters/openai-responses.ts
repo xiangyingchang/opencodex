@@ -450,7 +450,7 @@ function repairOversizedReplayCallIds(body: unknown): unknown {
 /** Flatten a Responses tool-output `output` value (string or content-part array) to plain text. */
 function toolOutputText(output: unknown): string {
   if (typeof output === "string") return output;
-  if (!Array.isArray(output)) return JSON.stringify(output ?? "");
+  if (!Array.isArray(output)) return JSON.stringify(stripInputImagesDeep(output) ?? "");
   return output.map(part => {
     if (!isPlainObject(part)) return "";
     if (typeof part.text === "string") return part.text;
@@ -1063,6 +1063,53 @@ function buildRoutedCompactionBody(body: unknown): unknown {
   };
 }
 
+export interface OpenAiResponsesForwardNormalizationOptions {
+  readonly modelId: string;
+  /** True when a previous-response replay could not be expanded locally. */
+  readonly replayMiss?: boolean;
+  /** Provider metadata is optional for the standalone split bridge. */
+  readonly provider?: OcxProviderConfig;
+  readonly compactionRequest?: boolean;
+}
+
+/**
+ * Normalize the body sent to a ChatGPT/Codex forward endpoint.
+ *
+ * This is deliberately pure and shared by the normal adapter and the split bridge. The bridge has no
+ * local replay cache or provider object, but it must not grow a near-copy that silently misses a future
+ * forward-mode hardening change.
+ */
+export function normalizeOpenAiResponsesForwardBody(
+  body: unknown,
+  options: OpenAiResponsesForwardNormalizationOptions,
+): unknown {
+  const provider = options.provider;
+  let outBody = stripPreviousResponseId(body, true);
+  outBody = repairOrphanedInputItems(outBody, options.replayMiss === true);
+  outBody = stripUnsupportedForwardParams(outBody);
+  outBody = repairOversizedReplayCallIds(outBody);
+  outBody = stripUnsupportedReasoningSummaryDelivery(outBody, options.modelId);
+  outBody = backfillWebSearchQueries(outBody);
+  if (options.compactionRequest === true && provider && !isCanonicalOpenAiForwardProvider(provider)) {
+    outBody = buildRoutedCompactionBody(outBody);
+  }
+  outBody = normalizeToolSchemas(stripSparkCompatibility(stripUnsupportedReasoningParams(
+    stripItemIdsWhenUnstored(stripInvalidItemIds(stripUnsupportedHostedTools(
+      sanitizeReasoningInputContent(scrubOcxCompactionItems(outBody), {
+        preserveRawReasoningContent: provider?.preserveResponsesReasoningContent === true,
+      }),
+    ))),
+  )));
+  if (provider) {
+    outBody = stripDisabledReasoningSummaries(
+      normalizeConfiguredReasoningSummaryDelivery(outBody, provider, options.modelId),
+      provider,
+      options.modelId,
+    );
+  }
+  return outBody;
+}
+
 /** Read the Responses `usage` block, if the gateway sent one. */
 function usageFromResponsesPayload(payload: unknown): OcxUsage | undefined {
   if (!isPlainObject(payload) || !isPlainObject(payload.usage)) return undefined;
@@ -1143,23 +1190,24 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
 
       const forward = provider.authMode === "forward";
       const unexpandedMiss = !!parsed.previousResponseId && parsed._previousResponseInputExpanded !== true;
-      let outBody = stripPreviousResponseId(
-        parsed._rawBody,
-        forward || parsed._previousResponseInputExpanded === true,
-      );
-      const stateless = provider.statelessResponses === true;
-      if (stateless) outBody = stripStatefulResponsesParams(outBody);
-      // A replay miss can leave a function_call_output whose paired function_call sat
-      // in the prefix that was never expanded. A stateless upstream cannot resolve the
-      // pair from its own storage either, so it needs the same repair the forward
-      // backend gets — dropping previous_response_id is not much use if the body that
-      // reaches the wire is unparseable.
-      if (forward || stateless) {
-        outBody = repairOrphanedInputItems(outBody, unexpandedMiss);
-      }
+      let outBody: unknown;
       if (forward) {
-        outBody = stripUnsupportedForwardParams(outBody);
+        outBody = normalizeOpenAiResponsesForwardBody(parsed._rawBody, {
+          modelId: parsed.modelId,
+          replayMiss: unexpandedMiss,
+          provider,
+          compactionRequest: parsed._compactionRequest === true,
+        });
       } else {
+        outBody = stripPreviousResponseId(parsed._rawBody, parsed._previousResponseInputExpanded === true);
+        const stateless = provider.statelessResponses === true;
+        if (stateless) outBody = stripStatefulResponsesParams(outBody);
+        // A replay miss can leave a function_call_output whose paired function_call sat
+        // in the prefix that was never expanded. A stateless upstream cannot resolve the
+        // pair from its own storage either, so it needs the same repair the forward
+        // backend gets — dropping previous_response_id is not much use if the body that
+        // reaches the wire is unparseable.
+        if (stateless) outBody = repairOrphanedInputItems(outBody, unexpandedMiss);
         outBody = preferConfiguredHostedTools(
           outBody,
           provider,
@@ -1167,27 +1215,43 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
           parsed._openAiVirtualSelectedModelId,
         );
         outBody = normalizeImageGenClientTools(outBody);
+        // Routed key-mode gateways are still plain summarizers for compaction.
+        // Reuse the forward normalizer so private trigger/tools/images never
+        // reach a provider that does not implement Codex compaction.
+        if (parsed._compactionRequest === true) {
+          outBody = normalizeOpenAiResponsesForwardBody(outBody, {
+            modelId: parsed.modelId,
+            provider,
+            compactionRequest: true,
+          });
+        }
       }
-      if (forward || parsed._previousResponseInputExpanded === true) {
+      if (!forward && parsed._previousResponseInputExpanded === true) {
         outBody = repairOversizedReplayCallIds(outBody);
       }
-      outBody = stripUnsupportedReasoningSummaryDelivery(outBody, parsed.modelId);
-      // Repair stored history from before the bridge emitted both keys: a conversation
-      // that already recorded a single-query web_search_call replays it every turn, and
-      // a strict parser rejects the whole request over it (#930).
-      outBody = backfillWebSearchQueries(outBody);
-      // Same predicate as the routedCompaction gate in handleResponses(): an
-      // authMode check would let a noncanonical custom forward provider skip this
-      // rewrite while the server still routes it as a summarizer turn (#422).
-      if (parsed._compactionRequest === true && !isCanonicalOpenAiForwardProvider(provider)) {
-        outBody = buildRoutedCompactionBody(outBody);
+      if (!forward) {
+        outBody = stripUnsupportedReasoningSummaryDelivery(outBody, parsed.modelId);
+        // Repair stored history from before the bridge emitted both keys: a conversation
+        // that already recorded a single-query web_search_call replays it every turn, and
+        // a strict parser rejects the whole request over it (#930).
+        outBody = backfillWebSearchQueries(outBody);
       }
-      const sanitizedBody = normalizeToolSchemas(stripSparkCompatibility(stripUnsupportedReasoningParams(stripItemIdsWhenUnstored(stripInvalidItemIds(stripUnsupportedHostedTools(sanitizeReasoningInputContent(scrubOcxCompactionItems(outBody), { preserveRawReasoningContent: provider.preserveResponsesReasoningContent === true })))))));
-      const body = JSON.stringify(stripDisabledReasoningSummaries(
-        normalizeConfiguredReasoningSummaryDelivery(sanitizedBody, provider, parsed.modelId),
-        provider,
-        parsed.modelId,
-      ));
+      let serializedBody: unknown = outBody;
+      if (!forward) {
+        const sanitizedBody = normalizeToolSchemas(stripSparkCompatibility(stripUnsupportedReasoningParams(
+          stripItemIdsWhenUnstored(stripInvalidItemIds(stripUnsupportedHostedTools(
+            sanitizeReasoningInputContent(scrubOcxCompactionItems(outBody), {
+              preserveRawReasoningContent: provider.preserveResponsesReasoningContent === true,
+            }),
+          ))),
+        )));
+        serializedBody = stripDisabledReasoningSummaries(
+          normalizeConfiguredReasoningSummaryDelivery(sanitizedBody, provider, parsed.modelId),
+          provider,
+          parsed.modelId,
+        );
+      }
+      const body = JSON.stringify(serializedBody);
       const releaseBodyObservation = translatorBudget.observeExternallyCapped(
         "passthrough_serialization",
         new TextEncoder().encode(body).byteLength,

@@ -8,7 +8,11 @@ export type ProviderSplitChannel =
 export interface ProviderSplitCatalog {
   readonly generation: string;
   readonly officialModels: ReadonlySet<string>;
+  /** Exact public account-qualified slugs; never infer these as a cross-product. */
+  readonly officialAccountSlugs: ReadonlySet<string>;
+  /** Derived metadata for status/catalog consumers, not routing ownership. */
   readonly officialAccountNamespaces: ReadonlySet<string>;
+  readonly officialAccountModels: ReadonlySet<string>;
   readonly officialApiKeyModels: ReadonlySet<string>;
   readonly thirdPartyModels: ReadonlySet<string>;
 }
@@ -40,11 +44,7 @@ export function assertProviderSplitCatalogDisjoint(catalog: ProviderSplitCatalog
   for (const model of catalog.officialModels) claim(model, "official-native");
   for (const model of catalog.officialApiKeyModels) claim(model, "official-api-key");
   for (const model of catalog.thirdPartyModels) claim(model, "third-party-gateway");
-  for (const namespace of catalog.officialAccountNamespaces) {
-    for (const model of catalog.officialModels) {
-      claim(`${namespace}/${model}`, "official-native-account");
-    }
-  }
+  for (const slug of catalog.officialAccountSlugs) claim(slug, "official-native-account");
 }
 
 function invalidDecision(reason = "unknown-model"): ProviderSplitDecision {
@@ -82,25 +82,24 @@ export function classifyProviderSplitModel(
 
   if (catalog.officialApiKeyModels.has(requestedModel)) {
     return {
-      channel: "official-api-key",
+      // The split bridge has one native ChatGPT/Codex base. Sending an
+      // `openai-apikey/*` slug there would silently use the wrong credential
+      // domain; 10100 owns the configured OpenAI API key transport instead.
+      channel: "third-party-gateway",
       canonicalModel: requestedModel,
       provider: "openai-apikey",
-      reason: "official-api-key-allowlist",
+      reason: "official-api-key-gateway-policy",
     };
   }
 
   const separator = requestedModel.indexOf("/");
-  if (separator > 0 && separator < requestedModel.length - 1) {
-    const namespace = requestedModel.slice(0, separator);
-    const model = requestedModel.slice(separator + 1);
-    if (catalog.officialAccountNamespaces.has(namespace) && catalog.officialModels.has(model)) {
-      return {
-        channel: "official-native-account",
-        canonicalModel: model,
-        provider: "openai",
-        reason: "official-account-namespace",
-      };
-    }
+  if (catalog.officialAccountSlugs.has(requestedModel) && separator > 0 && separator < requestedModel.length - 1) {
+    return {
+      channel: "official-native-account",
+      canonicalModel: requestedModel.slice(separator + 1),
+      provider: "openai",
+      reason: "official-account-namespace",
+    };
   }
 
   if (catalog.thirdPartyModels.has(requestedModel)) {

@@ -1,17 +1,25 @@
-import { readFileSync, statSync } from "node:fs";
 import type { Server } from "bun";
-import { loadConfig } from "../config";
+import { resolve } from "node:path";
+import { getConfigDir, loadConfig } from "../config";
 import { visibleCodexAccountSelectors } from "./catalog/account-models";
 import { readCatalog, readCodexCatalogPath } from "./catalog/parsing";
 import { buildProviderSplitCatalog } from "./split-catalog";
 import { startSplitBridge, assertSplitBridgeTargetUrls, type StartSplitBridgeOptions } from "../split-bridge";
 import type { OcxConfig } from "../types";
+import {
+  configuredSplitBridgeLaunchAgentOptions,
+  splitBridgeLaunchAgentDigest,
+} from "./split-bridge-launchd";
+import {
+  readSplitBridgeAdmissionToken as readSplitBridgeAdmissionTokenFromFile,
+  SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV,
+} from "../server/bridge-admission";
 
 export const SPLIT_BRIDGE_PORT = 10101;
 export const SPLIT_BRIDGE_GATEWAY_BASE_URL = "http://127.0.0.1:10100/v1";
 export const SPLIT_BRIDGE_NATIVE_BASE_URL_ENV = "OCX_SPLIT_NATIVE_BASE_URL";
 export const SPLIT_BRIDGE_GATEWAY_BASE_URL_ENV = "OCX_SPLIT_GATEWAY_BASE_URL";
-export const SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV = "OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE";
+export { SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV } from "../server/bridge-admission";
 
 export interface SplitBridgeEnvironment {
   readonly nativeBaseUrl: string;
@@ -41,18 +49,12 @@ export function resolveSplitBridgeEnvironment(
   return {
     nativeBaseUrl,
     gatewayBaseUrl,
-    admissionTokenFile: requiredEnv(env, SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV),
+    admissionTokenFile: resolve(requiredEnv(env, SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV)),
   };
 }
 
 export function readSplitBridgeAdmissionToken(path: string): string {
-  const mode = statSync(path).mode & 0o777;
-  if ((mode & 0o077) !== 0) {
-    throw new Error("split bridge admission token file must not be group/world accessible");
-  }
-  const token = readFileSync(path, "utf8").trim();
-  if (!token) throw new Error("split bridge admission token file is empty");
-  return token;
+  return readSplitBridgeAdmissionTokenFromFile(path);
 }
 
 function splitCatalog(config: OcxConfig) {
@@ -85,7 +87,19 @@ export function buildConfiguredSplitBridgeOptions(
 }
 
 /** Foreground process entry used by the dedicated LaunchAgent. */
-export async function runConfiguredSplitBridge(): Promise<never> {
+export async function runConfiguredSplitBridge(expectedPlistDigest?: string): Promise<never> {
+  const managedByLaunchAgent = process.env.OCX_SPLIT_BRIDGE === "1";
+  if (managedByLaunchAgent && !expectedPlistDigest) {
+    throw new Error("split bridge LaunchAgent digest is missing; run `ocx split-bridge repair`");
+  }
+  if (expectedPlistDigest) {
+    const actualPlistDigest = splitBridgeLaunchAgentDigest(
+      configuredSplitBridgeLaunchAgentOptions(getConfigDir()),
+    );
+    if (expectedPlistDigest !== actualPlistDigest) {
+      throw new Error("split bridge LaunchAgent digest does not match its configured endpoints; run `ocx split-bridge repair`");
+    }
+  }
   const server: Server<undefined> = startSplitBridge(buildConfiguredSplitBridgeOptions());
   console.log(`Split bridge listening on 127.0.0.1:${server.port}`);
   await new Promise<void>((resolve) => {

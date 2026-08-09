@@ -1,5 +1,15 @@
 import type { Server } from "bun";
-import { readBoundedResponseBody } from "./lib/bounded-body";
+import { normalizeOpenAiResponsesForwardBody } from "./adapters/openai-responses";
+import {
+  DecompressedBodyTooLargeError,
+  MAX_DECOMPRESSED_BODY_BYTES,
+  readBoundedJsonRequestBody,
+  UnsupportedContentEncodingError,
+} from "./server/request-decompress";
+import {
+  SPLIT_BRIDGE_ACCOUNT_SELECTOR_HEADER,
+  SPLIT_BRIDGE_ADMISSION_HEADER,
+} from "./server/bridge-admission";
 import {
   assertProviderSplitCatalogDisjoint,
   classifyProviderSplitModel,
@@ -7,8 +17,10 @@ import {
   type ProviderSplitDecision,
 } from "./providers/split-map";
 
-const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
+const DEFAULT_MAX_BODY_BYTES = MAX_DECOMPRESSED_BODY_BYTES;
+const SPLIT_BRIDGE_IDLE_TIMEOUT_SECONDS = 255;
 const HEALTH_PATH = "/healthz";
+const CAPABILITIES_PATH = "/capabilities";
 const RESPONSE_PATHS = new Set(["/v1/responses", "/v1/responses/compact"]);
 const REQUEST_METADATA_HEADERS = [
   "content-type",
@@ -40,8 +52,6 @@ const OFFICIAL_SPLIT_FORWARD_HEADERS = [
   "x-responsesapi-include-timing-metrics",
 ];
 
-const GATEWAY_ADMISSION_HEADER = "x-opencodex-bridge-admission";
-
 const SAFE_RESPONSE_HEADERS = new Set([
   "content-type",
   "cache-control",
@@ -70,10 +80,12 @@ export interface SplitBridgeOptions {
   readonly gatewayBaseUrl: string;
   /** Injected in tests; the default is the platform fetch implementation. */
   readonly fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-  /** Maximum number of request-body bytes materialized for model classification. */
+  /** Maximum number of decompressed request-body bytes materialized for model classification. */
   readonly maxBodyBytes?: number;
   /** Secret shared only between the split bridge and the local third-party gateway. */
   readonly gatewayAdmissionToken: string;
+  /** Listener port reported by the local health contract. */
+  readonly port?: number;
 }
 
 export interface StartSplitBridgeOptions extends SplitBridgeOptions {
@@ -84,10 +96,15 @@ export interface StartSplitBridgeOptions extends SplitBridgeOptions {
 type SplitBridgeHandler = (request: Request) => Response | Promise<Response>;
 
 function errorResponse(status: number, code: string, message: string): Response {
+  const type = status === 426
+    ? "upgrade_required"
+    : status >= 500
+      ? "server_error"
+      : "invalid_request_error";
   return new Response(JSON.stringify({
     error: {
       message,
-      type: status >= 500 ? "server_error" : "invalid_request_error",
+      type,
       code,
     },
   }), {
@@ -116,19 +133,28 @@ function physicalOrigin(base: URL): string {
   return base.origin.toLowerCase();
 }
 
-/**
- * Resolve the target from the selected base only. The incoming query is retained;
- * a base path is treated as a prefix unless the incoming path already contains it.
- * This supports both `https://host` and `http://127.0.0.1:10100/v1` inputs without
- * allowing the caller-controlled URL to select another origin.
- */
-function targetUrl(base: URL, incoming: URL): string {
-  const basePath = base.pathname.replace(/\/+$/, "");
-  const incomingPath = incoming.pathname.startsWith("/") ? incoming.pathname : `/${incoming.pathname}`;
-  const path =
-    basePath.length === 0 || basePath === "/" || incomingPath === basePath || incomingPath.startsWith(`${basePath}/`)
-      ? incomingPath
-      : `${basePath}/${incomingPath.replace(/^\/+/, "")}`;
+const UPSTREAM_ROUTE_SUFFIXES = {
+  native: {
+    "/v1/responses": "/responses",
+    "/v1/responses/compact": "/responses/compact",
+  },
+  gateway: {
+    "/v1/responses": "/responses",
+    "/v1/responses/compact": "/responses/compact",
+  },
+} as const;
+
+type SplitUpstreamChannel = keyof typeof UPSTREAM_ROUTE_SUFFIXES;
+
+/** Resolve an allowlisted endpoint from an explicit native/gateway route table. */
+function targetUrl(base: URL, incoming: URL, channel: SplitUpstreamChannel): string {
+  const suffix = UPSTREAM_ROUTE_SUFFIXES[channel][incoming.pathname as keyof typeof UPSTREAM_ROUTE_SUFFIXES[SplitUpstreamChannel]];
+  if (!suffix) throw new TypeError(`Unsupported split bridge route: ${incoming.pathname}`);
+  let basePath = base.pathname.replace(/\/+$/, "");
+  // A gateway origin is accepted for convenience, but its contract is still /v1/...;
+  // an explicitly supplied path prefix remains authoritative.
+  if (channel === "gateway" && (basePath.length === 0 || basePath === "/")) basePath = "/v1";
+  const path = `${basePath}/${suffix.replace(/^\/+/, "")}`;
   const target = new URL(path, base.origin);
   target.search = incoming.search;
   return target.toString();
@@ -142,18 +168,26 @@ export function assertSplitBridgeTargetUrls(nativeBaseUrl: string, gatewayBaseUr
   }
 }
 
-function requestHeaders(incoming: Headers, decision: ProviderSplitDecision, gatewayAdmissionToken: string): Headers {
+function requestHeaders(
+  incoming: Headers,
+  decision: ProviderSplitDecision,
+  gatewayAdmissionToken: string,
+  requestedModel: string,
+): Headers {
   const selected = new Headers();
+  const accountGateway = decision.channel === "official-native-account";
   const allowed = decision.channel === "third-party-gateway"
     ? REQUEST_METADATA_HEADERS
-    : [...OFFICIAL_SPLIT_FORWARD_HEADERS, ...REQUEST_METADATA_HEADERS];
+    : [...OFFICIAL_SPLIT_FORWARD_HEADERS, ...REQUEST_METADATA_HEADERS]
+      .filter(name => !accountGateway || (name !== "authorization" && name !== "chatgpt-account-id"));
   for (const name of allowed) {
     const value = incoming.get(name);
     if (value !== null) selected.set(name, value);
   }
-  if (decision.channel === "third-party-gateway") {
+  if (decision.channel === "third-party-gateway" || accountGateway) {
     // Never inherit the incoming value: only the bridge's configured secret can pass.
-    selected.set(GATEWAY_ADMISSION_HEADER, gatewayAdmissionToken);
+    selected.set(SPLIT_BRIDGE_ADMISSION_HEADER, gatewayAdmissionToken);
+    if (accountGateway) selected.set(SPLIT_BRIDGE_ACCOUNT_SELECTOR_HEADER, requestedModel);
   }
   return selected;
 }
@@ -170,47 +204,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isResponsesWebSocketUpgrade(request: Request, path: string): boolean {
+  return path === "/v1/responses"
+    // Some Bun/Codex handshake paths omit Connection after the request has
+    // crossed the local proxy. Upgrade is the decisive signal here; requiring
+    // both headers incorrectly falls through to the ordinary 405 method guard.
+    && request.headers.get("upgrade")?.trim().toLowerCase() === "websocket";
+}
+
 async function readRequestJson(
   request: Request,
   maxBodyBytes: number,
 ): Promise<{ body: Record<string, unknown>; raw: string } | Response> {
-  const declaredLength = Number(request.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > maxBodyBytes) {
-    return errorResponse(413, "request_too_large", "Request body exceeds the configured limit");
-  }
-
-  let bounded;
+  if (request.signal.aborted) throw request.signal.reason;
+  let parsed: unknown;
   try {
-    bounded = await readBoundedResponseBody(new Response(request.body), {
-      maxBytes: maxBodyBytes,
-      fatalUtf8: true,
+    parsed = await readBoundedJsonRequestBody(request, maxBodyBytes, undefined, {
       signal: request.signal,
+      fatalUtf8: true,
     });
   } catch (error) {
     if (request.signal.aborted) throw error;
-    return errorResponse(400, "invalid_request", "Invalid JSON request body");
-  }
-  if (bounded.oversized) {
-    return errorResponse(413, "request_too_large", "Request body exceeds the configured limit");
-  }
-  if (bounded.truncated || !bounded.displaySafe) {
-    return errorResponse(400, "invalid_request", "Invalid JSON request body");
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(bounded.text);
-  } catch {
+    if (error instanceof DecompressedBodyTooLargeError) {
+      return errorResponse(413, "request_too_large", "Request body exceeds the configured limit");
+    }
+    if (error instanceof UnsupportedContentEncodingError) {
+      return errorResponse(415, "invalid_request", error.message);
+    }
     return errorResponse(400, "invalid_request", "Invalid JSON request body");
   }
   if (!isRecord(parsed)) {
     return errorResponse(400, "invalid_request", "Request body must be a JSON object");
   }
-  return { body: parsed, raw: bounded.text };
+  return { body: parsed, raw: JSON.stringify(parsed) };
 }
 
 function canonicalBody(raw: string, body: Record<string, unknown>, decision: ProviderSplitDecision): string {
-  if (decision.canonicalModel === body.model) return raw;
+  if (decision.channel === "official-native-account" || decision.canonicalModel === body.model) return raw;
   // Account-qualified native slugs are catalog identities, not upstream model ids.
   return JSON.stringify({ ...body, model: decision.canonicalModel });
 }
@@ -219,7 +249,9 @@ function canonicalBody(raw: string, body: Record<string, unknown>, decision: Pro
  * Build the isolated split data-plane handler. It has no listener or configuration
  * side effects; all network behavior is behind the injected fetch implementation.
  * This bounded slice intentionally covers only HTTP Responses/compact; WebSocket,
- * app-server, Images, search, lifecycle, and admission wiring remain future work.
+ * app-server, Images, search, and lifecycle remain outside this handler. Account-
+ * qualified native rows delegate to 10100 so exact credential resolution stays in
+ * the existing Responses implementation.
  */
 export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBridgeHandler {
   const nativeBase = parseBaseUrl(options.nativeBaseUrl, "nativeBaseUrl");
@@ -242,10 +274,32 @@ export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBrid
     if (incoming.pathname === HEALTH_PATH) {
       if (request.method !== "GET") return errorResponse(405, "method_not_allowed", "Only GET is supported for healthz");
       // Liveness only: probing an upstream here would couple the two failure domains.
-      return Response.json({ status: "ok", service: "opencodex-split-bridge" });
+      return Response.json({
+        status: "ok",
+        service: "opencodex-split-bridge",
+        pid: process.pid,
+        port: options.port ?? 10101,
+      });
+    }
+    if (incoming.pathname === CAPABILITIES_PATH) {
+      if (request.method !== "GET") return errorResponse(405, "method_not_allowed", "Only GET is supported for capabilities");
+      return Response.json({
+        status: "ok",
+        service: "opencodex-split-bridge",
+        transports: {
+          responsesHttp: true,
+          responsesCompactHttp: true,
+          responsesWebSocketFallback: true,
+        },
+        catalogGeneration: options.catalog.generation,
+        gatewayAdmissionConfigured: true,
+      });
     }
     if (!RESPONSE_PATHS.has(incoming.pathname)) {
       return errorResponse(404, "not_found", "Split bridge endpoint not found");
+    }
+    if (isResponsesWebSocketUpgrade(request, incoming.pathname)) {
+      return errorResponse(426, "upgrade_required", "Responses WebSocket transport is not supported; use HTTP");
     }
     if (request.method !== "POST") {
       return errorResponse(405, "method_not_allowed", "Only POST is supported for Responses endpoints");
@@ -261,13 +315,25 @@ export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBrid
       return errorResponse(400, "unknown_model", "Requested model is not in the split catalog");
     }
 
-    const isGateway = decision.channel === "third-party-gateway";
-    const target = targetUrl(isGateway ? gatewayBase : nativeBase, incoming);
+    const isGateway = decision.channel === "third-party-gateway" || decision.channel === "official-native-account";
+    const target = targetUrl(isGateway ? gatewayBase : nativeBase, incoming, isGateway ? "gateway" : "native");
+    const canonical = canonicalBody(parsed.raw, parsed.body, decision);
+    const upstreamBody = isGateway
+      ? canonical
+      : JSON.stringify(normalizeOpenAiResponsesForwardBody(
+        decision.canonicalModel === parsed.body.model
+          ? parsed.body
+          : { ...parsed.body, model: decision.canonicalModel },
+        {
+          modelId: decision.canonicalModel,
+          replayMiss: typeof parsed.body.previous_response_id === "string",
+        },
+      ));
     try {
       const upstream = await fetchImpl(target, {
         method: "POST",
-        headers: requestHeaders(request.headers, decision, options.gatewayAdmissionToken),
-        body: canonicalBody(parsed.raw, parsed.body, decision),
+        headers: requestHeaders(request.headers, decision, options.gatewayAdmissionToken, requestedModel),
+        body: upstreamBody,
         signal: request.signal,
       });
       // Do not inspect or buffer upstream.body: this keeps SSE backpressure and cancellation.
@@ -290,9 +356,12 @@ export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBrid
 /** Start the isolated listener; wiring and lifecycle ownership remain outside this slice. */
 export function startSplitBridge(options: StartSplitBridgeOptions): Server<undefined> {
   const handler = createSplitBridgeHandler(options);
+  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   return Bun.serve({
     hostname: options.hostname ?? "127.0.0.1",
     port: options.port ?? 10101,
+    idleTimeout: SPLIT_BRIDGE_IDLE_TIMEOUT_SECONDS,
+    maxRequestBodySize: maxBodyBytes,
     fetch: handler,
   });
 }

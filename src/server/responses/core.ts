@@ -126,6 +126,7 @@ import {
   recordSubagentQuotaFailureForThreadSpawn,
 } from "../../codex/subagent-model-fallback";
 import { isNativeMainTrafficBlocked } from "../../codex/native-profile-startup";
+import { codexAccountRouteMatchesSelector } from "../../codex/account-namespace-match";
 import {
   beginRequestAttempt,
   catalogModelSupportsServiceTier,
@@ -599,6 +600,8 @@ export interface HandleResponsesOptions {
   onConsumedComboFailure?: (failure: ConsumedComboFailure) => void;
   /** Caller-owned for Chat/Claude replay; omitted only at genuine Responses ingress. */
   translatorBudget?: TranslatorBudget;
+  /** Internal split-bridge proof: do not allow an exact account selector to fall through routing. */
+  requiredCodexAccountSelector?: string;
 }
 
 
@@ -1421,6 +1424,10 @@ async function handleResponsesInner(
       logCtx.routeDecision = err.trace;
     }
     return formatErrorResponse(404, "invalid_request_error", err instanceof Error ? err.message : String(err));
+  }
+  if (options.requiredCodexAccountSelector
+    && !codexAccountRouteMatchesSelector(route, options.requiredCodexAccountSelector)) {
+    return formatErrorResponse(400, "invalid_request_error", "Requested Codex account selector is unavailable");
   }
 
   const hasUnexpandedPreviousResponse = !!parsed.previousResponseId

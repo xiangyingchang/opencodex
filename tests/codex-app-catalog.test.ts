@@ -22,6 +22,8 @@ describe("Codex App split catalog contract", () => {
 
     expect([...catalog.officialModels]).toContain("gpt-5.5");
     expect([...catalog.officialAccountNamespaces]).toEqual(["side"]);
+    expect([...catalog.officialAccountSlugs]).toEqual(["side/gpt-5.5"]);
+    expect([...catalog.officialAccountModels]).toEqual(["gpt-5.5"]);
     expect([...catalog.officialApiKeyModels]).toContain("openai-apikey/gpt-5.5");
     expect([...catalog.thirdPartyModels]).toEqual(["deepseek/deepseek-v4-flash"]);
   });
@@ -54,5 +56,14 @@ describe("Codex App split catalog contract", () => {
     const second = buildProviderSplitCatalog({ ...input, entries: [...entries].reverse() });
 
     expect(second.generation).toBe(first.generation);
+  });
+
+  test("keeps account-only native rows separate from bare native rows", () => {
+    const catalog = buildProviderSplitCatalog({
+      entries: [{ slug: "side/gpt-5.5", visibility: "list" }],
+      officialAccountNamespaces: ["side"],
+    });
+    expect([...catalog.officialModels]).toEqual([]);
+    expect([...catalog.officialAccountModels]).toEqual(["gpt-5.5"]);
   });
 });

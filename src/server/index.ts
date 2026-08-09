@@ -22,6 +22,8 @@ import { reconcileOAuthProviders } from "../oauth";
 import { withCatalogWriteSerialization } from "../codex/catalog-write-serialization";
 import { invalidateCodexModelsCacheWithPermit } from "../codex/catalog/sync";
 import { getCodexHome } from "../codex/paths";
+import { desiredCodexRoutingMode } from "../codex/desired-state";
+import { installedSplitBridgeAdmissionTokenPath } from "../codex/split-bridge-launchd";
 import { registerCodexCooldownRecoveryProbeWorker } from "../codex/auth-api";
 import { startMemoryWatchdog } from "./memory-watchdog";
 import {
@@ -141,6 +143,12 @@ import {
   withCors,
   withManagementCors,
 } from "./auth-cors";
+import {
+  hasSplitBridgeAdmission,
+  readSplitBridgeAdmissionToken,
+  SPLIT_BRIDGE_ACCOUNT_SELECTOR_HEADER,
+  SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV,
+} from "./bridge-admission";
 export {
   assertServerAuthConfig,
   corsHeaders,
@@ -365,6 +373,8 @@ export interface StartServerDeps {
   liveSidebandWebSocketFactory?: LiveSidebandWebSocketFactory;
   /** Test-only seam; production derives a fresh local-attestation secret per process. */
   localAttestationSecret?: string;
+  /** Split activation's owner-only gateway token; omitted for legacy-local mode. */
+  splitBridgeAdmissionToken?: string | null;
 }
 
 /*
@@ -391,6 +401,20 @@ export function consumeStartupCacheInvalidationWrite(): boolean {
 export function startServer(port?: number, deps: StartServerDeps = {}) {
   const localAttestationSecret = deps.localAttestationSecret ?? createLocalAttestationSecret();
   const config = runAlibabaRegionStartupMigration(runOpenAiTierStartupMigration(loadConfig()));
+  const splitModeActive = desiredCodexRoutingMode(config) === "split";
+  const configuredSplitBridgeAdmissionToken = splitModeActive
+    ? deps.splitBridgeAdmissionToken === undefined
+      ? (() => {
+        const path = process.env[SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV]?.trim()
+          || installedSplitBridgeAdmissionTokenPath();
+        return path ? readSplitBridgeAdmissionToken(path) : undefined;
+      })()
+      : deps.splitBridgeAdmissionToken ?? undefined
+    : undefined;
+  if (splitModeActive && !configuredSplitBridgeAdmissionToken) {
+    throw new Error("split routing requires a valid split bridge admission token file");
+  }
+  const splitBridgeAdmissionToken = splitModeActive ? configuredSplitBridgeAdmissionToken : undefined;
   setLiveStateStoreConfig(config);
   applyProxyEnv(config);
   assertServerAuthConfig(config);
@@ -507,6 +531,26 @@ export function startServer(port?: number, deps: StartServerDeps = {}) {
     }), req, config);
   }
 
+  function splitBridgeAdmissionError(req: Request): Response | null {
+    if (!splitBridgeAdmissionToken || hasSplitBridgeAdmission(req, splitBridgeAdmissionToken)) return null;
+    return withCors(new Response(JSON.stringify({
+      error: {
+        type: "authentication_error",
+        code: "split_bridge_admission_required",
+        message: "This Responses endpoint accepts split-bridge traffic only",
+      },
+    }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    }), req, config);
+  }
+
+  function splitBridgeAccountSelector(req: Request): string | undefined {
+    if (!splitBridgeAdmissionToken || !hasSplitBridgeAdmission(req, splitBridgeAdmissionToken)) return undefined;
+    const selector = req.headers.get(SPLIT_BRIDGE_ACCOUNT_SELECTOR_HEADER)?.trim();
+    return selector || undefined;
+  }
+
   async function runAdmittedHttpTurn(req: Request, work: (lease: ActiveTurnLease) => Promise<Response>): Promise<Response> {
     const lease = tryAdmitTurn();
     if (!lease) return serverBusyResponse(req, "active turns");
@@ -548,6 +592,11 @@ export function startServer(port?: number, deps: StartServerDeps = {}) {
         });
       }
 
+      if (url.pathname.startsWith("/v1/") && splitBridgeAdmissionToken) {
+        const splitAdmissionError = splitBridgeAdmissionError(req);
+        if (splitAdmissionError) return splitAdmissionError;
+      }
+
       // Responses WebSocket (phase 120.2). Codex upgrades the same /v1/responses path; auth is
       // handshake-time only, so capture inbound headers and thread them into the pipeline.
       if (url.pathname === "/v1/responses" && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
@@ -581,7 +630,15 @@ export function startServer(port?: number, deps: StartServerDeps = {}) {
       if (url.pathname === "/healthz" && req.method === "GET") {
         // service/pid/port let CLI liveness reject foreign 200s and verify pid identity.
         const healthPort = server.port ?? listenPort;
-        const response = jsonResponse({ status: "ok", service: "opencodex", version: VERSION, uptime: process.uptime(), pid: process.pid, port: healthPort }, 200, req, config);
+        const response = jsonResponse({
+          status: "ok",
+          service: "opencodex",
+          version: VERSION,
+          uptime: process.uptime(),
+          pid: process.pid,
+          port: healthPort,
+          ...(splitModeActive ? { splitAdmissionConfigured: splitBridgeAdmissionToken !== undefined } : {}),
+        }, 200, req, config);
         const challenge = req.headers.get(LOCAL_ATTESTATION_CHALLENGE_HEADER);
         if (challenge) {
           const proof = createLocalAttestationProof(localAttestationSecret, challenge, process.pid, healthPort);
@@ -778,7 +835,13 @@ export function startServer(port?: number, deps: StartServerDeps = {}) {
         return runAdmittedHttpTurn(req, async turnAdmissionLease => {
           let response: Response;
           try {
-            response = await handleResponsesCompact(req, config, logCtx, turnAdmissionLease);
+            response = await handleResponsesCompact(
+              req,
+              config,
+              logCtx,
+              turnAdmissionLease,
+              splitBridgeAccountSelector(req),
+            );
           } catch {
             response = formatErrorResponse(500, "server_error", "Unexpected compact request failure");
           }
@@ -902,6 +965,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}) {
           const response = await handleResponses(req, config, logCtx, {
             turnAdmissionLease,
             abortSignal: req.signal,
+            requiredCodexAccountSelector: splitBridgeAccountSelector(req),
             onFirstOutput: () => recordFirstOutput(logCtx, start),
             onNativePassthroughTerminal: status => {
               finalizeNativePassthroughLog(httpStatusForTerminalStatus(status), {

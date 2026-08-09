@@ -929,13 +929,35 @@ switch (command) {
     break;
   }
   case "split-bridge": {
-    if (args[1] !== "start" || args.length > 2) {
-      console.error("Usage: ocx split-bridge start");
+    const action = args[1] ?? "status";
+    const plistDigestArg = args[2];
+    const validStartDigest = action === "start"
+      && args.length === 3
+      && /^--split-plist-digest=[a-f0-9]{64}$/.test(plistDigestArg ?? "");
+    if ((!validStartDigest && args.length > 2) || !["install", "load", "status", "start", "stop", "uninstall", "remove", "repair"].includes(action)) {
+      console.error("Usage: ocx split-bridge <install|load|status|start|stop|uninstall|remove|repair>");
       process.exitCode = 2;
       break;
     }
-    const { runConfiguredSplitBridge } = await import("../codex/split-bridge-runtime");
-    await runConfiguredSplitBridge();
+    if (action === "start") {
+      const { runConfiguredSplitBridge } = await import("../codex/split-bridge-runtime");
+      await runConfiguredSplitBridge(validStartDigest ? plistDigestArg!.slice("--split-plist-digest=".length) : undefined);
+      break;
+    }
+    const lifecycle = await import("../codex/split-bridge-service");
+    const run = action === "install"
+      ? lifecycle.installSplitBridgeService
+      : action === "load"
+        ? lifecycle.loadSplitBridgeService
+        : action === "stop"
+          ? lifecycle.stopSplitBridgeService
+          : action === "uninstall" || action === "remove"
+            ? lifecycle.uninstallSplitBridgeService
+            : action === "repair"
+              ? lifecycle.repairSplitBridgeService
+              : lifecycle.splitBridgeServiceStatus;
+    const status = run();
+    console.log(JSON.stringify(status));
     break;
   }
   case "service":

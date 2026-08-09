@@ -5,7 +5,9 @@ import type { ProviderSplitCatalog } from "../src/providers/split-map";
 const catalog: ProviderSplitCatalog = {
   generation: "catalog-test-1",
   officialModels: new Set(["gpt-5.6-luna", "gpt-5.5"]),
+  officialAccountSlugs: new Set(["side/gpt-5.5"]),
   officialAccountNamespaces: new Set(["side"]),
+  officialAccountModels: new Set(["gpt-5.5"]),
   officialApiKeyModels: new Set(["openai-apikey/gpt-5.6-luna"]),
   thirdPartyModels: new Set([
     "ark-coding/deepseek-v4-flash",
@@ -32,12 +34,12 @@ describe("Provider Split Map", () => {
     });
   });
 
-  test("keeps OpenAI API-key entries distinct from native Codex login", () => {
+  test("keeps OpenAI API-key entries distinct from native Codex login and uses gateway policy", () => {
     expect(classifyProviderSplitModel("openai-apikey/gpt-5.6-luna", catalog)).toEqual({
-      channel: "official-api-key",
+      channel: "third-party-gateway",
       canonicalModel: "openai-apikey/gpt-5.6-luna",
       provider: "openai-apikey",
-      reason: "official-api-key-allowlist",
+      reason: "official-api-key-gateway-policy",
     });
   });
 
@@ -48,6 +50,22 @@ describe("Provider Split Map", () => {
       provider: "deepseek",
       reason: "third-party-model-allowlist",
     });
+  });
+
+  test("does not synthesize a bare native route from an account-qualified row", () => {
+    const accountOnly: ProviderSplitCatalog = {
+      ...catalog,
+      officialModels: new Set(),
+      officialAccountSlugs: new Set(["side/gpt-5.5"]),
+      officialAccountModels: new Set(["gpt-5.5"]),
+      officialAccountNamespaces: new Set(["side"]),
+    };
+    expect(classifyProviderSplitModel("side/gpt-5.5", accountOnly).channel).toBe("official-native-account");
+    expect(classifyProviderSplitModel("gpt-5.5", accountOnly).channel).toBe("invalid");
+  });
+
+  test("does not infer an enabled model for a different account namespace", () => {
+    expect(classifyProviderSplitModel("other/gpt-5.5", catalog).channel).toBe("invalid");
   });
 
   test("fails closed for unknown, empty, and malformed model ids", () => {

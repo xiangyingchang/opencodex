@@ -3,6 +3,7 @@ import {
   DecompressedBodyTooLargeError,
   decodeRequestBody,
   MAX_DECOMPRESSED_BODY_BYTES,
+  readBoundedJsonRequestBody,
   readJsonRequestBody,
   UnsupportedContentEncodingError,
 } from "../src/server/request-decompress";
@@ -197,5 +198,41 @@ describe("readJsonRequestBody", () => {
       body: Bun.zstdCompressSync(new TextEncoder().encode("{\"model\":")),
     });
     await expect(readJsonRequestBody(req)).rejects.toBeInstanceOf(SyntaxError);
+  });
+
+  test("strict mode rejects malformed UTF-8 instead of replacing bytes", async () => {
+    const prefix = new TextEncoder().encode('{"model":"gpt-5.5","input":"');
+    const suffix = new TextEncoder().encode('"}');
+    const bytes = new Uint8Array(prefix.length + 1 + suffix.length);
+    bytes.set(prefix);
+    bytes[prefix.length] = 0xff;
+    bytes.set(suffix, prefix.length + 1);
+    const req = new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: bytes,
+    });
+
+    await expect(readBoundedJsonRequestBody(req, 1024, undefined, { fatalUtf8: true })).rejects.toThrow();
+  });
+
+  test("strict mode aborts while a request body is still being read", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("client closed", "AbortError");
+    const req = new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: new ReadableStream<Uint8Array>({
+        pull: () => new Promise<void>(() => undefined),
+      }),
+      signal: controller.signal,
+    });
+    const pending = readBoundedJsonRequestBody(req, 1024, undefined, {
+      signal: controller.signal,
+      fatalUtf8: true,
+    });
+    await Bun.sleep(0);
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
   });
 });

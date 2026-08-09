@@ -27,7 +27,7 @@ function splitIdentity(slug: string): { namespace: string; model: string } | nul
 function generationFor(catalog: Omit<ProviderSplitCatalog, "generation">): string {
   const rows = [
     ...[...catalog.officialModels].sort().map(model => `native:${model}`),
-    ...[...catalog.officialAccountNamespaces].sort().map(namespace => `account:${namespace}`),
+    ...[...catalog.officialAccountSlugs].sort().map(slug => `account:${slug}`),
     ...[...catalog.officialApiKeyModels].sort().map(model => `apikey:${model}`),
     ...[...catalog.thirdPartyModels].sort().map(model => `thirdparty:${model}`),
   ];
@@ -46,6 +46,8 @@ export function buildProviderSplitCatalog(options: BuildProviderSplitCatalogOpti
   const disabled = new Set(options.disabledModels ?? []);
   const accountNamespaces = new Set(options.officialAccountNamespaces.filter(value => value.trim().length > 0));
   const officialModels = new Set<string>();
+  const officialAccountSlugs = new Set<string>();
+  const officialAccountModels = new Set<string>();
   const officialApiKeyModels = new Set<string>();
   const thirdPartyModels = new Set<string>();
 
@@ -66,7 +68,8 @@ export function buildProviderSplitCatalog(options: BuildProviderSplitCatalogOpti
     }
 
     if (accountNamespaces.has(identity.namespace) && SUPPORTED_NATIVE_OPENAI_SLUGS.has(identity.model)) {
-      officialModels.add(identity.model);
+      officialAccountSlugs.add(slug);
+      officialAccountModels.add(identity.model);
       continue;
     }
 
@@ -75,16 +78,11 @@ export function buildProviderSplitCatalog(options: BuildProviderSplitCatalogOpti
 
   const base = {
     officialModels,
+    officialAccountSlugs,
+    officialAccountModels,
     officialAccountNamespaces: new Set(
       [...accountNamespaces].filter(namespace =>
-        [...options.entries].some(entry => {
-          if (entry.visibility !== "list" || typeof entry.slug !== "string") return false;
-          const identity = splitIdentity(entry.slug);
-          return identity !== null
-            && identity.namespace === namespace
-            && SUPPORTED_NATIVE_OPENAI_SLUGS.has(identity.model)
-            && !disabled.has(entry.slug);
-        }),
+        [...officialAccountSlugs].some(slug => splitIdentity(slug)?.namespace === namespace),
       ),
     ),
     officialApiKeyModels,

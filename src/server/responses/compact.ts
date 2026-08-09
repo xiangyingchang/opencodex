@@ -75,6 +75,7 @@ import { ForwardAdmissionCredentialError, validateForwardAdmissionCredential } f
 import { listOpenAiForwardSidecarCandidates, resolveFirstUsableOpenAiSidecar, type ResolvedOpenAiForwardSidecar } from "../../providers/openai-sidecar";
 import { isCanonicalOpenAiForwardProvider, supportsNativeResponsesCompactEndpoint } from "../../providers/openai-tiers";
 import { slugsEquivalent } from "../../providers/slug-codec";
+import { codexAccountRouteMatchesSelector } from "../../codex/account-namespace-match";
 import { applyOpenAiVirtualModel, resolveOpenAiCompactModel } from "../../providers/openai-virtual-models";
 import { isUsageDebugEnabled } from "../../usage/debug";
 import { readJsonRequestBody, DecompressedBodyTooLargeError, UnsupportedContentEncodingError } from "../request-decompress";
@@ -253,6 +254,7 @@ export async function handleResponsesCompact(
   config: OcxConfig,
   logCtx: RequestLogContext,
   turnAdmissionLease?: AdmissionLease,
+  requiredCodexAccountSelector?: string,
 ): Promise<Response> {
   let body: unknown;
   try {
@@ -282,6 +284,10 @@ export async function handleResponsesCompact(
       logCtx.routeDecision = err.trace;
     }
     return formatErrorResponse(404, "invalid_request_error", err instanceof Error ? err.message : String(err));
+  }
+  if (requiredCodexAccountSelector
+    && !codexAccountRouteMatchesSelector(route, requiredCodexAccountSelector)) {
+    return formatErrorResponse(400, "invalid_request_error", "Requested Codex account selector is unavailable");
   }
   const selectedModelId = route.modelId;
   logCtx.requestedModel = raw.model;

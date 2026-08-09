@@ -5,7 +5,7 @@ import { findLiveProxy, isOpencodexHealthz, probeHostname } from "../server/prox
 import type { OcxConfig } from "../types";
 import { diagnoseService, serviceLogPath } from "../service";
 import { collectStartupHealth, type StartupHealth } from "../codex/autostart-health";
-import { getCodexRoutingKind } from "../codex/inject";
+import { getCodexRoutingKind, isCodexSplitBridgeRoutingInjected } from "../codex/inject";
 import { diagnoseCodexShim } from "../codex/shim";
 import { displayCodexRuntimePath, effortClampAppliesToRuntime, loadLastEffortClamp, resolveCodexRuntime } from "../codex/runtime";
 import { redactSecretString, redactUserPath } from "../lib/redact";
@@ -16,17 +16,22 @@ import { readCatalog, readCodexCatalogPath } from "../codex/catalog/parsing";
 import { visibleCodexAccountSelectors } from "../codex/catalog/account-models";
 import { desiredCodexRoutingMode } from "../codex/desired-state";
 import { deriveSplitBridgeStatus, type SplitBridgeStatus } from "../codex/split-status";
+import { installedSplitBridgeAdmissionTokenPath } from "../codex/split-bridge-launchd";
+import { splitBridgeServiceStatus } from "../codex/split-bridge-service";
+import { readSplitBridgeAdmissionToken, SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV } from "../server/bridge-admission";
 
 export type HealthCheck = {
   ok: boolean;
   url: string;
   message: string;
   label: string;
+  splitAdmissionConfigured?: boolean;
 };
 
 export interface StatusCollectionDeps {
   readonly checkProxyHealth?: (target: ListenTarget) => Promise<HealthCheck>;
-  readonly checkSplitBridgeHealth?: () => Promise<boolean>;
+  readonly checkSplitBridgeHealth?: (expectedPid?: number | null) => Promise<boolean>;
+  readonly checkSplitBridgeTransport?: (expectedCatalogGeneration?: string | null) => Promise<boolean>;
   readonly catalogGenerationForStatus?: (config: OcxConfig) => string | null;
 }
 
@@ -132,7 +137,7 @@ async function checkProxyHealth(target: ListenTarget): Promise<HealthCheck> {
       const message = `returned HTTP ${response.status}`;
       return { ok: false, url, message, label: `${url} ${message}` };
     }
-    const body = await response.json().catch(() => null) as { service?: unknown; status?: unknown; version?: unknown; uptime?: unknown } | null;
+    const body = await response.json().catch(() => null) as { service?: unknown; status?: unknown; version?: unknown; uptime?: unknown; splitAdmissionConfigured?: unknown } | null;
     if (!isOpencodexHealthz(body)) {
       const message = "responded, but not an opencodex proxy";
       return { ok: false, url, message, label: `${url} ${message}` };
@@ -140,7 +145,13 @@ async function checkProxyHealth(target: ListenTarget): Promise<HealthCheck> {
     const version = typeof body?.version === "string" ? ` v${body.version}` : "";
     const uptime = typeof body?.uptime === "number" ? `, uptime ${Math.round(body.uptime)}s` : "";
     const message = `ok${version}${uptime}`;
-    return { ok: true, url, message, label: `${url} ${message}` };
+    return {
+      ok: true,
+      url,
+      message,
+      label: `${url} ${message}`,
+      splitAdmissionConfigured: body?.splitAdmissionConfigured === true,
+    };
   } catch (error) {
     const reason = error instanceof Error && error.name === "AbortError" ? "timed out" : "unreachable";
     return { ok: false, url, message: reason, label: `${url} ${reason}` };
@@ -149,19 +160,56 @@ async function checkProxyHealth(target: ListenTarget): Promise<HealthCheck> {
   }
 }
 
-async function checkSplitBridgeHealth(): Promise<boolean> {
+async function checkSplitBridgeHealth(expectedPid?: number | null): Promise<boolean> {
   const url = "http://127.0.0.1:10101/healthz";
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 400);
   try {
     const response = await fetch(url, { signal: controller.signal });
     if (!response.ok) return false;
-    const body = await response.json().catch(() => null) as { service?: unknown; status?: unknown } | null;
-    return body?.service === "opencodex-split-bridge" && body.status === "ok";
+    const body = await response.json().catch(() => null) as { service?: unknown; status?: unknown; pid?: unknown; port?: unknown } | null;
+    return body?.service === "opencodex-split-bridge"
+      && body.status === "ok"
+      && body.port === 10101
+      && (typeof expectedPid !== "number" || body.pid === expectedPid);
   } catch {
     return false;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function checkSplitBridgeTransport(expectedCatalogGeneration?: string | null): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 400);
+  try {
+    const response = await fetch("http://127.0.0.1:10101/capabilities", { signal: controller.signal });
+    if (!response.ok) return false;
+    const body = await response.json().catch(() => null) as {
+      transports?: { responsesHttp?: unknown; responsesCompactHttp?: unknown; responsesWebSocketFallback?: unknown };
+      catalogGeneration?: unknown;
+    } | null;
+    const transportReady = body?.transports?.responsesHttp === true
+      && body.transports.responsesCompactHttp === true
+      && body.transports.responsesWebSocketFallback === true;
+    return transportReady
+      && (typeof expectedCatalogGeneration !== "string" || body.catalogGeneration === expectedCatalogGeneration);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function splitBridgeAdmissionConfigured(): boolean {
+  const path = process.env[SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV]?.trim()
+    || installedSplitBridgeAdmissionTokenPath();
+  if (!path) return false;
+  try {
+    readSplitBridgeAdmissionToken(path);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -182,6 +230,7 @@ function catalogGenerationForStatus(config: OcxConfig): string | null {
 export async function collectStatus(deps: StatusCollectionDeps = {}): Promise<CliStatusView> {
   const checkHealth = deps.checkProxyHealth ?? checkProxyHealth;
   const checkSplitHealth = deps.checkSplitBridgeHealth ?? checkSplitBridgeHealth;
+  const checkSplitTransport = deps.checkSplitBridgeTransport ?? checkSplitBridgeTransport;
   const getCatalogGeneration = deps.catalogGenerationForStatus ?? catalogGenerationForStatus;
   const configDiagnostics = readConfigDiagnostics();
   const config = configDiagnostics.config;
@@ -215,9 +264,7 @@ export async function collectStatus(deps: StatusCollectionDeps = {}): Promise<Cl
   const desiredMode = desiredCodexRoutingMode(config);
   const splitModeActive = desiredMode === "split";
   const gatewayHealth = splitModeActive
-    ? listen.port === 10100
-      ? health
-      : await checkHealth({
+    ? await checkHealth({
         port: 10100,
         hostname: "127.0.0.1",
         source: "config",
@@ -228,11 +275,30 @@ export async function collectStatus(deps: StatusCollectionDeps = {}): Promise<Cl
       ...health,
       label: `${health.label} (legacy-local gateway)`,
     };
+  const splitLifecycle = splitModeActive
+    ? splitBridgeServiceStatus()
+    : { supported: true, installed: true, loaded: true, matchesPlist: true, pid: null, plistPath: "" };
+  const splitBridgeRunning = splitModeActive ? await checkSplitHealth(splitLifecycle.pid) : false;
+  const routingInjected = splitModeActive && isCodexSplitBridgeRoutingInjected();
+  const catalogGeneration = getCatalogGeneration(config);
+  const nativeTransportReady = splitModeActive ? await checkSplitTransport(catalogGeneration) : false;
   const splitBridge = deriveSplitBridgeStatus({
     desiredMode,
-    splitBridgeRunning: splitModeActive ? await checkSplitHealth() : false,
+    splitBridgeRunning,
+    bridgeLiveness: splitBridgeRunning,
+    bridgePid: splitLifecycle.pid,
+    nativeRouteConfigured: routingInjected,
+    nativeTransportReady,
+    routingInjected,
+    configurationInvalid: configDiagnostics.source === "fallback" || configDiagnostics.error !== null,
+    gatewayAdmissionConfigured: splitModeActive
+      ? splitBridgeAdmissionConfigured() && gatewayHealth.splitAdmissionConfigured === true
+      : true,
+    launchAgentInstalled: splitLifecycle.installed,
+    launchAgentLoaded: splitLifecycle.loaded,
+    launchAgentMatchesPlist: splitLifecycle.matchesPlist,
     gatewayReachable: gatewayHealth.ok,
-    catalogGeneration: getCatalogGeneration(config),
+    catalogGeneration,
   });
   const bunRuntime = durableBunRuntime();
   const service = diagnoseService();

@@ -45,6 +45,68 @@ function declaredBodyLength(req: Request): number | null {
   return Number.isFinite(length) && length >= 0 ? length : null;
 }
 
+export interface ReadBoundedJsonRequestBodyOptions {
+  readonly signal?: AbortSignal;
+  readonly fatalUtf8?: boolean;
+}
+
+async function readRawRequestBody(
+  req: Request,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  if (signal?.aborted) throw signal.reason;
+  if (!req.body) return new Uint8Array();
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let cancelReason: unknown;
+  let rejectAbort: ((reason: unknown) => void) | undefined;
+  const aborted = signal
+    ? new Promise<never>((_resolve, reject) => { rejectAbort = reject; })
+    : undefined;
+  const onAbort = () => rejectAbort?.(signal?.reason);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (aborted) void aborted.catch(() => undefined);
+
+  try {
+    while (true) {
+      const read = reader.read();
+      void read.catch(() => undefined);
+      const outcome = aborted ? await Promise.race([read, aborted]) : await read;
+      if (signal?.aborted) throw signal.reason;
+      const { done, value } = outcome;
+      if (done) break;
+      if (value.byteLength > maxBytes - total) {
+        throw new DecompressedBodyTooLargeError(maxBytes + 1, maxBytes);
+      }
+      if (value.byteLength > 0) {
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    }
+  } catch (error) {
+    cancelReason = error;
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    if (cancelReason !== undefined || signal?.aborted) {
+      await reader.cancel(cancelReason ?? signal?.reason).catch(() => undefined);
+    } else {
+      reader.releaseLock();
+    }
+  }
+
+  const raw = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    raw.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return raw;
+}
+
 function inflateDeflateBody(compressed: Uint8Array<ArrayBuffer>, opts: { maxOutputLength: number }): Uint8Array {
   // HTTP "deflate" appears both zlib-wrapped and raw in the wild (Bun.deflateSync emits raw,
   // which the previous Bun.inflateSync accepted). Try zlib-wrapped first, fall back to raw —
@@ -90,6 +152,7 @@ export async function readBoundedJsonRequestBody(
   req: Request,
   maxBytes: number,
   budget?: TranslatorBudget,
+  options: ReadBoundedJsonRequestBodyOptions = {},
 ): Promise<unknown> {
   const encoding = req.headers.get("content-encoding");
   const declaredLength = declaredBodyLength(req);
@@ -104,7 +167,7 @@ export async function readBoundedJsonRequestBody(
     : undefined;
   let raw: Uint8Array;
   try {
-    raw = new Uint8Array(await req.arrayBuffer());
+    raw = await readRawRequestBody(req, maxBytes, options.signal);
   } finally {
     releaseReservation?.();
   }
@@ -114,7 +177,7 @@ export async function readBoundedJsonRequestBody(
   try {
     const decoded = decodeRequestBody(raw, encoding, maxBytes);
     releaseDecoded = decoded === raw ? undefined : budget?.observeAcceptedRequestCopy(decoded.byteLength);
-    const text = new TextDecoder().decode(decoded);
+    const text = new TextDecoder("utf-8", { fatal: options.fatalUtf8 === true }).decode(decoded);
     releaseText = budget?.observeAcceptedRequestCopy(new TextEncoder().encode(text).byteLength);
     const parsed = JSON.parse(text);
     budget?.observeAcceptedRequestCopy(new TextEncoder().encode(JSON.stringify(parsed)).byteLength);

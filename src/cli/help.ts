@@ -44,12 +44,12 @@ const helpEntries: Record<string, HelpEntry> = {
     ],
   },
   "split-bridge": {
-    usage: "ocx split-bridge start",
-    summary: "Run the isolated Provider Split Bridge in the foreground.",
+    usage: "ocx split-bridge <install|load|status|start|stop|uninstall|repair>",
+    summary: "Manage or run the isolated Provider Split Bridge.",
     details: [
-      "The dedicated launchd service uses this command on port 10101.",
+      "The dedicated launchd service uses `start` on port 10101.",
       "It requires OCX_SPLIT_NATIVE_BASE_URL and a permission-hardened OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE.",
-      "This command does not install or load a service.",
+      "Lifecycle commands never restore or rewrite Codex configuration.",
     ],
   },
   service: {

@@ -8,6 +8,7 @@ import {
   codexAccountIdNamespaceCollisionError,
   codexAccountNamespaceProviderCollisionError,
   codexAccountNamespaceForModel,
+  codexAccountRouteMatchesSelector,
   hasCodexAccountNamespace,
 } from "../src/codex/account-namespace-match";
 import {
@@ -324,6 +325,14 @@ describe("Codex account namespace foundations", () => {
       .toBe("account id must not collide with a configured Codex account namespace");
     expect(codexAccountIdNamespaceCollisionError(inherited, "Side")).toBeUndefined();
     expect(codexAccountIdNamespaceCollisionError(inherited, "inherited")).toBeUndefined();
+  });
+
+  test("requires the final route to retain the exact account selector", () => {
+    const route = { codexAccountId: "stored-side", codexAccountNamespace: "side", modelId: "gpt-5.5" };
+    expect(codexAccountRouteMatchesSelector(route, "side/gpt-5.5")).toBe(true);
+    expect(codexAccountRouteMatchesSelector(route, "other/gpt-5.5")).toBe(false);
+    expect(codexAccountRouteMatchesSelector(route, "side/gpt-5.4")).toBe(false);
+    expect(codexAccountRouteMatchesSelector({ ...route, codexAccountId: undefined }, "side/gpt-5.5")).toBe(false);
   });
 
   test("normalizes only the explicit main sentinel and keeps a pool id named main literal", () => {

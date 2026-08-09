@@ -58,6 +58,18 @@ export function codexAccountNamespaceForModel(
   return hasCodexAccountNamespace(namespaces, namespace) ? namespace : undefined;
 }
 
+/** Require the final route to retain the exact public selector supplied by the split bridge. */
+export function codexAccountRouteMatchesSelector(
+  route: { codexAccountId?: string; codexAccountNamespace?: string; modelId: string },
+  selector: string,
+): boolean {
+  const slash = selector.indexOf("/");
+  if (slash <= 0 || slash >= selector.length - 1) return false;
+  return route.codexAccountId !== undefined
+    && route.codexAccountNamespace === selector.slice(0, slash)
+    && route.modelId === selector.slice(slash + 1);
+}
+
 export function isValidCodexAccountNamespaceTarget(accountId: unknown): accountId is string {
   return accountId === MAIN_CODEX_ACCOUNT_NAMESPACE_TARGET || isValidCodexAccountId(accountId);
 }

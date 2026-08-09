@@ -6,6 +6,16 @@ describe("Codex split bridge status contract", () => {
     const status = deriveSplitBridgeStatus({
       desiredMode: "split",
       splitBridgeRunning: true,
+      bridgeLiveness: true,
+      bridgePid: 4242,
+      nativeRouteConfigured: true,
+      nativeTransportReady: true,
+      routingInjected: true,
+      configurationInvalid: false,
+      gatewayAdmissionConfigured: true,
+      launchAgentInstalled: true,
+      launchAgentLoaded: true,
+      launchAgentMatchesPlist: true,
       gatewayReachable: true,
       catalogGeneration: "generation-1",
     });
@@ -26,6 +36,16 @@ describe("Codex split bridge status contract", () => {
     const status = deriveSplitBridgeStatus({
       desiredMode: "split",
       splitBridgeRunning: true,
+      bridgeLiveness: true,
+      bridgePid: 4242,
+      nativeRouteConfigured: true,
+      nativeTransportReady: true,
+      routingInjected: true,
+      configurationInvalid: false,
+      gatewayAdmissionConfigured: true,
+      launchAgentInstalled: true,
+      launchAgentLoaded: true,
+      launchAgentMatchesPlist: true,
       gatewayReachable: false,
       catalogGeneration: "generation-1",
     });
@@ -44,6 +64,16 @@ describe("Codex split bridge status contract", () => {
     const status = deriveSplitBridgeStatus({
       desiredMode: "split",
       splitBridgeRunning: false,
+      bridgeLiveness: false,
+      bridgePid: null,
+      nativeRouteConfigured: true,
+      nativeTransportReady: true,
+      routingInjected: true,
+      configurationInvalid: false,
+      gatewayAdmissionConfigured: true,
+      launchAgentInstalled: true,
+      launchAgentLoaded: true,
+      launchAgentMatchesPlist: true,
       gatewayReachable: true,
       catalogGeneration: "generation-1",
     });
@@ -56,6 +86,16 @@ describe("Codex split bridge status contract", () => {
     const status = deriveSplitBridgeStatus({
       desiredMode: "legacy-local",
       splitBridgeRunning: false,
+      bridgeLiveness: false,
+      bridgePid: null,
+      nativeRouteConfigured: false,
+      nativeTransportReady: false,
+      routingInjected: false,
+      configurationInvalid: false,
+      gatewayAdmissionConfigured: true,
+      launchAgentInstalled: false,
+      launchAgentLoaded: false,
+      launchAgentMatchesPlist: false,
       gatewayReachable: true,
       catalogGeneration: "generation-1",
     });
@@ -68,5 +108,49 @@ describe("Codex split bridge status contract", () => {
       routingDependency: "legacy-local",
       catalogGeneration: "generation-1",
     });
+  });
+
+  test("health alone does not claim readiness without injection and transport proof", () => {
+    const status = deriveSplitBridgeStatus({
+      desiredMode: "split",
+      splitBridgeRunning: true,
+      bridgeLiveness: true,
+      bridgePid: 4242,
+      nativeRouteConfigured: false,
+      nativeTransportReady: false,
+      routingInjected: false,
+      configurationInvalid: false,
+      gatewayAdmissionConfigured: true,
+      launchAgentInstalled: true,
+      launchAgentLoaded: true,
+      launchAgentMatchesPlist: true,
+      gatewayReachable: true,
+      catalogGeneration: "generation-1",
+    });
+
+    expect(status.readiness).toBe("routing-not-injected");
+    expect(status.bridgeLiveness).toBe(true);
+    expect(status.nativeTransportReady).toBe(false);
+  });
+
+  test("missing gateway admission is configuration-invalid even when both ports are live", () => {
+    const status = deriveSplitBridgeStatus({
+      desiredMode: "split",
+      splitBridgeRunning: true,
+      bridgeLiveness: true,
+      bridgePid: 4242,
+      nativeRouteConfigured: true,
+      nativeTransportReady: true,
+      routingInjected: true,
+      configurationInvalid: false,
+      gatewayAdmissionConfigured: false,
+      launchAgentInstalled: true,
+      launchAgentLoaded: true,
+      launchAgentMatchesPlist: true,
+      gatewayReachable: true,
+      catalogGeneration: "generation-1",
+    });
+
+    expect(status.readiness).toBe("configuration-invalid");
   });
 });
