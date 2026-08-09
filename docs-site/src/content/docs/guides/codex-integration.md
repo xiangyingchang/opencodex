@@ -39,24 +39,49 @@ The proxy listens on port `10100` by default and serves `POST /v1/responses`,
 ## Provider Split Bridge (activation-gated)
 
 When `codexRoutingMode` is explicitly set to `"split"`, the Codex entry point is the independent
-`http://127.0.0.1:10101/v1` Split Bridge. It routes official native/account/API-key models directly
-to their native upstream and sends only explicitly classified third-party models to the existing
-`127.0.0.1:10100` gateway. Unknown models fail closed; there is no cross-plane fallback.
+`http://127.0.0.1:10101/v1` Split Bridge. It routes bare official native models directly to their
+native upstream. Account-qualified rows retain their exact selector and delegate through the existing
+`127.0.0.1:10100` gateway so its stored account credential resolver can run. API-key and explicitly
+classified third-party models also use 10100 under their configured credential policy. Unknown models
+fail closed; there is no cross-plane fallback.
 
-The default remains `"legacy-local"`, which preserves the existing `10100` injection. The uninstalled foreground entry is `ocx split-bridge start`. It requires an explicit
-`OCX_SPLIT_NATIVE_BASE_URL` and an owner-only
-`OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE`; the generated LaunchAgent carries only the file path,
-never the admission value. No install or launchd load occurs from this documentation change. Use
+The default remains `"legacy-local"`, which preserves the existing `10100` injection. Use
+`ocx split-bridge start` for the foreground process, or
+`ocx split-bridge install|load|status|stop|uninstall|repair` for the dedicated macOS LaunchAgent.
+Lifecycle commands require an explicit `OCX_SPLIT_NATIVE_BASE_URL` and an owner-only
+`OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE`; the generated LaunchAgents carry only the file path,
+never the admission value. No lifecycle command is run implicitly by sync or status. Use
 `ocx status --json` to inspect `splitBridge.splitBridgeRunning`, `gatewayReachable`,
-`catalogGeneration`, and the distinct `bridge-unavailable` versus `gateway-unavailable` readiness
-states.
+`catalogGeneration`, `nativeTransportReady`, `routingInjected`, `gatewayAdmissionConfigured`,
+and LaunchAgent `installed/loaded/matchesPlist` evidence, plus the distinct `bridge-unavailable`,
+`gateway-unavailable`, `configuration-invalid`, and `transport-unverified` readiness states. A healthy
+`/healthz` alone is liveness, not completion readiness.
+
+The native route is not the same as the gateway route. With the canonical native base
+`https://chatgpt.com/backend-api/codex`, `/v1/responses` becomes `/backend-api/codex/responses` and
+`/v1/responses/compact` becomes `/backend-api/codex/responses/compact`; the 10100 gateway keeps its
+`/v1/...` paths and query strings. A WebSocket upgrade to 10101 returns `426` with
+`error.type = "upgrade_required"`, then Codex falls back to HTTP. This phase does not claim native
+upstream WebSocket support.
+
+Bare official request bodies use the same forward normalization contract as the `openai-responses` adapter:
+`previous_response_id`, unsupported `metadata`/`max_output_tokens`, proxy reasoning/compaction envelopes,
+and oversized replay call ids are normalized before the native request. Third-party requests do not use
+this native-only transform. Account-qualified requests preserve the selector for 10100, which resolves
+the exact stored credential and then applies the normal adapter normalization. The bridge injects
+`x-opencodex-bridge-admission` and an internal exact-selector proof; the 10100 gateway must validate
+split admission state. Loopback bypass is not a security boundary.
+
+Split activation is gated until fake-upstream protocol/failure tests, locked restore concurrency tests,
+status checks and the complete LaunchAgent `install/load/status/stop/uninstall/repair` lifecycle pass.
 
 ### Built-in image generation (`image_gen`)
 
 Codex's built-in `image_gen` tool does not go through `/v1/responses` — the codex-rs extension
 POSTs `{base_url}/images/generations` (or `/images/edits` when reference images are attached)
-directly, with the same ChatGPT bearer auth it uses for chat. Because the injected `base_url`
-points at opencodex, the proxy relays those calls to the OpenAI upstream.
+directly, with the same ChatGPT bearer auth it uses for chat. The legacy 10100 proxy relays these
+calls to the OpenAI upstream. The first split-bridge phase intentionally exposes only Responses and
+compact routes, so image generation is not covered by split activation yet.
 
 This is separate from the [Image Bridge](/guides/image-bridge/), which only activates when a
 **Responses** turn lists the hosted `image_generation` tool while a non-OpenAI model is selected.
@@ -343,12 +368,11 @@ When opencodex runs as a managed [background service](/reference/cli/#ocx-servic
 `OCX_SERVICE=1` so a service-driven restart does **not** thrash the Codex config — only an explicit
 `ocx stop` / `ocx service stop` restores native Codex.
 
-## Provider Split Bridge (planned, not active)
+## Provider Split Bridge (activation-gated)
 
-The current release still uses the single loopback form above: Codex sends requests to `10100`, and
-opencodex routes them internally. A planned Provider Split Bridge will add an independent `10101`
-listener so the Codex model picker can keep native and routed entries together while the data plane is
-separated:
+The default remains the single loopback form above: Codex sends requests to `10100`, and opencodex
+routes them internally. The implemented Provider Split Bridge adds an independent `10101` listener so
+the Codex model picker can keep native and routed entries together while the data plane is separated:
 
 ```text
 Codex -> 127.0.0.1:10101
@@ -359,5 +383,8 @@ Codex -> 127.0.0.1:10101
 When `10100` is stopped or crashes, native GPT must remain on its direct path and third-party selection
 must fail with `503 gateway_unavailable`; there is no cross-provider fallback. The model catalog stays
 stable while gateway readiness is reported separately, so Codex App does not lose its third-party rows
-when the gateway is temporarily unavailable. This behavior is intentionally documented as pending
-until the bridge, catalog/injection journal, fake-upstream fault matrix, and rollback gate are shipped.
+when the gateway is temporarily unavailable. Native WebSocket upgrades receive `426 upgrade_required`
+and use the existing HTTP fallback contract. The split bridge and gateway share an owner-only admission
+token validation contract, and Codex injection/restore share the canonical `CODEX_HOME` write lock.
+The behavior remains activation-gated until the fake-upstream protocol matrix, readiness evidence and
+LaunchAgent lifecycle are green; no real completion is implied by a healthy port.

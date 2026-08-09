@@ -38,23 +38,45 @@ proxy 默认监听 `10100` 端口，并提供 `POST /v1/responses`、`POST /v1/r
 ## Provider Split Bridge（需显式激活）
 
 当显式设置 `codexRoutingMode = "split"` 时，Codex 入口会切换到独立的
-`http://127.0.0.1:10101/v1` Split Bridge。它把官方原生/账户/API-key 模型直接发送到对应原生
-上游，只把明确分类为第三方的模型发送到现有 `127.0.0.1:10100` gateway。未知模型 fail closed，
-两个平面之间没有 fallback。
+`http://127.0.0.1:10101/v1` Split Bridge。裸官方原生模型直接发送到对应原生上游；账户限定模型
+会保留完整 selector，并交给现有 `127.0.0.1:10100` gateway 解析映射账户的已存储凭据。API-key
+模型和明确分类为第三方的模型也按其凭据策略发送到 10100。未知模型 fail closed，两个平面之间
+没有 fallback。
 
-缺省仍是 `"legacy-local"`，继续使用现有的 `10100` 注入路径。未安装的 foreground 入口是
-`ocx split-bridge start`；它要求显式设置 `OCX_SPLIT_NATIVE_BASE_URL`，并提供 owner-only 权限的
+缺省仍是 `"legacy-local"`，继续使用现有的 `10100` 注入路径。前台入口是
+`ocx split-bridge start`；macOS LaunchAgent 使用
+`ocx split-bridge install|load|status|stop|uninstall|repair` 管理。生命周期命令要求显式设置
+`OCX_SPLIT_NATIVE_BASE_URL`，并提供 owner-only 权限的
 `OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE`。生成的 LaunchAgent 只携带 token 文件路径，不会嵌入
-token 值；本文档不会安装或加载 launchd。可用 `ocx status --json` 查看
-`splitBridge.splitBridgeRunning`、`gatewayReachable`、`catalogGeneration`，以及互相独立的
-`bridge-unavailable` 和 `gateway-unavailable` readiness 状态。
+token 值；sync 或 status 不会隐式执行生命周期命令。可用 `ocx status --json` 查看
+`splitBridge.splitBridgeRunning`、`gatewayReachable`、`catalogGeneration`、
+`nativeTransportReady`、`routingInjected`、`gatewayAdmissionConfigured` 和 LaunchAgent
+`installed/loaded/matchesPlist` 证据，以及互相独立的 `bridge-unavailable`、`gateway-unavailable`、`configuration-invalid` 和
+`transport-unverified` readiness 状态。健康 `/healthz` 只证明 liveness，不证明 completion 可用。
+
+native route 与 gateway route 不共用路径拼接规则。使用规范 native base
+`https://chatgpt.com/backend-api/codex` 时，`/v1/responses` 会变成
+`/backend-api/codex/responses`，`/v1/responses/compact` 会变成
+`/backend-api/codex/responses/compact`；10100 gateway 仍保留 `/v1/...` 路径和 query。第一阶段对
+10101 的 WebSocket upgrade 返回 `426`，`error.type = "upgrade_required"`，随后由 Codex fallback
+到 HTTP；这不宣称 native upstream WebSocket 支持。
+
+裸官方请求 body 使用与 `openai-responses` adapter 相同的 forward normalization contract：发送到
+native upstream 前会规范化 `previous_response_id`、不支持的 `metadata`/`max_output_tokens`、
+proxy reasoning/compaction envelope 和 oversized replay call id。账户限定请求会把原始 selector
+交给 10100，由 10100 在精确账户解析后执行正常 adapter normalization；第三方请求不使用这项
+native-only transform。bridge 会注入 `x-opencodex-bridge-admission` 和 exact-selector proof，10100
+gateway 必须在 split admission mode 下从 owner-only token file 校验它们；loopback bypass 不是安全边界。
+
+在 fake-upstream 协议/故障测试、restore 并发锁测试、status 检查和完整 LaunchAgent
+`install/load/status/stop/uninstall/repair` 生命周期全部通过前，split activation 保持 gated。
 
 ### 内置图像生成（`image_gen`）
 
 Codex 内置的 `image_gen` 工具不会经过 `/v1/responses` —— codex-rs 扩展会直接 POST
 `{base_url}/images/generations`（附带参考图像时则为 `/images/edits`），并使用它在聊天时相同的
-ChatGPT bearer auth。由于注入的 `base_url` 指向 opencodex，proxy 会把这些调用中继到 OpenAI
-上游。
+ChatGPT bearer auth。旧的 10100 proxy 会把这些调用中继到 OpenAI 上游。第一阶段的 split bridge
+有意只暴露 Responses 和 compact 路由，因此图像生成目前不在 split activation 覆盖范围内。
 
 这与 [Image Bridge](/guides/image-bridge/) 是分开的；后者只会在某个 **Responses** 回合列出
 托管的 `image_generation` 工具、且当前选中了非 OpenAI 模型时才会激活。单独的
@@ -317,19 +339,23 @@ ocx restore back # point plain Codex at the running proxy again
 `OCX_SERVICE=1`，这样由服务驱动的重启**不会**反复改写 Codex config——只有显式的
 `ocx stop` / `ocx service stop` 才会恢复原生 Codex。
 
-## Provider Split Bridge（计划中，尚未启用）
+## Provider Split Bridge（已实现但 activation-gated）
 
-当前版本仍使用上面的单 loopback 形式：Codex 把请求发送到 `10100`，再由 opencodex 在同一
-进程内部分流。计划中的 Provider Split Bridge 会新增独立的 `10101` listener，使 Codex 模型
-选择器可以继续同时保留原生条目和路由条目，同时把数据面拆开：
+缺省仍使用上面的单 loopback 形式：Codex 把请求发送到 `10100`，再由 opencodex 在同一进程内
+分流。已实现的 Provider Split Bridge 会新增独立的 `10101` listener，使 Codex 模型选择器可以
+继续同时保留原生条目和路由条目，同时把数据面拆开：
 
 ```text
 Codex -> 127.0.0.1:10101
-  原生 GPT -> ChatGPT/Codex 官方上游
+  裸原生 GPT -> ChatGPT/Codex 官方上游
+  账户限定原生 -> OpenCodex 10100 精确账户路由
   provider/model -> OpenCodex 127.0.0.1:10100
 ```
 
-当 `10100` 停止或崩溃时，原生 GPT 必须继续走直连路径；第三方选择只能返回
+当 `10100` 停止或崩溃时，裸原生 GPT 必须继续走直连路径；账户限定和第三方选择只能返回
 `503 gateway_unavailable`，不能跨 provider 回退。模型目录保持稳定，网关 ready 状态单独报告，
-这样 Codex App 不会因为网关暂时不可用而丢失第三方条目。该行为在 bridge、catalog/injection
-journal、fake-upstream 故障矩阵和回滚门禁完成前，仍只作为待实现协议。
+这样 Codex App 不会因为网关暂时不可用而丢失第三方条目。native WebSocket upgrade 返回
+`426 upgrade_required` 后使用现有 HTTP fallback；bridge 与 gateway 共享 owner-only admission
+token 校验契约，Codex injection/restore 共享 canonical `CODEX_HOME` write lock。fake-upstream
+协议矩阵、readiness 证据和 LaunchAgent 生命周期全部通过前，行为仍保持 activation-gated；端口
+健康不等于真实 completion 成功。

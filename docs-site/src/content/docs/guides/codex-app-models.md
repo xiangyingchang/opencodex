@@ -15,7 +15,9 @@ opencodex adds separate `<selector>/<native-openai-model>` rows for the mapped a
 the bare native rows from the Codex picker. Selector labels are user-chosen public names with no
 built-in account-role meaning. Selecting a qualified row uses only its mapped account, does not
 change the active Pool account, and fails closed instead of switching accounts when the target is
-unavailable. See [Exact Codex account selectors](/reference/configuration/routing/#exact-codex-account-selectors).
+unavailable. In split mode, the selector is preserved to the 10100 exact-account route so the mapped
+stored credential is injected there; 10101 never forwards the caller's bearer for that row. See [Exact
+Codex account selectors](/reference/configuration/routing/#exact-codex-account-selectors).
 API GPT-5.6 entries use
 1,050,000 context / 922,000 max input, and `*-pro` picker ids resolve to the base wire model with
 `reasoning.mode: "pro"` while logs, usage, and picker state keep the virtual id.
@@ -165,12 +167,13 @@ ocx sync
 opencodex rewrites `models_cache.json` with a deliberately stale cache wrapper whenever catalog
 visibility, priority, or metadata changes, so the next Codex model refresh reads the new catalog.
 
-## Provider Split Bridge (planned)
+## Provider Split Bridge (activation-gated)
 
-The model picker is a shared catalog surface, not a live gateway-health list. In the planned split
+The model picker is a shared catalog surface, not a live gateway-health list. In an activated split
 mode, native entries such as `gpt-5.6-luna` and routed entries such as
 `deepseek/deepseek-v4-flash` remain visible together. Selecting a native entry uses the official
 OpenAI/Codex path; selecting a routed entry uses the local gateway path. If the gateway is down, the
 routed row remains selectable but its request fails closed with `gateway_unavailable`; the native row
 must remain unaffected. App request success still requires separate HTTP/SSE and WebSocket/app-server
-verification, so catalog visibility alone is not a transport compatibility claim.
+verification, so catalog visibility alone is not a transport compatibility claim. Native WebSocket
+upgrades currently use the documented `426` HTTP fallback contract.

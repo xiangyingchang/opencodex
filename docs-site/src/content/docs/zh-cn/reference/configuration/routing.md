@@ -36,7 +36,9 @@ opencodex 按以下顺序解析请求的模型：
 
 `codexAccountNamespaces` 会把 `side` 这样的公开 selector 映射到一个已存储 Codex 账户。
 `side/gpt-5.6-sol` 请求即使在规范 `openai` 提供方处于 Direct mode 时也只使用该账户，并向
-upstream 发送裸 `gpt-5.6-sol` model id。selector 后只能使用裸原生 OpenAI-family id。
+upstream 发送裸 `gpt-5.6-sol` model id。selector 后只能使用裸原生 OpenAI-family id。Split mode
+下，10101 会保留完整 selector 并交给 10100 的精确账户路由，由 10100 注入映射账户凭据；不会把
+调用方 bearer 直接发送到官方 upstream。
 
 精确选择会绕过 Pool 分配策略和普通 thread affinity。若映射账户不存在、已暂停、处于 cooldown、
 不可用或需要重新认证，请求会 fail closed，不会切换到其他账户，也不会改变 active Pool account。
@@ -114,17 +116,26 @@ CLI：`ocx logs explain <request-id>`、`ocx logs rebuild-index`、`ocx logs ind
 
 `routingProfiles` 是可选的增量配置：现有配置文件与旧 `usage.jsonl` 行均可原样加载。索引是一次性的——删除后会在下次查询时从 `usage.jsonl` 自动重建。系统不会自动调优。
 
-## Provider Split Bridge（计划中）
+## Provider Split Bridge（activation-gated）
 
-当前 2.10.2 的 loopback 注入会把 Codex 内置 `openai` provider 指向 `127.0.0.1:10100`，
-官方模型和第三方模型共享同一个进程。计划中的 split mode 会让共享 catalog 通过独立的
-`127.0.0.1:10101` bridge：
+缺省的 loopback 注入会把 Codex 内置 `openai` provider 指向 `127.0.0.1:10100`，官方模型和第三方
+模型共享同一个进程。显式 split mode 会让共享 catalog 通过独立的 `127.0.0.1:10101` bridge：
 
-- 原生 `gpt-*` 和账户限定的原生条目使用 OpenAI/Codex 官方路径；
+- 裸原生 `gpt-*` 使用 OpenAI/Codex 官方路径；
+- 账户限定原生条目保留 selector 并通过 10100 精确解析映射账户；
 - 显式 `provider/model` 条目必须依赖 10100 第三方网关；
 - 未知或有歧义的 slug fail-closed；
 - 网关失败只返回第三方 `503 gateway_unavailable`，不会回退到 GPT；
-- catalog 可见性保持稳定，网关 ready 状态单独报告。
+- catalog 可见性保持稳定，网关 ready 状态单独报告；
+- native `/v1/responses` 映射到规范的 `/backend-api/codex/responses`，compact 映射到
+  `/backend-api/codex/responses/compact`，gateway 继续使用 `/v1` 语义；
+- native WebSocket upgrade 返回 `426 upgrade_required` 并使用 HTTP fallback，这不表示 native
+  upstream WebSocket 支持；
+- 裸官方 body 使用与 `openai-responses` 相同的 forward normalization；账户限定 body 在 10100
+  完成精确账户解析后再做同样处理；第三方 body 不使用 native-only transform；
+- split admission 要求 gateway 校验 owner-only bridge token，loopback bypass 不是安全边界；
+  injection 与 restore 共享 `CODEX_HOME` write lock。
 
-本节描述的是目标协议，不表示 split mode 已启用。正式启用需要独立 bridge 服务、注入 journal
-迁移、fake-upstream 故障测试、备份和明确的操作员确认。
+本节描述的是 activation-gated 实现，不表示健康端口就证明 completion 可用。正式启用需要独立
+bridge 生命周期、注入 journal 迁移、fake-upstream 协议/故障测试、readiness 证据、备份和明确
+的操作员确认。

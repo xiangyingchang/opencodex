@@ -78,18 +78,33 @@ The server exposes `POST /api/stop` which restores native Codex config, stops an
 - 다른 대안 대신 이 방식을 선택한 이유: Absolute dotenv expansion bypasses a relative-path check, global dotenv removal breaks supported configuration, and an environment-only marker can itself come from dotenv.
 - 장점, 단점 및 영향: Normal npm launches preserve genuine shell overrides. Direct Bun or legacy launches have no provenance signal and fail closed for all three ambient Anthropic slots — credentials included, because subscription mode leaves `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` unset by design (#253) and a `settings.env` merge can still replace the destination after launch, so a preserved key would travel with it. The cost is that `bun src/cli/index.ts` loses ambient Anthropic values; the escape hatch is running through the published `ocx` bin, where genuine shell exports are preserved by proof. Durable artifacts use the running or bundled Bun.
 
-## Provider Split Bridge (runtime boundary)
+## Provider Split Bridge (runtime boundary, activation-gated)
 
 The split runtime boundary is two independent local data planes rather than an `if` branch inside the
 existing proxy. `com.opencodex.proxy` remains the third-party gateway on 10100; a separate
-`com.opencodex.split-bridge` process owns 10101 and dispatches official-native models directly to
-ChatGPT/Codex while forwarding third-party models to 10100. The direct branch must not wait on gateway
-health, gateway admission, retry state, or gateway queues. The gateway branch is fail-closed when 10100
-is unavailable. Both services have independent PIDs, logs, health state, launchd KeepAlive policy, and
+`com.opencodex.split-bridge` process owns 10101 and dispatches bare official-native models directly to
+ChatGPT/Codex while forwarding third-party models to 10100. Account-qualified official rows preserve
+their selector and use 10100's existing exact-account auth path. The bare direct branch must not wait on
+gateway health, gateway admission, retry state, or gateway queues. Gateway-dependent branches are
+fail-closed when 10100 is unavailable. Both services have independent PIDs, logs, health state, launchd KeepAlive policy, and
 resource limits. The foreground entry is `ocx split-bridge start`; that dedicated command bypasses the
-ordinary CLI Codex-shim auto-restore hook. `src/codex/split-bridge-launchd.ts` only builds the separate
-plist, and no installer/load action is performed until activation is approved.
-Until activation, the current single-listener lifecycle remains the shipped behavior.
+ordinary CLI Codex-shim auto-restore hook.
+
+Native base URLs and gateway base URLs use explicit route tables: the canonical native base
+`https://chatgpt.com/backend-api/codex` receives `/responses` and `/responses/compact`, while the
+gateway retains `/v1/responses` semantics. A WebSocket upgrade on 10101 receives `426 upgrade_required`
+and must fall back to HTTP; the split bridge does not claim native upstream WebSocket support. Official
+body normalization is shared with the forward `openai-responses` adapter, including stateful-field
+stripping, proxy reasoning/compaction cleanup, and replay call-id repair.
+
+The gateway branch injects an owner-only `x-opencodex-bridge-admission` value, and 10100 validates it in
+split admission mode; loopback's ordinary API-auth bypass is not an admission substitute. Status must
+prove liveness, route/transport configuration, catalog generation, routing injection, admission
+configuration, gateway reachability, and the independent LaunchAgent lifecycle before reporting ready.
+Injection and restore use the same canonical-`CODEX_HOME` write lock, with under-lock ownership and
+generation re-reads. `src/codex/split-bridge-launchd.ts` owns a testable install/load/status/stop/
+uninstall/repair lifecycle as well as plist generation. Until the full fake-upstream and fault matrix
+passes, the current single-listener lifecycle remains the activatable/default behavior.
 
 ## Providers and adapters
 

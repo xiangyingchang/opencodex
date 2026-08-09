@@ -171,7 +171,10 @@ and `routeModel`, but user config overrides registry defaults per field/key.
 ## Restore
 
 `ocx stop`, `ocx restore` / `ocx eject`, `ocx service stop`, and `ocx service uninstall` must strip
-opencodex config and routed catalog entries without damaging native Codex state.
+opencodex config and routed catalog entries without damaging native Codex state. Normal injection and
+restore config/profile/journal publication share the canonical `CODEX_HOME` write lock; each operation
+re-reads the current bytes, ownership proof, and generation while holding it. A synchronous forced-exit
+path may not claim restore completed if it cannot acquire that lock.
 
 Full `ocx uninstall` config cleanup is ownership-manifest based. A fresh config directory receives a
 root-bound owner marker and an uninstall manifest before its first atomic config write. Uninstall
@@ -188,11 +191,16 @@ the residual directory for manual review; there is no recursive-delete fallback.
 
 Split mode now has a marker-owned state that points Codex's single client entry at
 `http://127.0.0.1:10101/v1`; the bridge, not Codex TOML, maps the selected catalog slug to the
-official or third-party physical channel. The existing 10100 loopback form remains the legacy-local
-state and is never overwritten blindly. Migration first proves journal/marker ownership, preserves
-user-owned `openai_base_url`, and writes the bridge target atomically. Restore removes only
-bridge-owned keys and catalog/cache changes; it does not depend on an `exit` handler, because SIGKILL
-and power loss can leave files behind. The target state, backup manifest, and failure recovery
-contract are recorded in [`docs/协议文档.md`](../docs/协议文档.md). The 10101 listener, LaunchAgent
-installation, and Codex routing switch remain activation-gated and are not performed by these docs
-or static builders.
+bare official or third-party physical channel. Account-qualified native slugs retain their selector
+and delegate to 10100's exact-account auth path so the stored credential, not the caller's bearer, is
+selected. The native target maps `/v1/responses` to
+`https://chatgpt.com/backend-api/codex/responses` and compact to the corresponding
+`/responses/compact` route; the 10100 target keeps its `/v1` prefix. The existing 10100 loopback form
+remains the legacy-local state and is never overwritten blindly. Migration first proves
+journal/marker ownership, preserves user-owned `openai_base_url`, and writes the bridge target
+atomically. Restore removes only bridge-owned keys and catalog/cache changes under the same write lock,
+with a fresh ownership/generation read; it does not depend on an `exit` handler, because SIGKILL and
+power loss can leave files behind. The target state, backup manifest, and failure recovery contract
+are recorded in [`docs/协议文档.md`](../docs/协议文档.md). Readiness is gated on more than `/healthz`,
+including route/fallback capability, admission validation, catalog generation, injection proof and
+LaunchAgent lifecycle.

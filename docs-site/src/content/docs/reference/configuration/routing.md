@@ -224,18 +224,29 @@ an automatic rebuild from `usage.jsonl` on the next query; `ocx logs
 rebuild-index` forces one. Nothing in this system auto-tunes weights,
 budgets, or candidate sets.
 
-## Provider Split Bridge (planned)
+## Provider Split Bridge (activation-gated)
 
-The current 2.10.2 loopback injection sends the built-in Codex `openai` provider to `127.0.0.1:10100`,
-where official and third-party models share one process. The planned split mode will send the shared
-catalog through an independent `127.0.0.1:10101` bridge:
+The default loopback injection sends the built-in Codex `openai` provider to `127.0.0.1:10100`,
+where official and third-party models share one process. Explicit split mode sends the shared catalog
+through an independent `127.0.0.1:10101` bridge:
 
-- native `gpt-*` and account-qualified native rows use the official OpenAI/Codex path;
+- bare native `gpt-*` rows use the official OpenAI/Codex path;
+- account-qualified native rows preserve their exact selector and delegate through 10100 so the mapped
+  stored Codex credential is resolved; they never fall back to another account or the caller's bearer;
 - explicit `provider/model` rows require the third-party gateway on 10100;
 - unknown or ambiguous slugs fail closed;
 - gateway failure returns a third-party-only `503 gateway_unavailable` and never falls back to GPT;
-- catalog visibility remains stable while gateway readiness is reported separately.
+- catalog visibility remains stable while gateway readiness is reported separately;
+- native `/v1/responses` maps to the canonical `/backend-api/codex/responses` path, and compact maps to
+  `/backend-api/codex/responses/compact`; the gateway keeps `/v1` semantics;
+- a native WebSocket upgrade returns `426 upgrade_required` so Codex can use HTTP fallback; this is not
+  native upstream WebSocket support;
+- bare official bodies use the same forward normalization as `openai-responses`; account-qualified bodies
+  are normalized by 10100 after exact-account resolution, while third-party bodies do not receive
+  native-only transforms;
+- split admission requires gateway-side validation of the owner-only bridge token; loopback bypass is
+  not that security boundary; injection and restore share the `CODEX_HOME` write lock.
 
-This section describes the target protocol and is not a claim that split mode is active. Activation
-requires the separate bridge service, injection journal migration, fake-upstream fault tests, backup,
-and an explicit operator gate.
+This section describes an activation-gated implementation and is not a claim that a healthy port proves
+completion availability. Activation requires the separate bridge lifecycle, injection journal migration,
+fake-upstream protocol/fault tests, readiness evidence, backup, and an explicit operator gate.

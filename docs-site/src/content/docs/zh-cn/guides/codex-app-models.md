@@ -5,7 +5,7 @@ description: opencodex 中的模型如何通过共享 Codex 目录出现在 Code
 
 opencodex 不会修改 Codex App。它会写入 Codex CLI/TUI 已经使用的同一套 Codex 配置和模型目录。因为 Codex App 读取的是这份共享状态，路由模型可以像普通 Codex 目录条目一样出现在 App 的模型选择器中。
 
-OpenAI 条目有两种凭据通道：原生 Codex 登录，以及命名空间化的 `openai-apikey/<model>` API key 通道。仅在 Pool 与 Direct 之间切换 `codexAccountMode` 不会改变选择器 id。但当 `codexAccountNamespaces` 中有目标账户存在的 selector 时，opencodex 会为映射账户添加独立的 `<selector>/<native-openai-model>` 行，并在选择器中隐藏裸原生行。Selector 名称是用户自定义的公开标签，没有内置的账户角色含义。选择带 `selector` 的行只会使用映射账户，不会更改当前 Pool 账户；目标不可用时，请求会直接失败，不会切换到其他账户。详情请参阅[精确 Codex 账户选择器](/reference/configuration/routing/#exact-codex-account-selectors)。API GPT-5.6 条目使用 1,050,000 context / 922,000 max input，而 `*-pro` 选择器 id 会解析到基础线协议模型，并在日志、用量和选择器状态中保留虚拟 id，同时带上 `reasoning.mode: "pro"`。API 目录固定为恰好八个 id：`gpt-5.5`、`gpt-5.6`、Sol/Terra/Luna，以及它们三个 Pro 虚拟 id；不存在通用的 `gpt-5.6-pro` 别名。Compact 请求会保留所选 tier，但发送基础模型且不带 reasoning 对象。
+OpenAI 条目有两种凭据通道：原生 Codex 登录，以及命名空间化的 `openai-apikey/<model>` API key 通道。仅在 Pool 与 Direct 之间切换 `codexAccountMode` 不会改变选择器 id。但当 `codexAccountNamespaces` 中有目标账户存在的 selector 时，opencodex 会为映射账户添加独立的 `<selector>/<native-openai-model>` 行，并在选择器中隐藏裸原生行。Selector 名称是用户自定义的公开标签，没有内置的账户角色含义。选择带 `selector` 的行只会使用映射账户，不会更改当前 Pool 账户；目标不可用时，请求会直接失败，不会切换到其他账户。Split mode 下，10101 会保留 selector 并交给 10100 的精确账户路由，不能把调用方 bearer 当成映射账户凭据。详情请参阅[精确 Codex 账户选择器](/reference/configuration/routing/#exact-codex-account-selectors)。API GPT-5.6 条目使用 1,050,000 context / 922,000 max input，而 `*-pro` 选择器 id 会解析到基础线协议模型，并在日志、用量和选择器状态中保留虚拟 id，同时带上 `reasoning.mode: "pro"`。API 目录固定为恰好八个 id：`gpt-5.5`、`gpt-5.6`、Sol/Terra/Luna，以及它们三个 Pro 虚拟 id；不存在通用的 `gpt-5.6-pro` 别名。Compact 请求会保留所选 tier，但发送基础模型且不带 reasoning 对象。
 
 请通过选择器 id 显式选择凭据路径。在 Providers 页面切换 Pool/Direct；下面的 `<selector>` 是
 用户自定义、通过 `codexAccountNamespaces` 映射的公开标签：
@@ -110,11 +110,11 @@ ocx sync
 
 每当目录可见性、priority 或元数据发生变化时，opencodex 都会用一个刻意标记为过期的缓存 wrapper 重写 `models_cache.json`，这样 Codex 下次刷新模型时就会读取新目录。
 
-## Provider Split Bridge（计划中）
+## Provider Split Bridge（需显式激活）
 
-模型选择器是共享 catalog 界面，不是实时的网关健康列表。在计划中的 split mode 中，
+模型选择器是共享 catalog 界面，不是实时的网关健康列表。在已激活的 split mode 中，
 `gpt-5.6-luna` 这样的原生条目和 `deepseek/deepseek-v4-flash` 这样的路由条目会继续同时可见。
 选择原生条目使用 OpenAI/Codex 官方路径；选择路由条目使用本地网关路径。如果网关关闭，
 路由条目仍可选择，但请求会以 `gateway_unavailable` fail-closed；原生条目必须不受影响。
 Codex App 请求能否成功还必须分别验证 HTTP/SSE 和 WebSocket/app-server，因此 catalog 能显示
-不等于 transport 已经兼容。
+不等于 transport 已经兼容。当前 native WebSocket upgrade 使用文档化的 `426` HTTP fallback 契约。

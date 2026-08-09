@@ -589,13 +589,17 @@ Sidecar failures must degrade to text markers or skipped capability, not abort t
 
 ## Provider Split Bridge (activation-gated)
 
-The split bridge is a separate transport boundary from the existing adapter bridge. Its currently
-implemented bounded surface is HTTP/SSE `POST /v1/responses`, `POST /v1/responses/compact`, and local
-`GET /healthz`: official-native requests use the canonical ChatGPT/Codex target without entering the
-10100 listener, while explicit third-party slugs are forwarded to 10100 with OpenAI/Codex authorization
-headers removed and a bridge-only admission header injected. Each channel owns its target, cancellation,
-error mapping, and stream budget. WebSocket/app-server, Images, search, Live/Realtime, and
-continuation/replay paths require separate compatibility tests; an unimplemented surface must fail
-closed rather than silently taking the other channel. `ocx split-bridge start` and the plist builder are
-available for isolated validation, but until activation the current single-listener transport inventory
-remains authoritative.
+The split bridge is a separate transport boundary from the existing adapter bridge. Its bounded surface
+is HTTP/SSE `POST /v1/responses`, `POST /v1/responses/compact`, WebSocket-upgrade rejection with
+`426 upgrade_required`, and local `GET /healthz`/readiness probes. Official-native requests use an
+explicit native route table: the canonical base `https://chatgpt.com/backend-api/codex` receives
+`/responses` or `/responses/compact`, not `/v1/responses`; explicit third-party slugs are forwarded to
+10100 with OpenAI/Codex authorization headers removed and a bridge-only admission header injected.
+Each channel owns its target, cancellation, error mapping, and stream budget. Official request bodies
+reuse the forward `openai-responses` normalization helper for `previous_response_id`, unsupported
+forward fields, proxy reasoning/compaction envelopes and oversized replay call ids. WebSocket upstream,
+app-server, Images, search and Live/Realtime still require separate compatibility tests; an unimplemented
+surface must fail closed rather than silently taking the other channel. The gateway validates the bridge
+admission token itself in split mode; loopback API-auth bypass is not that validation. `ocx split-bridge`
+provides foreground and lifecycle operations for isolated validation, but until all fake-upstream and
+fault-matrix gates pass the current single-listener transport inventory remains activatable/default.
