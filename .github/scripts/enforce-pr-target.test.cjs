@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const { latestCodeRabbitReviewForHead } = require("./pr-quality-state.cjs");
 
 describe("enforce-pr-target workflow", () => {
   const workflowPath = path.join(__dirname, "../workflows/enforce-pr-target.yml");
@@ -46,6 +47,19 @@ describe("enforce-pr-target workflow", () => {
 
   it("listens for synchronize so rebase can clear ancestry failures", () => {
     assert.match(workflow, /synchronize/);
+  });
+
+  it("re-runs on issue_comment so a maintainer GUI waiver takes effect", () => {
+    // The GUI-screenshot gate is waived by a maintainer issue comment
+    // ("not touching gui"). `pull_request_target` types do not include issue
+    // comments, so without this trigger the waiver sits unread until a PR
+    // edit or push re-runs the gate.
+    assert.match(workflow, /^  issue_comment:/m);
+    assert.match(workflow, /- created/);
+    assert.match(workflow, /- edited/);
+    // The script resolves the PR number from the issue payload, which is what
+    // an issue_comment event delivers instead of a pull_request object.
+    assert.match(workflow, /context\.payload\.issue\?\.number/);
   });
 
   it("does not add review events that would break the trusted-base model", () => {
@@ -120,18 +134,48 @@ describe("enforce-pr-target workflow", () => {
     assert.match(workflow, /legacyReadinessComment/);
   });
 
-  it("checks out trusted base-branch scripts only (never PR head)", () => {
+  it("checks out scripts from the event-specific trusted boundary (never PR head)", () => {
     // Scope the assertions to the checkout step itself, so a stray `ref:` on
     // another step cannot satisfy the pin while the checkout stays mutable.
     const checkoutStep = workflow
       .split("- name: Checkout trusted PR-quality scripts")[1]
       .split(/\n {6}- name:/)[0];
     assert.match(checkoutStep, /actions\/checkout@[0-9a-f]{40}/);
-    assert.match(checkoutStep, /ref:\s*\$\{\{\s*github\.event\.pull_request\.base\.sha\s*\}\}/);
+    // `pull_request_target` pins the PR base SHA. Privileged `issue_comment`
+    // runs must source scripts from the repository default branch, matching
+    // the branch that supplied the workflow itself; unpromoted `dev` scripts
+    // must never execute under the write-capable token.
+    assert.match(
+      checkoutStep,
+      /ref:\s*\$\{\{\s*github\.event_name\s*==\s*'issue_comment'\s*&&\s*github\.event\.repository\.default_branch\s*\|\|\s*github\.event\.pull_request\.base\.sha\s*\}\}/,
+    );
+    assert.doesNotMatch(checkoutStep, /\|\|\s*'dev'/);
     // The readiness ping reads MAINTAINERS.md from the same trusted checkout.
     assert.match(checkoutStep, /sparse-checkout:\s*\|\s*\n\s*\.github\/scripts\n\s*MAINTAINERS\.md/);
     assert.match(checkoutStep, /persist-credentials:\s*false/);
     assert.doesNotMatch(workflow, /ref:\s*\$\{\{\s*github\.event\.pull_request\.head/);
+  });
+
+  it("orders same-head CodeRabbit reviews deterministically without timestamps", () => {
+    const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const latest = latestCodeRabbitReviewForHead({
+      reviews: [
+        {
+          id: 41,
+          commit_id: head,
+          user: { login: "coderabbitai[bot]" },
+          body: "older",
+        },
+        {
+          id: 42,
+          commit_id: head,
+          user: { login: "coderabbitai[bot]" },
+          body: "newer",
+        },
+      ],
+      liveHeadSha: head,
+    });
+    assert.equal(latest?.id, 42);
   });
 
   it("loads pr-quality via require from the checked-out scripts", () => {

@@ -8,6 +8,15 @@ on:
       - edited
       - ready_for_review
       - synchronize
+  # A maintainer issue comment ("not touching gui") waives the GUI-screenshot
+  # gate. CodeRabbit also edits its normal PR status comment when a review
+  # finishes, which gives this privileged workflow a safe signal to re-check
+  # review findings even for fork PRs. `pull_request_target` types do not
+  # include issue comments, so both cases use this separate trigger.
+  issue_comment:
+    types:
+      - created
+      - edited
 
 # pull-requests:write covers title/comment/label updates.
 # contents:write is required for convertPullRequestToDraft /
@@ -19,22 +28,39 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: enforce-pr-target-${{ github.event.pull_request.number }}
+  # `issue_comment` events carry the issue number, not the PR number. The
+  # group is shared with the hygiene workflow: both read-modify-write the same
+  # consolidated gate comment, so serializing them under one key prevents a
+  # concurrent update from clobbering the other's section.
+  group: pr-gate-comment-${{ github.event.pull_request.number || github.event.issue.number }}
 
 jobs:
   enforce-target:
+    # `issue_comment` fires for comments on ANY issue or PR. This gate is
+    # write-capable, so only two trusted sources may start that path: a
+    # canonical maintainer (GUI-waiver case) or CodeRabbit's own PR status
+    # comment, whose create/edit event is used only as a signal to re-read the
+    # live review threads. All other pull_request_target events run normally.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request != null &&
+       (github.event.comment.user.login == 'coderabbitai[bot]' ||
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'COLLABORATOR' ||
+        github.event.comment.author_association == 'MEMBER'))
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout trusted PR-quality scripts
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          # The event's base commit, not the repository default: pull_request_target
-          # runs this workflow from the base revision, and the scripts must come
-          # from the same revision or a merged gate would run against the
-          # pre-promotion scripts on `main`. The immutable SHA pins the checkout
-          # to the exact base commit the event was built against.
-          ref: ${{ github.event.pull_request.base.sha }}
+          # `pull_request_target` runs from the PR base revision, so use that
+          # immutable base SHA for the trusted scripts. `issue_comment` runs the
+          # privileged workflow from the repository default branch; source its
+          # scripts and MAINTAINERS.md from that same promoted trust boundary.
+          # This prevents unpromoted `dev` script changes from executing with
+          # the workflow's write-capable token.
+          ref: ${{ github.event_name == 'issue_comment' && github.event.repository.default_branch || github.event.pull_request.base.sha }}
           persist-credentials: false
           sparse-checkout: |
             .github/scripts
@@ -81,8 +107,12 @@ jobs:
             const {
               GATE_MARKER,
               READINESS_MARKER,
+              HYGIENE_MARKER,
+              HYGIENE_BLOCK_START,
+              HYGIENE_BLOCK_END,
               inlineCode,
               buildGateCommentBody,
+              extractHygieneSection,
               buildFailureSections,
               failureSummary,
               buildStaleNotice,
@@ -113,9 +143,54 @@ jobs:
             const LEGACY_COMMENT_MARKER = "<!-- wrong-branch-enforcer -->";
             const REVIEW_READY_LABEL = "review-ready";
             const MAINTAINERS_FILE = "MAINTAINERS.md";
+            const CODE_RABBIT_LOGIN = "coderabbitai[bot]";
 
             const { owner, repo } = context.repo;
-            const pull_number = context.payload.pull_request.number;
+            // `issue_comment` events carry the PR's issue object, not a
+            // `pull_request` object. The issue number is the PR number either
+            // way, so resolve it from whichever payload the event delivered.
+            const pull_number =
+              context.payload.pull_request?.number ??
+              context.payload.issue?.number;
+
+            // Defensive re-check of the job-level guard. `issue_comment` events
+            // carry a `comment` object with the author's association. A normal
+            // user comment is trusted only when it comes from a canonical
+            // maintainer; CodeRabbit's own PR status comment is separately
+            // allowed as a signal to re-read live review threads. The comment
+            // body itself is never trusted as gate evidence.
+            if (context.eventName === "issue_comment") {
+              const isPrComment =
+                context.payload.issue?.pull_request != null;
+              const association = context.payload.comment?.author_association;
+              const commenter = context.payload.comment?.user?.login;
+              const isCodeRabbit = commenter === CODE_RABBIT_LOGIN;
+              // The association is a cheap prefilter, but OWNER/COLLABORATOR/
+              // MEMBER is broader than this repository's canonical maintainer
+              // list. A collaborator or member who is not a maintainer must not
+              // start this write-capable gate.
+              const maintainerLogins = new Set(
+                readMaintainerLogins().map(login => login.toLowerCase())
+              );
+              const isCanonicalMaintainer =
+                typeof commenter === "string" &&
+                maintainerLogins.has(commenter.toLowerCase());
+              if (
+                !isPrComment ||
+                (!isCodeRabbit &&
+                 (![
+                   "OWNER",
+                   "COLLABORATOR",
+                   "MEMBER"
+                 ].includes(association) ||
+                  !isCanonicalMaintainer))
+              ) {
+                core.info(
+                  "issue_comment is neither CodeRabbit nor a canonical maintainer on a PR; skipping the gate."
+                );
+                return;
+              }
+            }
 
             const { data: pr } = await github.rest.pulls.get({
               owner,
@@ -231,7 +306,16 @@ jobs:
              * readiness section or a stale intermediate checkpoint body.
              */
             async function upsertGateComment(state, opts) {
-              const body = buildGateCommentBody(state, opts).join("\n");
+              let body = buildGateCommentBody(state, opts).join("\n");
+              // The hygiene workflow writes its status into this same comment.
+              // Preserve whatever it left so a gate rebuild does not drop it.
+              const existingHygiene = extractHygieneSection(gateComment?.body);
+              if (existingHygiene && !body.includes("pr-hygiene-block")) {
+                body = body.replace(
+                  /\s+$/,
+                  `\n\n## Hygiene\n\n${HYGIENE_BLOCK_START}\n${HYGIENE_MARKER}\n\n${existingHygiene}\n\n${HYGIENE_BLOCK_END}`
+                );
+              }
               if (gateCommentId) {
                 await github.rest.issues.updateComment({
                   owner,
@@ -474,8 +558,16 @@ jobs:
             // (see `completionIsStale`). When it is stale the gate resets the
             // boxes and the notification state, re-drafts, and tells the
             // author to re-test and re-tick against the latest code.
+            // `issue_comment` events carry no `pull_request.head.sha`, so the
+            // fallback to the live head would let a completed checklist with
+            // no recorded completion head pass as if it attested the current
+            // head. A comment-triggered run must not promote readiness: pass
+            // the live head only when the event actually delivered it.
             const eventHeadSha =
-              context.payload.pull_request?.head?.sha ?? pr.head.sha;
+              context.payload.pull_request?.head?.sha ??
+              (context.eventName === "issue_comment"
+                ? ""
+                : pr.head.sha);
             const completionHeadSha =
               gateState.completedAtHeadSha ?? null;
             const headDrifted = completionIsStale({

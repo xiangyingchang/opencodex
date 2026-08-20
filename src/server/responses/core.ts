@@ -172,14 +172,23 @@ import {
   imageGenToolCallAliases,
   restoreImageGenCallsInJson,
 } from "../responses-image-gen-repair";
-import { composeSsePayloadRewrites, relaySseWithPayloadRewrite } from "../sse-payload-rewrite";
+import { createResponsesModelPayloadRewrite, rewriteResponsesModelJson } from "../responses-model-rewrite";
 import type { EffectiveSubagentRoster, SpawnAgentSurface } from "../../codex/catalog";
 
 import { buildToolBridgeMaps, collabSurface, injectDeveloperMessage, multiAgentGuidanceText } from "./collaboration";
 import { hasUnreadableEncryptedAgentTask, looksLikeBackendCiphertext, sanitizeEncryptedContentInPlace } from "./encrypted-payload";
 import { fetchWithHeaderTimeout, providerFetch, safeHostLabel, safeOriginLabel } from "./fetch-helpers";
 import { classifyTransportFailureKind, transportErrorCode } from "../../lib/upstream-reachability";
-import { recordUpstreamHostFailure, resetUpstreamHostHealth, upstreamHostHealthKey } from "../../codex/upstream-host-health";
+import {
+  acquireUpstreamHostAdmission,
+  disableUpstreamHostCircuitForKey,
+  normalizeUpstreamHostCircuitThreshold,
+  recordUpstreamHostFailure,
+  releaseUpstreamHostAdmission,
+  resetUpstreamHostHealth,
+  upstreamHostHealthKey,
+  type UpstreamHostAdmissionLease,
+} from "../../codex/upstream-host-health";
 import {
   createResponsesSnapshotBlockRewrite,
   hasResponsesSnapshotRepair,
@@ -187,9 +196,11 @@ import {
 } from "../responses-snapshot-repair";
 import {
   composeSseBlockRewrites,
+  composeSsePayloadRewrites,
   payloadRewriteAsBlockRewrite,
   relaySseWithBlockRewrite,
 } from "../sse-payload-rewrite";
+import { createGithubCopilotResponsesBlockRewrite } from "../github-copilot-responses-repair";
 import { responsesJsonToSseBody } from "../responses-json-events";
 import { guardTerminalEventStream } from "./terminal-guard";
 
@@ -241,6 +252,30 @@ export function usesCodexForwardPoolAuth(
 ): authCtx is Extract<CodexAuthContext, { kind: "pool" | "main-pool" }> {
   return (authCtx.kind === "pool" || authCtx.kind === "main-pool")
     && provider.authMode === "forward" && provider.adapter === "openai-responses";
+}
+
+export function preAuthUpstreamHostCircuitKey(
+  route: Pick<RouteResult, "provider" | "providerName" | "codexAccountMode" | "codexAccountId">,
+  config: OcxConfig,
+  options: { requireResponsesAdapter?: boolean } = {},
+): string | null {
+  if (
+    normalizeUpstreamHostCircuitThreshold(config.upstreamHostCircuitThreshold) === 0
+    || route.codexAccountMode !== "pool"
+    || route.codexAccountId !== undefined
+    || route.provider.authMode !== "forward"
+    || (options.requireResponsesAdapter !== false && route.provider.adapter !== "openai-responses")
+  ) return null;
+  return upstreamHostHealthKey(route.providerName, safeOriginLabel(route.provider.baseUrl ?? ""));
+}
+
+export function upstreamHostCircuitOpenResponse(retryAfterSeconds: number): Response {
+  return formatErrorResponse(
+    503,
+    "upstream_host_circuit_open",
+    "Provider host is temporarily unavailable",
+    { retryAfter: String(retryAfterSeconds) },
+  );
 }
 
 function normalizeCodexUnsupportedModelDetail(value: string): string {
@@ -457,7 +492,12 @@ async function retryCodexPoolOnAlternateAccount(
       route.provider.authMode === "forward",
     );
     // A real HTTP response proves the host was reached (#914).
-    resetUpstreamHostHealth(upstreamHostHealthKey(route.providerName, safeOriginLabel(request.url)));
+    const retryHostKey = upstreamHostHealthKey(route.providerName, safeOriginLabel(request.url));
+    if (normalizeUpstreamHostCircuitThreshold(config.upstreamHostCircuitThreshold) > 0) {
+      resetUpstreamHostHealth(retryHostKey, null);
+    } else {
+      resetUpstreamHostHealth(retryHostKey);
+    }
     return {
       kind: "retried",
       authCtx: retryAuthCtx,
@@ -867,6 +907,12 @@ async function applyFinalRouteRequestNormalization(args: {
 }): Promise<void> {
   const { parsed, route, config, req, logCtx, inboundWire, inboundTransport } = args;
 
+  // Only Anthropic message routes retain the Codex-facing selector. Other providers must keep
+  // their existing response.model contract even when their public and wire model ids differ.
+  const responseModelId = parsed.modelId;
+  const preserveAnthropicResponseModel = route.providerName === "anthropic"
+    || route.provider.adapter === "anthropic";
+
   // Apply the routed model id upstream: routing may strip a "<provider>/" namespace.
   if (route.modelId !== parsed.modelId) {
     if (parsed._rawBody && typeof parsed._rawBody === "object") {
@@ -885,6 +931,7 @@ async function applyFinalRouteRequestNormalization(args: {
   // Settle the wire once so logging, fast-mode, auth, and sidecars read the adapter
   // this request will actually use (#404).
   route.provider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire);
+  if (preserveAnthropicResponseModel) parsed._responseModelId = responseModelId;
   logCtx.model = route.modelId;
   logCtx.provider = route.providerName;
   logCtx.providerAdapter = route.provider.adapter;
@@ -902,6 +949,10 @@ async function applyFinalRouteRequestNormalization(args: {
 
   // Virtual model rewriting: Pro aliases → base model + reasoning.mode="pro".
   applyOpenAiVirtualModel(parsed, route, logCtx);
+  if (parsed._responseModelId !== undefined && parsed._responseModelId !== parsed.modelId) {
+    logCtx.resolvedModel = route.modelId;
+    logCtx.preserveResolvedModelFromRoute = true;
+  }
 
   // Fast mode override for OpenAI-routed models, only where the provider's Responses
   // route documents `service_tier` support (capability gate below strips everywhere else).
@@ -1308,6 +1359,9 @@ async function handleResponsesInner(
   logCtx: RequestLogContext,
   options: HandleResponsesOptions & { translatorBudget: TranslatorBudget },
 ): Promise<Response> {
+  let pendingHostAdmissionLease: UpstreamHostAdmissionLease | null = null;
+  let authCtx: CodexAuthContext = { kind: "main", accountId: null };
+  try {
   // The Chat and Anthropic surfaces replay through here with a Responses-shaped body,
   // so an omitted value means a genuine Responses inbound.
   const inboundWire = options.inboundWire ?? "responses";
@@ -1446,7 +1500,6 @@ async function handleResponsesInner(
     nativeMainSelectionOnly: !nativeMainRecoveryBlocked
       && previewSelectionAdmission?.mainProfileDraining === true,
   };
-  let authCtx: CodexAuthContext = { kind: "main", accountId: null };
   let selectedForwardHeaders = req.headers;
   let subagentFallbackAccountId = config.activeCodexAccountId ?? null;
   let subagentQuotaFailureModel = parsed.modelId;
@@ -1551,6 +1604,19 @@ async function handleResponsesInner(
     logCtx.provider = `${route.providerName}-${route.codexAccountNamespace}`;
   }
 
+  if (options.abortSignal?.aborted) return clientCancelledResponse();
+  const preAuthHostKey = preAuthUpstreamHostCircuitKey(route, config);
+  if (preAuthHostKey) {
+    const admission = acquireUpstreamHostAdmission(
+      preAuthHostKey,
+      config.upstreamHostCircuitThreshold,
+    );
+    if (admission.kind === "blocked") {
+      return upstreamHostCircuitOpenResponse(admission.retryAfterSeconds);
+    }
+    pendingHostAdmissionLease = admission.lease;
+  }
+
   {
     const finalAuth = await resolveResponsesCodexAuth(req, config, route, options);
     if (!finalAuth.ok) return finalAuth.response;
@@ -1644,6 +1710,19 @@ async function handleResponsesInner(
   const adapterProvider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire);
   const adapter = resolveAdapter(adapterProvider, config.cacheRetention);
   logCtx.providerAdapter = adapter.name;
+  // Ordinary requests receive one durable attempt only after their final initial
+  // adapter is resolved. Combo children own their attempt and retries keep it.
+  if (!options.comboAttempt && !logCtx.activeAttempt) {
+    const attempt = beginRequestAttempt(
+      (logCtx.attempts?.length ?? 0) + 1,
+      logCtx.provider,
+      route.modelId,
+      adapter.name,
+    );
+    logCtx.activeAttempt = attempt;
+    logCtx.activeAttemptStartedAt = Date.now();
+    (logCtx.attempts ??= []).push(attempt);
+  }
   sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, adapter.name);
   const isPassthrough = "passthrough" in adapter && !!adapter.passthrough;
 
@@ -1748,10 +1827,22 @@ async function handleResponsesInner(
     delete parsed._webSearch;
     delete parsed.options.toolChoice;
     delete parsed.options.parallelToolCalls;
+    // The compaction turn is a plain prose summary; a surviving structured-output format
+    // would force schema-constrained JSON into the synthetic compaction item. The flag and
+    // the raw `text` controls go too: Kiro's capability guard reads both and would reject
+    // the turn outright, and the key-mode openai-responses adapter builds from _rawBody.
+    delete parsed.options.textFormat;
+    delete parsed._structuredOutput;
+    if (parsed._rawBody && typeof parsed._rawBody === "object") {
+      delete (parsed._rawBody as Record<string, unknown>).text;
+    }
     parsed.context.messages.push({ role: "user", content: COMPACT_PROMPT, timestamp: Date.now() });
   }
 
   if ("passthrough" in adapter && adapter.passthrough && !routedCompaction) {
+    let hostAdmissionLease = pendingHostAdmissionLease;
+    pendingHostAdmissionLease = null;
+    try {
     const imageGenCallAliases = route.provider.authMode === "forward"
       ? new Map<string, { namespace: string; name: string }>()
       : imageGenToolCallAliases(toolBridgeMaps.toolNsMap, parsed._rawBody, translatorBudget);
@@ -1776,8 +1867,52 @@ async function handleResponsesInner(
         + `(model ${parsed.modelId}); forwarding without it — earlier turns may be missing from this request`,
       );
     }
-    let request = await adapter.buildRequest(parsed, { headers: selectedForwardHeaders, translatorBudget });
+    let request: Awaited<ReturnType<typeof adapter.buildRequest>>;
+    try {
+      request = await adapter.buildRequest(parsed, { headers: selectedForwardHeaders, translatorBudget });
+    } catch (error) {
+      releaseCodexAuthContextProbeLease(authCtx);
+      throw error;
+    }
     recordAdapterReasoning(logCtx, request);
+    const actualHostKey = upstreamHostHealthKey(
+      route.providerName,
+      safeOriginLabel(request.url),
+    );
+    const hostKey = route.provider.authMode === "forward"
+      ? actualHostKey
+      : null;
+    const hostCircuitEnabled = hostKey !== null
+      && normalizeUpstreamHostCircuitThreshold(config.upstreamHostCircuitThreshold) > 0;
+    if (hostKey !== null && !hostCircuitEnabled) {
+      disableUpstreamHostCircuitForKey(actualHostKey);
+    }
+    if (hostAdmissionLease && hostAdmissionLease.key !== hostKey) {
+      return formatErrorResponse(502, "upstream_error", "Provider host changed after circuit admission");
+    }
+    if (options.abortSignal?.aborted) {
+      releaseCodexAuthContextProbeLease(authCtx);
+      return clientCancelledResponse();
+    }
+    if (!hostAdmissionLease && hostCircuitEnabled) {
+      const admission = acquireUpstreamHostAdmission(
+        hostKey!,
+        config.upstreamHostCircuitThreshold,
+      );
+      if (admission.kind === "blocked") {
+        releaseCodexAuthContextProbeLease(authCtx);
+        return upstreamHostCircuitOpenResponse(admission.retryAfterSeconds);
+      }
+      hostAdmissionLease = admission.lease;
+    }
+    const settleObservedHostResponse = (): void => {
+      if (hostCircuitEnabled) {
+        resetUpstreamHostHealth(actualHostKey, hostAdmissionLease);
+      } else {
+        resetUpstreamHostHealth(actualHostKey);
+      }
+      hostAdmissionLease = null;
+    };
     const passthroughEstimate = typeof request.usageLog?.inputTokens === "number"
       ? request.usageLog.inputTokens
       : undefined;
@@ -1793,16 +1928,30 @@ async function handleResponsesInner(
     let upstreamResponse: Response;
     const transportFailureResponse = (err: unknown): Response => {
       upstream.abort();
-      if (options.abortSignal?.aborted) return clientCancelledResponse();
+      if (options.abortSignal?.aborted) {
+        releaseUpstreamHostAdmission(hostAdmissionLease);
+        hostAdmissionLease = null;
+        releaseCodexAuthContextProbeLease(authCtx);
+        return clientCancelledResponse();
+      }
       const outcome = classifyTransportFailureKind(err);
       // Host-level evidence stands regardless of pool membership: a direct
       // forward send has no pool accounting, but the reachability failure is
       // still host-wide, not account evidence (#914 review).
       if (outcome === "connect_neutral") {
-        recordUpstreamHostFailure(
-          upstreamHostHealthKey(route.providerName, safeOriginLabel(request.url)),
-          { code: transportErrorCode(err) },
-        );
+        if (hostCircuitEnabled) {
+          recordUpstreamHostFailure(actualHostKey, {
+            code: transportErrorCode(err),
+            threshold: config.upstreamHostCircuitThreshold,
+            lease: hostAdmissionLease,
+          });
+        } else {
+          recordUpstreamHostFailure(actualHostKey, { code: transportErrorCode(err) });
+        }
+        hostAdmissionLease = null;
+      } else {
+        releaseUpstreamHostAdmission(hostAdmissionLease);
+        hostAdmissionLease = null;
       }
       if (usesCodexForwardPoolAuth(authCtx, route.provider)) {
         recordCodexUpstreamOutcome(config, authCtx.accountId, outcome, {
@@ -1835,7 +1984,7 @@ async function handleResponsesInner(
             // Every real attempt response — including an intermediate 5xx the
             // retry wrapper replaces — proves the host was reached (#914 review).
             .then(res => {
-              resetUpstreamHostHealth(upstreamHostHealthKey(route.providerName, safeOriginLabel(request.url)));
+              settleObservedHostResponse();
               return res;
             });
         },
@@ -1894,7 +2043,7 @@ async function handleResponsesInner(
             }, recovery), upstream.signal, connectMs, parsed.stream, providerFetch(route.provider),
               route.provider.authMode === "forward")
               .then(res => {
-                resetUpstreamHostHealth(upstreamHostHealthKey(route.providerName, safeOriginLabel(request.url)));
+                settleObservedHostResponse();
                 return res;
               });
           },
@@ -2059,13 +2208,18 @@ async function handleResponsesInner(
     if (isEventStream && upstreamResponse.body) {
       const repairConfig = route.provider.responsesItemIdRepair;
       const snapshotRepairEnabled = hasResponsesSnapshotRepair(route.provider.responsesSnapshotRepair);
-      const needsClientRewrite = imageGenCallAliases.size > 0 || hasResponsesItemIdRepair(repairConfig) || snapshotRepairEnabled;
+      const githubCopilotRepairEnabled = route.providerName === "github-copilot";
+      const responseModelRewrite = parsed._responseModelId !== undefined
+        && parsed._responseModelId !== parsed.modelId
+        ? createResponsesModelPayloadRewrite(parsed._responseModelId)
+        : undefined;
       // Compose opt-in payload rewrites into one parse/stringify pass (image-gen restore first).
       const payloadRewrites = [
         createImageGenCallRestoreRewrite(imageGenCallAliases),
         hasResponsesItemIdRepair(repairConfig)
           ? createResponsesItemIdPayloadRewrite(repairConfig!, translatorBudget)
           : undefined,
+        responseModelRewrite,
       ].filter((rewrite): rewrite is NonNullable<typeof rewrite> => rewrite !== undefined);
       // #893: sparse-snapshot gateways get field backfills AND lifecycle event
       // injection at the block level, after payload rewrites. Defaults come
@@ -2078,12 +2232,21 @@ async function handleResponsesInner(
           return undefined;
         }
       })();
-      const clientBlockRewrite = snapshotRepairEnabled
-        ? composeSseBlockRewrites(
-          payloadRewriteAsBlockRewrite(composeSsePayloadRewrites(...payloadRewrites)),
-          createResponsesSnapshotBlockRewrite(snapshotDefaultsRequest, translatorBudget),
-        )
+      const blockRewrites = [
+        payloadRewrites.length > 0
+          ? payloadRewriteAsBlockRewrite(composeSsePayloadRewrites(...payloadRewrites))
+          : undefined,
+        githubCopilotRepairEnabled
+          ? createGithubCopilotResponsesBlockRewrite(translatorBudget)
+          : undefined,
+        snapshotRepairEnabled
+          ? createResponsesSnapshotBlockRewrite(snapshotDefaultsRequest, translatorBudget)
+          : undefined,
+      ].filter((rewrite): rewrite is NonNullable<typeof rewrite> => rewrite !== undefined);
+      const clientBlockRewrite = blockRewrites.length > 0
+        ? composeSseBlockRewrites(...blockRewrites)
         : undefined;
+      const needsClientRewrite = clientBlockRewrite !== undefined;
       // #864: win32 rewrite traffic must never enter the tee()+JS-pull chain
       // (Bun#32111 JS-sink segfault — text frames pass, the terminal block is
       // lost). The eager single reader applies the same rewrites inline.
@@ -2093,6 +2256,8 @@ async function handleResponsesInner(
         needsClientRewrite,
         config.streamMode ?? "auto",
       );
+      const inlineEagerRewrite = needsClientRewrite
+        && (win32EagerRewrite || eagerPath?.useEagerRelay === true);
       if (eagerPath?.useEagerRelay || win32EagerRewrite) {
         const turnAc = new AbortController();
         linkAbortSignal(upstream, turnAc.signal);
@@ -2124,6 +2289,7 @@ async function handleResponsesInner(
           logCtx,
           onCompletedResponse: rememberPassthroughResponse,
           onFirstOutput: options.onFirstOutput,
+          pinCompletedResponseIdToFirstSeen: githubCopilotRepairEnabled,
         });
         const eagerBody = relaySseEagerBounded(upstreamResponse.body, turnAc, {
           inspectChunk: chunk => inspector.feed(chunk),
@@ -2132,9 +2298,6 @@ async function handleResponsesInner(
           // Stream lifetime follows the protocol terminal even when this request
           // has no outcome callback configured (reported() would stay false).
           sawTerminal: () => inspector.terminalSeen(),
-          ...(win32EagerRewrite
-            ? { rewritePayload: composeSsePayloadRewrites(...payloadRewrites) }
-            : {}),
           ...(clientBlockRewrite
             ? { rewriteBlocks: clientBlockRewrite }
             : {}),
@@ -2151,11 +2314,11 @@ async function handleResponsesInner(
           },
           onClientCancel: () => options.onNativePassthroughCancel?.(),
           onDone: () => unregisterTurn(turnAc),
-        }, win32EagerRewrite ? { rewriteBudget: translatorBudget } : undefined);
+        }, inlineEagerRewrite ? { rewriteBudget: translatorBudget } : undefined);
         // When selected, this relay closes response.completed even if upstream
-        // keeps the connection alive. Windows rewrite traffic applies its
-        // payload transform inline — never via the Bun#32111-unsafe
-        // tee()+JS-pull chain (#864).
+        // keeps the connection alive. Windows forced-rewrite traffic and Darwin
+        // explicit eager traffic apply client rewrites inline rather than via
+        // the tee()+JS-pull chain.
         if (!headers.has("content-type")) headers.set("content-type", "text/event-stream");
         return markEagerRelaySseResponse(
           markNativePassthroughSseResponse(new Response(eagerBody, {
@@ -2173,6 +2336,7 @@ async function handleResponsesInner(
         clientGoneSignal: clientGone.signal,
         drainBounds: { ms: 15_000, bytes: 32 * 1024 * 1024 },
         upstream,
+        pinCompletedResponseIdToFirstSeen: githubCopilotRepairEnabled,
       };
       if (recordTerminalOutcomes) {
         // A real terminal was parsed from the (teed) inspection stream — record it as the outcome
@@ -2225,8 +2389,8 @@ async function handleResponsesInner(
       // Windows was handled by the eager terminal-aware branch above. Remaining
       // tee traffic can use the JS relay to close on a protocol terminal and to
       // convert a mid-stream reset into a clean response.failed event.
-      const rewrittenBody = clientBlockRewrite !== undefined || payloadRewrites.length > 0
-        ? relaySseWithBlockRewrite(nativeBody, clientBlockRewrite ?? payloadRewriteAsBlockRewrite(composeSsePayloadRewrites(...payloadRewrites)), translatorBudget)
+      const rewrittenBody = clientBlockRewrite !== undefined
+        ? relaySseWithBlockRewrite(nativeBody, clientBlockRewrite, translatorBudget)
         : nativeBody;
       const clientBody = relaySseWithFailedTail(rewrittenBody, upstream, reason => clientGone.abort(reason));
       return markNativePassthroughSseResponse(new Response(clientBody, {
@@ -2257,14 +2421,19 @@ async function handleResponsesInner(
       }
       const clientJson = (() => {
         const restored = restoreImageGenCallsInJson(text, imageGenCallAliases);
-        if (!hasResponsesSnapshotRepair(route.provider.responsesSnapshotRepair)) return restored;
-        let outbound: unknown;
-        try {
-          outbound = JSON.parse(request.body);
-        } catch {
-          outbound = undefined;
-        }
-        return repairResponsesSnapshotJson(restored, outbound);
+        const repaired = (() => {
+          if (!hasResponsesSnapshotRepair(route.provider.responsesSnapshotRepair)) return restored;
+          let outbound: unknown;
+          try {
+            outbound = JSON.parse(request.body);
+          } catch {
+            outbound = undefined;
+          }
+          return repairResponsesSnapshotJson(restored, outbound);
+        })();
+        return parsed._responseModelId !== undefined && parsed._responseModelId !== parsed.modelId
+          ? rewriteResponsesModelJson(repaired, parsed._responseModelId)
+          : repaired;
       })();
       // #875: the transport-neutral reliability policy forced a bounded JSON
       // upstream for a client that asked for SSE. Reframe the completed JSON
@@ -2326,6 +2495,12 @@ async function handleResponsesInner(
       status: upstreamResponse.status,
       headers,
     });
+    } finally {
+      if (hostAdmissionLease) {
+        releaseUpstreamHostAdmission(hostAdmissionLease);
+        releaseCodexAuthContextProbeLease(authCtx);
+      }
+    }
   }
 
   // Image / web-search sidecars: plan once, then dispatch with runTurn-aware priority.
@@ -2567,7 +2742,7 @@ async function handleResponsesInner(
         eventSource = preflight.stream;
       }
       const sseStream = bridgeToResponsesSSE(
-        eventSource, parsed.modelId, toolNsMap, freeformToolNames, toolSearchToolNames,
+        eventSource, parsed._responseModelId ?? parsed.modelId, toolNsMap, freeformToolNames, toolSearchToolNames,
         () => {
           runTurnAbort.abort();
           queue.close();
@@ -2619,7 +2794,7 @@ async function handleResponsesInner(
       }
     }
     let providerState: OcxProviderContinuationState | undefined;
-    const json = buildResponseJSON(events, parsed.modelId, {
+    const json = buildResponseJSON(events, parsed._responseModelId ?? parsed.modelId, {
       translatorBudget,
       replayCacheScope: parsed._clientThreadId ?? "global",
       hideThinkingSummary: parsed.options.hideThinkingSummary,
@@ -3261,7 +3436,7 @@ async function handleResponsesInner(
       : initialEventStream;
     const { toolNsMap, freeformToolNames, toolSearchToolNames } = toolBridgeMaps;
     const sseStream = bridgeToResponsesSSE(
-      eventStream, parsed.modelId, toolNsMap, freeformToolNames, toolSearchToolNames,
+      eventStream, parsed._responseModelId ?? parsed.modelId, toolNsMap, freeformToolNames, toolSearchToolNames,
       () => upstream.abort(), 2_000,
       {
         translatorBudget,
@@ -3321,7 +3496,7 @@ async function handleResponsesInner(
     }
     const { toolNsMap, freeformToolNames, toolSearchToolNames } = toolBridgeMaps;
     let providerState: OcxProviderContinuationState | undefined;
-    const json = buildResponseJSON(events, parsed.modelId, {
+    const json = buildResponseJSON(events, parsed._responseModelId ?? parsed.modelId, {
       translatorBudget,
       replayCacheScope: parsed._clientThreadId ?? "global",
       hideThinkingSummary: parsed.options.hideThinkingSummary,
@@ -3351,6 +3526,12 @@ async function handleResponsesInner(
   }
 
   return formatErrorResponse(400, "invalid_request_error", "Non-streaming not supported by this adapter");
+  } finally {
+    if (pendingHostAdmissionLease) {
+      releaseUpstreamHostAdmission(pendingHostAdmissionLease);
+      releaseCodexAuthContextProbeLease(authCtx);
+    }
+  }
 }
 
 

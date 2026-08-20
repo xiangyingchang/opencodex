@@ -22,6 +22,7 @@ import {
   setCodexIntegrationEnabled,
   setGrokIntegrationEnabled,
   grokIntegrationEnabled,
+  shouldSyncCodexOnStart,
   shouldSyncGrokOnStart,
   syncCodexOnStartIfEnabled,
 } from "../src/codex/desired-state";
@@ -208,6 +209,11 @@ describe("the startup gate", () => {
     );
     expect(ran.ran).toBe(false);
     expect(calls).toBe(0);
+  });
+
+  test("the shared sync predicate has the same absent-means-on semantics", () => {
+    expect(shouldSyncCodexOnStart(baseConfig())).toBe(true);
+    expect(shouldSyncCodexOnStart({ ...baseConfig(), clientIntegrations: { codex: false } })).toBe(false);
   });
 
   test("absence, an empty object, and an explicit true all still sync", async () => {

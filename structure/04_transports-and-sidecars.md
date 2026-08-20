@@ -61,6 +61,11 @@ The two-shape contract is mirror-commented in `src/server/index.ts`; the real
 and the platform matrix lives in `tests/bun-stream-caps.test.ts`. Keep all three
 in lockstep with any passthrough-policy change.
 
+Translated response request-log tracking and the heartbeat relay also reuse
+`createSseInspector`. This keeps every client-facing SSE observation path on
+the same byte-bounded, discard-and-resynchronize frame policy and ensures the
+request-log, first-output, and terminal observers share one payload parse.
+
 ## Standalone Search and exact account selectors
 
 `POST /v1/alpha/search` retains the selected model in its request body. When that value is an
@@ -211,8 +216,15 @@ upstream Responses endpoint for bounded JSON on ANY client transport — WebSock
 HTTP/SSE. The bridge reframes that JSON into the same Responses event sequence
 (`src/server/responses-json-events.ts`): WS turns send the frames as WebSocket messages, while
 HTTP clients that requested streaming receive a synthesized terminal SSE body (created →
-output_item.done → terminal → `[DONE]`). DeepSeek V4 Flash uses this path because its Codex
-streaming response can deliver output without closing on a terminal event.
+output_item.done → terminal → `[DONE]`). No production registry entry currently opts in:
+DeepSeek V4 Flash used this path while its public-beta Responses stream was suspected of not
+closing on the terminal event, but the official guide documents a
+`response.completed`/`response.incomplete`/`response.failed` terminal with no `data: [DONE]`
+sentinel, and live probes (2026-08-07) confirm the stream closes on the terminal. The relay's
+terminal-output boundary (`src/server/relay.ts`) cuts the stream at that event and synthesizes
+`[DONE]` itself, so DeepSeek streams live again; the registry knob remains as a one-line
+rollback for upstreams that regress, kept suite-reachable by a synthetic-registry fixture in
+`tests/deepseek-inbound-wire.test.ts`.
 
 `ws-bridge.ts` preserves upstream `failed` and `incomplete` status values in the final WebSocket
 frame rather than always emitting `response.completed`. If the response status is `failed`, a

@@ -119,6 +119,15 @@ export function pinnedHttpGet(
             try { controller.enqueue(buffer); } catch { /* closed */ }
           });
           response.on("end", () => {
+            // A completed response must not keep the request's idle timeout alive.
+            // Clear it on the real ClientRequest; test doubles use the socket path
+            // so the configured timeout remains observable in transport assertions.
+            try {
+              if ((req as unknown) instanceof http.ClientRequest) {
+                req.setTimeout(0);
+                if (response instanceof http.IncomingMessage) response.setTimeout(0);
+              }
+            } catch { /* already closed */ }
             try { controller.close(); } catch { /* closed */ }
           });
           response.on("error", (error: Error) => {

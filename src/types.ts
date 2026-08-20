@@ -2,6 +2,8 @@ import type { KiroOAuthMetadata } from "./oauth/types";
 
 export interface OcxParsedRequest {
   modelId: string;
+  /** Client-facing model selector retained for Anthropic routes after wire-model normalization. */
+  _responseModelId?: string;
   /** Selected OpenAI API virtual-model id retained after it rewrites the upstream wire model. */
   _openAiVirtualSelectedModelId?: string;
   previousResponseId?: string;
@@ -164,6 +166,8 @@ export interface OcxTool {
   toolSearch?: boolean;
   /** Tool definition restored from a prior tool_search output; transports may prioritize it when catalogs are bounded. */
   loadedFromToolSearch?: boolean;
+  /** Cursor-only synthetic exact-match edit tool; never inferred from the wire name. */
+  cursorStructuredEdit?: true;
   /** Synthetic web_search tool: the model's call is executed by the gpt-5.4-mini sidecar, not relayed to Codex. */
   webSearch?: boolean;
   /** Synthetic image_gen tool: the model's call is executed by the xAI image bridge sidecar, not relayed to Codex. */
@@ -233,6 +237,20 @@ export interface OcxRequestOptions {
   frequencyPenalty?: number;
   /** Responses prompt-cache affinity key. Passthrough preserves it via _rawBody; routed adapters do not consume it unless their upstream wire supports it. */
   promptCacheKey?: string;
+  /**
+   * Responses `text.format` (json_schema / json_object), preserved for adapters whose
+   * upstream wire has an equivalent. The openai-chat adapter re-nests it as chat
+   * `response_format`, the exact inverse of responseFormatToText in src/chat/inbound.ts.
+   * The native passthrough ignores it (it forwards `_rawBody.text` verbatim) and Kiro
+   * keeps rejecting structured output via `_structuredOutput`.
+   */
+  textFormat?: {
+    type: "json_schema" | "json_object";
+    name?: string;
+    description?: string;
+    schema?: Record<string, unknown>;
+    strict?: boolean;
+  };
 }
 
 export type OcxMessagePhase = "commentary" | "final_answer";
@@ -555,6 +573,8 @@ export interface OcxClientIntegrationsConfig {
   codex?: boolean;
   /** Durable desired state for Grok Build. MISSING MEANS ON. */
   grok?: boolean;
+  /** Durable desired state for Claude Desktop. MISSING MEANS ON. */
+  "claude-desktop"?: boolean;
 }
 
 export interface OcxConfig {
@@ -713,6 +733,30 @@ export interface OcxConfig {
   /** Bind hostname. Default "127.0.0.1" (loopback only). Set "0.0.0.0" to expose on all interfaces. */
   hostname?: string;
   /**
+   * Optional second listener bound to 127.0.0.1 that admits data-plane requests without a
+   * credential (issue #1102).
+   *
+   * Why a separate listener rather than an exemption on the main one: when `hostname` is a
+   * wildcard, every caller needs `x-opencodex-api-key`, but a `codex app-server` spawned
+   * directly from the resolved entrypoint never goes through the generated shim and so never
+   * inherits the token. Exempting "loopback-looking peers" on the public listener would be
+   * unsound — `requestIP()` only proves the last transport hop, and Docker Desktop port
+   * forwarding, host-network containers, WSL mirrored networking and tunnels all terminate
+   * remote connections locally. Binding a second socket to 127.0.0.1 makes the kernel refuse
+   * remote connections outright, so there is no address to judge.
+   *
+   * The public listener's admission policy is unchanged. This adds an explicit local trust
+   * surface: every process on the machine can reach it, spend account quota, and consume paid
+   * provider credentials. Off by default; not for multi-tenant hosts.
+   *
+   * The port is required when enabled and must differ from the proxy port. An OS-assigned port
+   * would change across restarts, which would break already-running app-servers holding the
+   * previous `base_url` — the exact symptom #1102 reported and we disproved for token rotation.
+   */
+  unauthenticatedLoopbackListener?:
+    | { enabled: false }
+    | { enabled: true; port: number };
+  /**
    * Outbound HTTP(S) proxy URL for provider requests (e.g. "http://user:pass@proxy:8080", or
    * "${HTTPS_PROXY}"-style env reference). Mirrored into HTTP_PROXY/HTTPS_PROXY at startup when
    * those are unset — Bun's fetch honors them for all outbound calls; localhost is excluded.
@@ -767,11 +811,28 @@ export interface OcxConfig {
   /** Account ids administratively excluded from future pool selection until resumed. */
   pausedCodexAccountIds?: string[];
   /**
+   * Selection order per account id, higher used earlier; absent = 0. Keyed by id
+   * rather than stored on `codexAccounts` rows so the Desktop login (`__main__`),
+   * which has no row, can be ordered too. Range -100..100.
+   */
+  codexAccountPriorities?: Record<string, number>;
+  /**
+   * Account id the operator last selected by hand. Suppresses upward priority
+   * preemption until that account crosses the auto-switch threshold. Stores the
+   * id (not a flag) so a stale pin cannot outlive the selection it described.
+   */
+  activeCodexAccountPinned?: string;
+  /**
    * Public model-selector namespaces bound to one Codex account. Values are stored account ids;
    * `"@main"` selects the Codex Desktop/main auth.json account. Account display aliases
    * are intentionally separate from these selectors.
    */
   codexAccountNamespaces?: Record<string, string>;
+  /**
+   * Picker visibility override for account-qualified native models. When omitted, a non-empty
+   * selector map remains visible for compatibility with hand-written configurations.
+   */
+  codexAccountPickerEnabled?: boolean;
   /** Active pool account id for next session. undefined = main (passthrough as-is). */
   activeCodexAccountId?: string;
   /** Auto-switch threshold (0-100). Default 80. 0 = disabled. */
@@ -782,6 +843,11 @@ export interface OcxConfig {
   accountPoolStickyLimit?: number;
   /** Consecutive non-2xx upstream responses before switching future new threads. Default 3. 0 = disabled. */
   upstreamFailoverThreshold?: number;
+  /**
+   * Opt-in provider-origin circuit threshold for proven pre-connection reachability failures.
+   * Default 0 (disabled); range 0..20. The circuit never counts timeouts or HTTP responses.
+   */
+  upstreamHostCircuitThreshold?: number;
   /**
    * Opt-in Anthropic OAuth account pool (#294). Default OFF.
    * Failover on 429 + sticky affinity; new sessions may pick lowest known 5h usage.
@@ -1143,9 +1209,9 @@ export interface OcxProviderConfig {
    * full set so the user can pick). See devlog issue_052_provider-model-allowlist.
    */
   selectedModels?: string[];
-  /** Provider-wide Codex-visible context-window cap for routed catalog entries. */
+  /** Provider-wide fallback when context metadata is absent; otherwise caps the reported window. */
   contextWindow?: number;
-  /** Model-specific Codex-visible context-window caps. Values cap live metadata, never raise it. */
+  /** Per-model fallback when context metadata is absent; otherwise caps the reported window. */
   modelContextWindows?: Record<string, number>;
   /** Model-specific Codex catalog input modalities, e.g. ["text"] or ["text", "image"]. */
   modelInputModalities?: Record<string, string[]>;

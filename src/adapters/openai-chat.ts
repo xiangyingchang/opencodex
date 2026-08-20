@@ -3,6 +3,7 @@ import type { AdapterEvent, OcxAssistantMessage, OcxContentPart, OcxMessage, Ocx
 import { isAllowedToolChoice, modelInList, namespacedToolName, resolveToolChoiceWireName, toolAllowedByChoice } from "../types";
 import { mapReasoningEffort, modelRecordValue } from "../reasoning-effort";
 import { debugProviderDiagnostic } from "../lib/debug";
+import { sseFieldValue } from "../lib/sse-decoder";
 import { isDebugEnabled } from "../lib/debug-settings";
 import { isCyberPolicyCode } from "../lib/errors";
 import { redactSecretString } from "../lib/redact";
@@ -818,6 +819,26 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       if (provider.promptCacheKey && parsed.options.promptCacheKey !== undefined) {
         body.prompt_cache_key = parsed.options.promptCacheKey;
       }
+      // Responses `text.format` -> chat `response_format`. json_object maps 1:1; json_schema
+      // re-nests the flattened Responses fields under `json_schema` — the exact inverse of
+      // responseFormatToText in src/chat/inbound.ts. Forwarded unconditionally (like `stop`):
+      // response_format is a first-class Chat Completions field, it is only present when the
+      // caller explicitly asked for structured output, and a backend that rejects it should
+      // fail loud rather than silently return prose the caller will try to JSON.parse.
+      const textFormat = parsed.options.textFormat;
+      if (textFormat?.type === "json_object") {
+        body.response_format = { type: "json_object" };
+      } else if (textFormat?.type === "json_schema") {
+        body.response_format = {
+          type: "json_schema",
+          json_schema: {
+            name: textFormat.name ?? "response",
+            ...(textFormat.description !== undefined ? { description: textFormat.description } : {}),
+            ...(textFormat.schema !== undefined ? { schema: textFormat.schema } : {}),
+            ...(textFormat.strict !== undefined ? { strict: textFormat.strict } : {}),
+          },
+        };
+      }
 
       if (tools) {
         // Default-ON for chat-completions providers (user decision 260709): the buffered
@@ -927,8 +948,9 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       // Yields adapter events and returns "terminate" for a terminal frame ([DONE] / error) that
       // must end the stream, or "continue" otherwise. Mutates the closure's terminal-signal state.
       const handleDataLine = function* (line: string): Generator<AdapterEvent, "continue" | "terminate"> {
-        if (!line.startsWith("data: ")) return "continue";
-        const payload = line.slice(6).trim();
+        const rawPayload = sseFieldValue(line, "data");
+        if (rawPayload === null) return "continue";
+        const payload = rawPayload.trim();
         if (payload === "[DONE]") {
           yield* flushToolCalls();
           const stopReason = stopReasonFor(finishReason);

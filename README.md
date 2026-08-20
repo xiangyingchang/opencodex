@@ -60,6 +60,14 @@ ocx start                            # or `ocx service` to run it in the backgro
 Open **http://localhost:10100** and configure everything in the web dashboard — add providers
 (40+ built-ins, or any OpenAI-compatible endpoint), pick models, manage accounts. `ocx gui`
 re-opens the dashboard at any time.
+It can also manage a **ChatGPT account pool** for Codex auth. Add multiple ChatGPT / Codex accounts,
+refresh their 5h / weekly / 30d quota in the dashboard. Under quota routing, new sessions can use
+the lowest-usage healthy account; round-robin and fill-first use their own policies. Existing Codex
+threads normally retain affinity to the account that started them, so long SSH, tmux, or
+mobile-connected sessions do not jump accounts mid-conversation — but quota re-evaluation, failover,
+account exclusion, affinity expiry, or 401/403 and 429 recovery can rebind them. Give the accounts a
+selection order when one of them — usually your Codex Desktop login — should only be reached for
+once the others are drained.
 
 ### For agents
 
@@ -139,6 +147,8 @@ ocx start [--port 10100]       # start the proxy in the foreground
 ocx stop                       # stop + restore native Codex
 ocx service [install|start|stop|status|uninstall|remove]  # background service
 ocx codex-shim install         # start the proxy on demand whenever `codex` launches
+ocx health [--json]            # check immediate proxy liveness
+ocx ready [--json] [--wait [--timeout <seconds>]]  # check post-sync readiness
 ocx status                     # is the proxy running?
 ocx gui                        # open the web dashboard
 ocx provider <...>             # manage providers (list/add/edit/test/remove)
@@ -150,6 +160,27 @@ ocx update [--tag preview]     # update opencodex
 
 Unpinned starts may pick another free port if the preferred one is busy; an explicit `--port`
 never hops. Full reference: [CLI docs](https://opencodex.me/reference/cli/).
+
+### Health and readiness
+
+`GET /healthz` reports immediate proxy liveness. The unauthenticated `GET /readyz` endpoint reports
+post-sync readiness with the sanitized JSON identity `{service, version, uptime, pid, port, status}`.
+It returns `200` when `status` is `ready`; `pending` and terminal `failed` return `503` with
+`Retry-After: 1`.
+
+`ocx ready [--json] [--wait [--timeout <seconds>]]` performs one probe by default. `--wait` polls
+for up to 45 seconds by default, but exits immediately when it observes terminal `failed`;
+`--timeout <seconds>` sets a 1–300 second limit, requires `--wait`, and accepts only positive integers. CLI `--json` output is
+`{ready, status, pid, port}`, where `status` is `ready`, `pending`, `failed`, or `unreachable`.
+
+| Exit | Result |
+| --- | --- |
+| `0` | Ready |
+| `1` | Not ready: pending, failed, timeout, or unreachable |
+| `64` | Invalid arguments |
+
+An older proxy without `/readyz` fails closed as `unreachable` with exit 1, while `ocx health`
+remains compatible.
 
 ### Autostart: service vs shim
 

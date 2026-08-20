@@ -4,11 +4,12 @@
  * contract; every other gateway has to be driven as a plain summarizer, or Codex
  * fatals on a compaction turn that came back as an ordinary message.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleResponses, handleResponsesCompact } from "../src/server/responses";
+import * as adapterResolveModule from "../src/server/adapter-resolve";
 import { saveCodexAccountCredential } from "../src/codex/account-store";
 import {
   CODEX_QUOTA_PROBE_INTERVAL_MS,
@@ -19,10 +20,12 @@ import {
 } from "../src/codex/routing";
 import { clearAccountQuota, updateAccountQuota } from "../src/codex/auth-api";
 import { MAIN_CODEX_ACCOUNT_ID } from "../src/codex/main-account";
+import * as authContextModule from "../src/codex/auth-context";
 import {
   releaseCodexAuthContextProbeLease,
   resolveCodexAuthContext,
 } from "../src/codex/auth-context";
+import { clearUpstreamHostHealth } from "../src/codex/upstream-host-health";
 import { supportsNativeResponsesCompactEndpoint } from "../src/providers/openai-tiers";
 import type { RequestLogContext } from "../src/server/request-log";
 import { acquireNativeMainProfileDrain, tryAdmitTurn } from "../src/server/lifecycle";
@@ -398,7 +401,9 @@ describe("routed compaction for key-mode openai-responses (#422)", () => {
     }) as typeof fetch;
 
     const res = await handleResponses(
-      compactionRequest(baseCompactionBody()),
+      compactionRequest(baseCompactionBody({
+        text: { format: { type: "json_schema", name: "answer", schema: { type: "object" } } },
+      })),
       keyProviderConfig(),
       { model: "", provider: "" },
     );
@@ -411,11 +416,37 @@ describe("routed compaction for key-mode openai-responses (#422)", () => {
     expect(sent.tools).toBeUndefined();
     expect(sent.tool_choice).toBeUndefined();
     expect(sent.parallel_tool_calls).toBeUndefined();
+    // The summarizer must stay prose: a surviving text.format would force schema JSON.
+    expect(sent.text).toBeUndefined();
     expect(JSON.stringify(input)).toContain("CONTEXT CHECKPOINT COMPACTION");
 
     const json = await res.json() as { output?: Array<{ type?: string }> };
     const compactionItems = (json.output ?? []).filter(item => item.type === "compaction");
     expect(compactionItems.length).toBe(1);
+  });
+
+  test("routed chat compaction drops the structured-output format", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+      return jsonResponse({
+        choices: [{ index: 0, message: { role: "assistant", content: "handoff summary" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+    }) as typeof fetch;
+
+    const res = await handleResponses(
+      compactionRequest(baseCompactionBody({ text: { format: { type: "json_object" } } })),
+      keyProviderConfig({ adapter: "openai-chat" }),
+      { model: "", provider: "" },
+    );
+
+    expect(bodies.length).toBe(1);
+    // The compaction turn is a prose summary; the caller's structured-output request must not
+    // constrain it (core.ts routedCompaction deletes options.textFormat).
+    expect(bodies[0]!.response_format).toBeUndefined();
+    const json = await res.json() as { output?: Array<{ type?: string }> };
+    expect((json.output ?? []).filter(item => item.type === "compaction").length).toBe(1);
   });
 
   test("strips additional_tools even when top-level tools are absent", async () => {
@@ -571,6 +602,7 @@ describe("compact alternate-account attempt (#913)", () => {
     process.env.OPENCODEX_HOME = testDir;
     process.env.CODEX_HOME = testDir;
     clearCodexUpstreamHealth();
+    clearUpstreamHostHealth();
     clearAccountQuota();
     for (const id of ["pool-a", "pool-b"]) {
       saveCodexAccountCredential(id, {
@@ -584,6 +616,7 @@ describe("compact alternate-account attempt (#913)", () => {
     return run(twoAccountPoolConfig()).finally(() => {
       globalThis.fetch = originalFetch;
       clearCodexUpstreamHealth();
+      clearUpstreamHostHealth();
       clearAccountQuota();
       rmSync(testDir, { recursive: true, force: true });
       if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
@@ -927,6 +960,110 @@ describe("compact alternate-account attempt (#913)", () => {
       // Whichever account routing picked first carries the 429; the other carries B's 402.
       const statuses = ["pool-a", "pool-b"].map(id => health(id)?.lastFailureStatus).sort();
       expect(statuses).toEqual([402, 429]);
+    });
+  });
+
+  test("a pre-send build failure releases the Codex probe lease with host circuit disabled", async () => {
+    await withPoolEnv("ocx-regular-build-probe-release-", async config => {
+      config.upstreamHostCircuitThreshold = 0;
+      const probeAuth = {
+        kind: "pool" as const,
+        accountId: "pool-a",
+        writerGeneration: 1,
+        generation: 1,
+        accessToken: "probe-token",
+        chatgptAccountId: "pool_acc_a",
+        probeLeaseId: "probe-lease",
+        quotaScope: "shared" as const,
+      };
+      const authSpy = spyOn(authContextModule, "resolveCodexAuthContext").mockResolvedValue(probeAuth);
+      const releaseSpy = spyOn(authContextModule, "releaseCodexAuthContextProbeLease");
+      const adapterSpy = spyOn(adapterResolveModule, "resolveAdapter").mockReturnValue({
+        name: "openai-responses",
+        passthrough: true,
+        buildRequest: async () => { throw new Error("synthetic build failure"); },
+      } as ReturnType<typeof adapterResolveModule.resolveAdapter>);
+      try {
+        const request = new Request("http://localhost/v1/responses", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "gpt-5.6-sol", input: "hello", stream: false }),
+        });
+        await expect(handleResponses(request, config, { model: "", provider: "" }))
+          .rejects.toThrow("synthetic build failure");
+        expect(releaseSpy).toHaveBeenCalledWith(probeAuth);
+      } finally {
+        adapterSpy.mockRestore();
+        releaseSpy.mockRestore();
+        authSpy.mockRestore();
+      }
+    });
+  });
+
+  test("an opt-in regular circuit blocks before selecting another pool account", async () => {
+    await withPoolEnv("ocx-regular-host-circuit-", async config => {
+      config.upstreamHostCircuitThreshold = 1;
+      let sends = 0;
+      globalThis.fetch = (async () => {
+        sends += 1;
+        throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+      }) as typeof fetch;
+
+      const request = () => new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-5.6-sol", input: "hello", stream: false }),
+      });
+      const authSpy = spyOn(authContextModule, "resolveCodexAuthContext");
+      try {
+        const first = await handleResponses(request(), config, { model: "", provider: "" });
+        const selectionsAfterFirst = authSpy.mock.calls.length;
+        const second = await handleResponses(request(), config, { model: "", provider: "" });
+        expect(first.status).toBe(502);
+        expect(second.status).toBe(503);
+        expect(second.headers.get("retry-after")).toBe("30");
+        expect(sends).toBe(1);
+        expect(authSpy.mock.calls.length).toBe(selectionsAfterFirst);
+        expect(getCodexUpstreamHealth("pool-a")).toBeNull();
+        expect(getCodexUpstreamHealth("pool-b")).toBeNull();
+      } finally {
+        authSpy.mockRestore();
+      }
+    });
+  });
+
+  test("an opt-in compact circuit blocks before selecting another pool account", async () => {
+    await withPoolEnv("ocx-compact-host-circuit-", async config => {
+      config.upstreamHostCircuitThreshold = 1;
+      let sends = 0;
+      globalThis.fetch = (async () => {
+        sends += 1;
+        throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+      }) as typeof fetch;
+
+      const authSpy = spyOn(authContextModule, "resolveCodexAuthContext");
+      try {
+        const first = await handleResponsesCompact(
+          compactionRequest(baseCompactionBody({})),
+          config,
+          { model: "", provider: "" },
+        );
+        const selectionsAfterFirst = authSpy.mock.calls.length;
+        const second = await handleResponsesCompact(
+          compactionRequest(baseCompactionBody({})),
+          config,
+          { model: "", provider: "" },
+        );
+        expect(first.status).toBe(502);
+        expect(second.status).toBe(503);
+        expect(second.headers.get("retry-after")).toBe("30");
+        expect(sends).toBe(1);
+        expect(authSpy.mock.calls.length).toBe(selectionsAfterFirst);
+        expect(getCodexUpstreamHealth("pool-a")).toBeNull();
+        expect(getCodexUpstreamHealth("pool-b")).toBeNull();
+      } finally {
+        authSpy.mockRestore();
+      }
     });
   });
 });

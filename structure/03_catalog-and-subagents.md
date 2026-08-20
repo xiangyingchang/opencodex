@@ -34,6 +34,26 @@ deleting, or editing a provider's shape clears that per-provider cache; a disabl
 deliberately does not, because a disabled provider is already excluded from the catalog gather
 instead. Codex's own `models_cache.json` is a different cache, invalidated by catalog refresh.
 
+## Startup readiness
+
+Each `startServer` invocation owns a private, one-shot readiness gate created before the listener
+binds. `handleStart` supplies its gate and transitions it after the shared catalog sync settles.
+Calls without a supplied gate receive a fresh private gate that intentionally remains pending. Only
+`ok: true` with no nonempty warning becomes ready; `null`, a throw, `ok !== true`, or a nonempty
+warning becomes failed. State is isolated per server instance.
+
+Exact unauthenticated `GET /readyz` returns sanitized identity fields plus pending, ready, or failed:
+`200` for ready, or `503` with `Retry-After: 1` for pending and terminal failed. The full CLI syntax
+is `ocx ready [--json] [--wait [--timeout <seconds>]]`. The probe validates the service, version,
+uptime, PID, port, status, and HTTP/status pairing. The default is one probe. With `--wait`, it
+applies one absolute deadline (45 seconds by default) across discovery, readiness probes, polling,
+and sleeps, but exits immediately on terminal failed. `--timeout <seconds>` requires `--wait` and
+accepts positive integer seconds from 1–300. CLI `--json` emits
+`{ready, status, pid, port}`, with status in `ready|pending|failed|unreachable`. Exit 0 means ready;
+exit 1 covers not-ready, pending, failed, timeout, and unreachable; exit 64 means invalid arguments.
+Older proxies without `/readyz` fail closed as unreachable. `/healthz` remains the separate
+liveness contract.
+
 ## Entry shape
 
 Routed entries keep Codex-required metadata such as reasoning levels, shell type, API support flags,
@@ -63,8 +83,12 @@ Pool mode routes across main plus added Codex credentials. Key rules:
 - **A namespace is a public selector mapped to an internal target.** Generated selectors are how a
   caller names an account — the main login's selector is `main` (collision-suffixed if taken),
   which maps to the config-only sentinel `@main`; the sentinel deliberately sits outside the
-  pool-account id grammar. Selectors must not collide with provider or combo ids
-  (`src/codex/account-namespaces.ts`, `src/codex/account-namespace-match.ts`).
+  pool-account id grammar. Selector initialization requires an explicit opt-in and fills only an
+  absent or empty map; a non-empty user map keeps its object identity and insertion order. Generated
+  selectors avoid provider, combo, routing-policy, and slash-qualified routing-profile namespaces.
+  Collision checks normalize provider and reserved namespace keys, while account and
+  routing-profile selector prefixes are exact-case (`src/codex/account-namespaces.ts`,
+  `src/codex/account-namespace-match.ts`, `src/routing/profile-namespace.ts`).
 - **Selector labels carry no account-role semantics.** When at least one selector is advertisable,
   the Codex catalog clones each supported native row per selector and hides the bare picker rows;
   bare ids remain routable and stay in raw `/v1/models` unless explicitly disabled. Missing stored

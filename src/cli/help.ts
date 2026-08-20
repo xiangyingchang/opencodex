@@ -119,7 +119,7 @@ const helpEntries: Record<string, HelpEntry> = {
     ],
   },
   account: {
-    usage: "ocx account <list|current|use|refresh|auto-switch|login|reauth|code|cancel|remove|add-key|reset-credits|main> ...",
+    usage: "ocx account <list|current|use|refresh|auto-switch|priority|login|reauth|code|cancel|remove|add-key|reset-credits|main> ...",
     summary: "List and switch provider accounts and API-key pools (GUI parity).",
     details: [
       "list [provider]     Codex account pool, OAuth accounts and API keys (identifiers shown masked as the API returns them).",
@@ -127,12 +127,14 @@ const helpEntries: Record<string, HelpEntry> = {
       "use <provider> <id> Switch the active credential; 'main' selects the Codex App login.",
       "refresh <provider>  Force-refresh Codex or provider quota reports.",
       "auto-switch <provider> <on|off|status|threshold N>  Control the Codex pool threshold.",
+      "priority <provider> <id|main> [first|earlier|normal|later|last|-100..100|reset]  Selection order; omit the value to read it.",
       "remove <provider> <id> --yes  Remove a stored account or key after an existence check.",
       "add-key <provider> [--label <label>]  Add a key read only from piped stdin.",
       "login/reauth/code/cancel  Run browser or manual-code auth from a headless shell.",
       "reset-credits <id|main> [--consume --yes]  Inspect or consume Codex reset credits.",
       "main <subcommand>     Manage the physical native Codex login separately from Pool routing.",
-      "Codex pool selection applies to the next request after clearing existing affinity; in-flight requests keep their captured account.",
+      "Switching the active account takes effect immediately; running threads move on their next request, and in-flight requests keep the account they captured.",
+      "A selection-order change applies from the next unbound request and never moves a bound thread.",
     ],
   },
   models: {
@@ -258,6 +260,19 @@ const helpEntries: Record<string, HelpEntry> = {
     summary: "Check proxy health. Exits 0 if healthy, 1 otherwise.",
     details: ["Use --json for structured output: {ok, pid, port}."],
   },
+  ready: {
+    usage: "ocx ready [--json] [--wait [--timeout <seconds>]]",
+    summary: "Check post-sync readiness. Exits 0 only when ready.",
+    details: [
+      "Exact unauthenticated GET /readyz returns HTTP 200 when ready, or 503 with Retry-After: 1 for pending or failed.",
+      "Its sanitized HTTP identity is {service, version, uptime, pid, port, status}; /healthz is separate liveness, not readiness.",
+      "Default is a single identity-checked /readyz probe; old proxies without /readyz fail closed as unreachable.",
+      "--wait polls until ready or timeout, but exits immediately on terminal failed (default 45s, max 300s).",
+      "--timeout requires --wait and accepts a positive integer (1..300).",
+      "--json emits {ready, status, pid, port}; status is one of ready|pending|failed|unreachable.",
+      "Invalid or unknown arguments exit 64. Not-ready, pending, failed, timeout, and unreachable exit 1.",
+    ],
+  },
 };
 
 function packageVersion(): string {
@@ -299,6 +314,7 @@ Usage:
   ocx restart                  Stop and restart the proxy
   ocx v2 <sub>                multi_agent_v2 surface (status|on|off|mode|threads)
   ocx health [--json]          Check proxy health (exit 0=healthy, 1=not)
+  ocx ready [--json] [--wait [--timeout <s>]]  Check post-sync readiness (exit 0 only when ready)
   ocx provider <sub>          Providers, connectivity, quota, and selected models
   ocx account <sub>           Accounts, login/reauth, key pools, and quota controls
   ocx models <sub>            Live/custom models, visibility, context, and shadow calls

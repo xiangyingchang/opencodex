@@ -22,6 +22,7 @@
  */
 import { loadConfig, mutatePersistedConfig } from "../config";
 import type { OcxClientIntegrationsConfig, OcxConfig, CodexRoutingMode } from "../types";
+import { runStartupReadinessSync, type ReadinessGate, type SyncOutcomeLike } from "../server/readiness";
 
 /** Clients whose durable intent this module owns. */
 export type DurableIntentClientId = keyof OcxClientIntegrationsConfig;
@@ -62,8 +63,11 @@ export function codexInjectionHostname(
 export interface CodexStartupSyncOutcome {
   catalogWritten: boolean;
   cacheSynced: boolean;
+  /** Readiness-observable fields carried by the raw startup sync. */
+  ok?: boolean;
+  warning?: string;
 }
-export type CodexStartupSync = (port: number) => Promise<CodexStartupSyncOutcome | undefined>;
+export type CodexStartupSync = (port: number) => Promise<SyncOutcomeLike | undefined>;
 
 export type CodexDesiredStateResult =
   | { readonly ok: true; readonly status: "committed" | "unchanged"; readonly enabled: boolean }
@@ -90,6 +94,11 @@ export function integrationEnabled(
 
 export function codexIntegrationEnabled(config: Pick<OcxConfig, "clientIntegrations">): boolean {
   return integrationEnabled(config, "codex");
+}
+
+/** Whether a Codex sync is permitted for this admitted config snapshot. */
+export function shouldSyncCodexOnStart(config: Pick<OcxConfig, "clientIntegrations">): boolean {
+  return codexIntegrationEnabled(config);
 }
 
 /**
@@ -164,6 +173,20 @@ export function setGrokIntegrationEnabled(enabled: boolean): CodexDesiredStateRe
   return setIntegrationEnabled("grok", enabled);
 }
 
+/** Whether Claude Desktop's managed gateway profile is wanted. */
+export function claudeDesktopIntegrationEnabled(config: Pick<OcxConfig, "clientIntegrations">): boolean {
+  return integrationEnabled(config, "claude-desktop");
+}
+
+/** The same question when no admitted config snapshot is in hand. */
+export function claudeDesktopIntegrationEnabledNow(): boolean {
+  return claudeDesktopIntegrationEnabled(loadConfig());
+}
+
+export function setClaudeDesktopIntegrationEnabled(enabled: boolean): CodexDesiredStateResult {
+  return setIntegrationEnabled("claude-desktop", enabled);
+}
+
 /**
  * The startup gate, as a function rather than an `if` buried in `handleStart`.
  *
@@ -185,15 +208,35 @@ export function setGrokIntegrationEnabled(enabled: boolean): CodexDesiredStateRe
  */
 export async function syncCodexOnStartIfEnabled(
   port: number,
-  config: Pick<OcxConfig, "clientIntegrations">,
+  config: Pick<OcxConfig, "clientIntegrations" | "codexRoutingMode">,
   sync: CodexStartupSync = defaultStartupSync,
+  readinessGate?: ReadinessGate,
 ): Promise<{ ran: boolean; catalogWritten: boolean; cacheSynced: boolean }> {
-  if (!codexIntegrationEnabled(config)) {
+  if (!shouldSyncCodexOnStart(config)) {
+    // The user explicitly turned Codex off: there is nothing to sync, so the
+    // proxy is ready as soon as it is up. The gate is driven here so /readyz
+    // does not stay pending forever for a deployment that deliberately disabled
+    // the native Codex integration.
+    readinessGate?.markReady();
     return { ran: false, catalogWritten: false, cacheSynced: false };
   }
   // The `.catch` is deliberate and stays: a failure to APPLY must not stop the
-  // proxy from coming up. A failed sync simply reports no writes.
-  const outcome = await sync(port).catch(() => undefined);
+  // proxy from coming up. A failed sync simply reports no writes. The readiness
+  // gate observes the real outcome so /readyz reflects the sync state exactly as
+  // the PR contract defines (ready only on ok=true with no warning).
+  const outcome = readinessGate
+    ? await runStartupReadinessSync(readinessGate, async () => {
+      const result = await sync(port);
+      if (!result) return null;
+      // Split mode has a separate bridge lifecycle. A catalog write is the
+      // useful startup proof for the main process even when bridge-owned
+      // configuration is not reported as a clean apply by the sync callback.
+      if (desiredCodexRoutingMode(config) === "split" && result.catalogWritten) {
+        return { ok: true, catalogWritten: result.catalogWritten, cacheSynced: result.cacheSynced };
+      }
+      return result;
+    })
+    : await sync(port).catch(() => undefined);
   return {
     ran: true,
     catalogWritten: outcome?.catalogWritten === true,
