@@ -386,6 +386,19 @@ function findFreshCredentialForGrant(
   return null;
 }
 
+async function notePlanFromRefreshedAccessToken(
+  id: string,
+  accessToken: string,
+  generation: number,
+): Promise<void> {
+  try {
+    const { noteCodexAccountAccessToken } = await import("./plan-from-token");
+    noteCodexAccountAccessToken(id, accessToken, generation);
+  } catch {
+    // Derived plan metadata must not fail credential refresh.
+  }
+}
+
 export async function getValidCodexToken(id: string): Promise<CodexTokenResult> {
   const record = readCodexAccountRecord(id);
   const cred = record?.deletedAt == null ? record?.credential : undefined;
@@ -415,10 +428,12 @@ export async function getValidCodexToken(id: string): Promise<CodexTokenResult> 
         if (!saveCodexAccountCredentialIfGeneration(id, current.generation, refreshed.credential)) {
           throw new CodexCredentialGenerationConflictError();
         }
+        const generation = current.generation + 1;
+        await notePlanFromRefreshedAccessToken(id, refreshed.credential.accessToken, generation);
         return {
           accessToken: refreshed.credential.accessToken,
           chatgptAccountId: refreshed.credential.chatgptAccountId,
-          generation: current.generation + 1,
+          generation,
         };
       }
       return getValidCodexToken(id);
@@ -491,11 +506,22 @@ export async function getValidCodexToken(id: string): Promise<CodexTokenResult> 
       throw new TokenRefreshError(reason, `Codex token refresh failed (${reason}); reauthenticate the account.`);
     }
     const data = (await res.json()) as { access_token: string; refresh_token?: string; expires_in: number };
+    // Guard against a missing/non-finite/negative expires_in (malformed upstream
+    // response): a NaN expiry would never compare as expired, and a negative
+    // duration would stamp an already-past expiry — both block refresh semantics.
+    const expiresIn =
+      typeof data.expires_in === "number" && Number.isFinite(data.expires_in) && data.expires_in >= 0
+        ? data.expires_in
+        : 3600;
+    // The computed timestamp itself must stay finite: Number.MAX_VALUE passes
+    // Number.isFinite but overflows to Infinity once multiplied by 1000.
+    const expiresAt = Date.now() + expiresIn * 1000;
+    const safeExpiresAt = Number.isFinite(expiresAt) ? expiresAt : Date.now() + 3600 * 1000;
 
     const updated: CodexAccountCredentials = {
       accessToken: data.access_token,
       refreshToken: data.refresh_token ?? lockedCred.refreshToken,
-      expiresAt: Date.now() + data.expires_in * 1000,
+      expiresAt: safeExpiresAt,
       chatgptAccountId: lockedCred.chatgptAccountId,
     };
     if (!saveCodexAccountCredentialIfGeneration(id, startGeneration, updated)) {
@@ -509,6 +535,7 @@ export async function getValidCodexToken(id: string): Promise<CodexTokenResult> 
   flight = { promise: refreshPromise, startedAt: Date.now(), abort };
   refreshLocks.set(refreshGrantFingerprint, flight);
   const result = await refreshPromise;
+  await notePlanFromRefreshedAccessToken(id, result.accessToken, result.generation);
   return {
     accessToken: result.accessToken,
     chatgptAccountId: result.chatgptAccountId,

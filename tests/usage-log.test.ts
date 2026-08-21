@@ -53,6 +53,41 @@ describe("usage log", () => {
     expect(normalized.attempts).toEqual([]);
   });
 
+  test("preserves only valid non-PII Codex account log labels", () => {
+    const normalized = normalizeUsageEntryForTest({
+      requestId: "ocx-account-label",
+      timestamp: 1,
+      provider: "openai-pabc123",
+      model: "gpt-test",
+      accountLogLabel: "pabc123",
+      status: 200,
+      durationMs: 1,
+      usageStatus: "reported",
+      attempts: [{
+        ordinal: 1,
+        provider: "openai-pabc123",
+        model: "gpt-test",
+        adapter: "openai-responses",
+        accountLogLabel: "pabc123",
+        status: 200,
+        durationMs: 1,
+        sendCount: 1,
+        recoveryKinds: [],
+        usageStatus: "reported",
+      }],
+    });
+    expect(normalized.accountLogLabel).toBe("pabc123");
+    expect(normalized.attempts?.[0]?.accountLogLabel).toBe("pabc123");
+
+    const rejected = normalizeUsageEntryForTest({
+      ...normalized,
+      accountLogLabel: "raw-account-id",
+      attempts: [{ ...normalized.attempts![0]!, accountLogLabel: "person@example.test" }],
+    });
+    expect(rejected.accountLogLabel).toBeUndefined();
+    expect(rejected.attempts?.[0]?.accountLogLabel).toBeUndefined();
+  });
+
   test("persists the rate-limit-429 recovery kind on attempts", () => {
     const entry: PersistedUsageEntry = {
       requestId: "ocx-ratelimit-kind",
@@ -76,6 +111,31 @@ describe("usage log", () => {
     };
     appendUsageEntry(entry);
     expect(readUsageEntries()[0]?.attempts?.[0]?.recoveryKinds).toEqual(["rate-limit-429"]);
+  });
+
+  test("persists the empty-completion recovery kind on attempts", () => {
+    const entry: PersistedUsageEntry = {
+      requestId: "ocx-empty-completion-kind",
+      timestamp: 1,
+      provider: "fixture",
+      model: "fixture/model",
+      status: 200,
+      durationMs: 4,
+      usageStatus: "reported",
+      attempts: [{
+        ordinal: 1,
+        provider: "fixture",
+        model: "fixture/model",
+        adapter: "openai-chat",
+        status: 200,
+        durationMs: 4,
+        sendCount: 2,
+        recoveryKinds: ["empty-completion", "empty-completion"],
+        usageStatus: "reported",
+      }],
+    };
+    appendUsageEntry(entry);
+    expect(readUsageEntries()[0]?.attempts?.[0]?.recoveryKinds).toEqual(["empty-completion"]);
   });
 
   /** Build one minimal persisted-usage JSONL line for the given request id. */
@@ -783,4 +843,18 @@ describe("usage log", () => {
     expect(readRecentUsageEntries(0)).toEqual([]);
     expect(readRecentUsageEntries(-1)).toEqual([]);
   });
+
+  test("readRecentUsageEntries does not expand beyond its bounded tail window", () => {
+    const path = usageLogPath();
+    const fd = openSync(path, "w");
+    try {
+      const older = Buffer.from(`${persistedLine("outside-tail")}\n`);
+      writeSync(fd, older, 0, older.byteLength, 0);
+      truncateSync(fd, 64 * 1024 * 1024 + older.byteLength + 1);
+    } finally {
+      closeSync(fd);
+    }
+
+    expect(readRecentUsageEntries(1)).toEqual([]);
+  }, STORE_BUDGET_MS);
 });

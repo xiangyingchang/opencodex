@@ -19,6 +19,7 @@ import {
   getLoginStatus,
   isPublicOAuthProvider,
   listOAuthProviders,
+  publicOAuthAuthenticationErrorMessage,
   startLoginFlow,
   submitManualLoginCode,
 } from "../../oauth";
@@ -29,7 +30,7 @@ import { enrichProviderFromCatalog, listKeyLoginProviders } from "../../oauth/ke
 import { deriveProviderPresets } from "../../providers/derive";
 import { providerCodexAccountMode } from "../../providers/registry";
 import { routedSlug, slugEquals } from "../../providers/slug-codec";
-import { clearProviderQuotaCache, fetchProviderAccountQuotas, fetchProviderQuotaReports, supportsPerAccountQuota } from "../../providers/quota";
+import { clearAccountQuotaCache, clearProviderQuotaCache, fetchProviderAccountQuotas, fetchProviderQuotaReports, supportsPerAccountQuota } from "../../providers/quota";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import { clearThreadAccountMap } from "../../codex/routing";
 import {
@@ -69,6 +70,13 @@ import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, C
 import type { ManagementContext } from "./context";
 import { readManagementJsonBody, readManagementJsonBodyOr, rethrowManagementBodyTooLarge } from "./body";
 import { codexAccountNamespaceProviderCollisionError } from "../../codex/account-namespace-match";
+import { ACCOUNT_IMPORT_DEADLINE_MS, ACCOUNT_IMPORT_MAX_REQUEST_BYTES } from "../../oauth/account-import";
+import { readBoundedJsonRequestBody } from "../request-decompress";
+
+// ACCOUNT_IMPORT_DEADLINE_MS is the shared CLI/server import window. Individual
+// provider requests keep their own shorter timeouts; this is only the server-side
+// backstop for the admitted batch. A disconnected request aborts immediately
+// through req.signal below.
 
 /**
  * Parses a bounded JSON object body, or null. Malformed JSON is swallowed; an
@@ -168,7 +176,13 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
       return jsonResponse({ url: authUrl, instructions, deviceCode });
     } catch (err) {
       if (err instanceof OAuthMutationBusyError) throw err;
-      return jsonResponse({ error: err instanceof Error ? err.message : String(err) }, 409);
+      const message = err instanceof Error ? err.message : String(err);
+      const duplicateLoginMessage = `A login for ${provider} is already in progress`;
+      return jsonResponse({
+        error: message === duplicateLoginMessage
+          ? duplicateLoginMessage
+          : publicOAuthAuthenticationErrorMessage(err),
+      }, 409);
     }
   }
 
@@ -201,7 +215,8 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
   if (url.pathname === "/api/oauth/status" && req.method === "GET") {
     const provider = (url.searchParams.get("provider") ?? "").trim().toLowerCase();
     if (!isPublicOAuthProvider(provider)) return jsonResponse({ error: "unknown oauth provider" }, 400);
-    return jsonResponse(getLoginStatus(provider));
+    const status = getLoginStatus(provider);
+    return jsonResponse(status);
   }
 
   if (url.pathname === "/api/oauth/logout" && req.method === "POST") {
@@ -210,6 +225,10 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     await removeCredential(provider);
     reconcileLiveStateStores();
     clearLoginState(provider);
+    const { clearModelCache } = await import("../../codex/model-cache");
+    const { clearGatherRoutedModelsInflight } = await import("../../codex/catalog");
+    clearModelCache(provider);
+    clearGatherRoutedModelsInflight();
     // Drop cached/last-good quota rows tied to the removed credential.
     const { clearProviderQuotaCache, clearAccountQuotaCache } = await import("../../providers/quota");
     clearProviderQuotaCache();
@@ -281,6 +300,10 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
       const { resetAnthropicRoutingForManualSelection } = await import("../../oauth/anthropic-routing");
       resetAnthropicRoutingForManualSelection(body.accountId);
     }
+    const { clearModelCache } = await import("../../codex/model-cache");
+    const { clearGatherRoutedModelsInflight } = await import("../../codex/catalog");
+    clearModelCache(provider);
+    clearGatherRoutedModelsInflight();
     const { clearProviderQuotaCache } = await import("../../providers/quota");
     clearProviderQuotaCache();
     return jsonResponse({ ok: true, provider, activeAccountId: body.accountId });
@@ -376,6 +399,55 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
     return jsonResponse({ ok: true, cleared });
   }
 
+  if (url.pathname === "/api/oauth/accounts/import" && req.method === "POST") {
+    const controller = new AbortController();
+    const abortRequest = () => controller.abort();
+    if (req.signal.aborted) abortRequest();
+    else req.signal.addEventListener("abort", abortRequest, { once: true });
+    const deadline = setTimeout(abortRequest, ACCOUNT_IMPORT_DEADLINE_MS);
+    try {
+      let rawBody: unknown;
+      try {
+        rawBody = await readBoundedJsonRequestBody(
+          req,
+          ACCOUNT_IMPORT_MAX_REQUEST_BYTES,
+          undefined,
+          { signal: controller.signal },
+        );
+      } catch {
+        if (controller.signal.aborted) return jsonResponse({ code: "import_cancelled" }, 408);
+        return jsonResponse({ code: "invalid_document" }, 400);
+      }
+      if (!isPlainRecord(rawBody)) return jsonResponse({ code: "invalid_document" }, 400);
+      const provider = typeof rawBody.provider === "string" ? rawBody.provider : "";
+      const format = typeof rawBody.format === "string" ? rawBody.format : "";
+      const { importAccounts } = await import("../../oauth/account-import");
+      const imported = await importAccounts({
+        provider,
+        format,
+        document: rawBody.document,
+        signal: controller.signal,
+      });
+      const changed = imported.ok
+        ? imported.result.importedCount > 0 || imported.result.updatedCount > 0
+        : imported.changed === true;
+      if (changed) {
+        reconcileLiveStateStores();
+        const { clearModelCache } = await import("../../codex/model-cache");
+        const { clearGatherRoutedModelsInflight } = await import("../../codex/catalog");
+        clearModelCache(provider);
+        clearGatherRoutedModelsInflight();
+        clearProviderQuotaCache();
+        clearAccountQuotaCache(provider);
+      }
+      if (!imported.ok) return jsonResponse({ code: imported.code }, imported.status);
+      return jsonResponse(imported.result);
+    } finally {
+      clearTimeout(deadline);
+      req.signal.removeEventListener("abort", abortRequest);
+    }
+  }
+
   if (url.pathname === "/api/oauth/accounts/alias" && req.method === "PUT") {
     const body = await readManagementJsonBodyOr(req, {}) as { provider?: unknown; accountId?: unknown; alias?: unknown };
     const provider = typeof body.provider === "string" ? body.provider.trim().toLowerCase() : "";
@@ -404,6 +476,10 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
       clearAnthropicSessionAffinityForAccount(id);
     }
     if (!getAccountSet(provider)) clearLoginState(provider);
+    const { clearModelCache } = await import("../../codex/model-cache");
+    const { clearGatherRoutedModelsInflight } = await import("../../codex/catalog");
+    clearModelCache(provider);
+    clearGatherRoutedModelsInflight();
     const { clearProviderQuotaCache, clearAccountQuotaCache } = await import("../../providers/quota");
     clearProviderQuotaCache();
     clearAccountQuotaCache(provider);

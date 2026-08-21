@@ -6,6 +6,7 @@ import { CodexPauseToggleLabel, CodexTicketBadge } from "./codex-account-pool-he
 import type { CodexAccountEntry } from "./codex-account-pool-types";
 import type { CodexAccountModeState } from "../codex-multi-state";
 import type { TFn } from "../i18n/shared";
+import type { NoticeTone } from "../ui";
 import {
   doctorCopyButtonLabel,
   formatOAuthHealthLabel,
@@ -133,29 +134,29 @@ export function CodexAccountPoolMainCard({
         )}
         <span className="card-right"><IconLock width={14} /> {t("codexAuth.appLogin")}</span>
       </div>
-      <div className="card-sub">{main?.email || t("codexAuth.appLogin")}{main?.plan ? ` · ${main.plan}` : ""}</div>
+      <div className="codex-account-identity">
+        <div className="codex-account-identity-copy">{main?.email || t("codexAuth.appLogin")}{main?.plan ? ` · ${main.plan}` : ""}</div>
+        {main && (
+          <AccountPriorityControl
+            value={mainSwitchEntry.priority}
+            // Derived from the synthesized id rather than hardcoded as "-main": a pool account
+            // may legitimately be named `main` (the id pattern allows it), and that account's
+            // control would then claim the same DOM id, pointing this label at its dropdown.
+            selectId={`codex-account-priority-${mainSwitchEntry.id}`}
+            // Any in-flight order write, not just this card's: order writes share one mutation
+            // ref, so a pick made during another card's write returns "busy" and is dropped
+            // silently. Mirrors pauseBusy. A pending switch counts too — it writes the same
+            // pin this clears, so the controller refuses to overlap them, just as silently.
+            disabled={priorityUpdatingId !== null || switchingId !== null}
+            onChange={(priority) => onPriorityChange(mainSwitchEntry, priority)}
+          />
+        )}
+      </div>
       {healthSummary && (
         <div className="card-sub faint">{healthSummary}</div>
       )}
       {inCooldown && (
         <div className="card-sub faint">{t("pws.healthCooldownHint")}</div>
-      )}
-      {pinnedId === "__main__" && !main?.paused && <div className="card-sub faint">{t("codexAuth.pinnedHint")}</div>}
-      {/* Same rule as the pause button: without an app login there is no row to re-order. */}
-      {main && (
-        <AccountPriorityControl
-          value={mainSwitchEntry.priority}
-          // Derived from the synthesized id rather than hardcoded as "-main": a pool account
-          // may legitimately be named `main` (the id pattern allows it), and that account's
-          // control would then claim the same DOM id, pointing this label at its dropdown.
-          selectId={`codex-account-priority-${mainSwitchEntry.id}`}
-          // Any in-flight order write, not just this card's: order writes share one mutation
-          // ref, so a pick made during another card's write returns "busy" and is dropped
-          // silently. Mirrors pauseBusy. A pending switch counts too — it writes the same
-          // pin this clears, so the controller refuses to overlap them, just as silently.
-          disabled={priorityUpdatingId !== null || switchingId !== null}
-          onChange={(priority) => onPriorityChange(mainSwitchEntry, priority)}
-        />
       )}
       {showReauth
         ? <div className="card-sub faint">{t("codexAuth.mainTokenExpired")}</div>
@@ -189,7 +190,7 @@ export function CodexAccountPoolPageHead({
   pausingExhausted: boolean;
   pauseBusy?: boolean;
   actionFeedback?: string | null;
-  actionFeedbackTone?: "ok" | "err" | null;
+  actionFeedbackTone?: NoticeTone | null;
   onRefresh: () => void;
   onPauseExhausted: () => void;
 }) {
@@ -201,7 +202,7 @@ export function CodexAccountPoolPageHead({
       {!embedded && <h2 className="page-title">{t("nav.codexAuth")}</h2>}
       <div className={embedded ? "row" : "codex-auth-page-head__actions"}>
         <span
-          className={`codex-auth-page-head__feedback${actionFeedbackTone === "ok" ? " is-ok" : ""}${actionFeedbackTone === "err" ? " is-err" : ""}`}
+          className={`codex-auth-page-head__feedback${actionFeedbackTone === "ok" ? " is-ok" : ""}${actionFeedbackTone === "warn" ? " is-warn" : ""}${actionFeedbackTone === "err" ? " is-err" : ""}`}
           role="status"
           aria-live="polite"
         >

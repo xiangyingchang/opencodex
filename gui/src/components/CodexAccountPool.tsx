@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useT } from "../i18n/shared";
 import { IconPlus } from "../icons";
-import { EmptyState } from "../ui";
+import { EmptyState, type NoticeTone } from "../ui";
 import AddCodexAccountModal from "./AddCodexAccountModal";
 import { useCodexAccountPool, type CodexAccountPoolController } from "../hooks/useCodexAccountPool";
 import type { ReactNode } from "react";
 import type { CodexAccountModeState } from "../codex-multi-state";
 import CodexAutoSwitchSetting from "./CodexAutoSwitchSetting";
 import CodexPoolStrategySetting from "./CodexPoolStrategySetting";
+import CodexAuthAdvancedSettings from "./CodexAuthAdvancedSettings";
 import { useCodexAutoSwitch } from "../hooks/useCodexAutoSwitch";
 import { readJsonIfOk } from "../fetch-json";
 import { CodexAccountPoolCards, CodexAccountPoolReauthBanner } from "./codex-account-pool-cards";
@@ -19,6 +20,7 @@ import type { CodexAccountEntry } from "./codex-account-pool-types";
 import { accountNeedsReauth } from "../oauth-health-display";
 import { useCopyFeedback } from "./use-copy-feedback";
 import { DEFAULT_ACCOUNT_POOL_STRATEGY } from "../account-pool-strategy";
+import type { CodexAccountMutationCompletion } from "../codex-account-mutation";
 
 // Single definition lives with the controller that owns this data (WP3).
 export type { CodexAccountEntry } from "../hooks/useCodexAccountPool";
@@ -32,12 +34,14 @@ const DOCTOR_CMD = "ocx doctor";
  * (the Codex Auth page passes its mode banner); `embedded` (WP090) omits page
  * title chrome while retaining the shared account actions in the Providers workspace.
  */
-export default function CodexAccountPool({ apiBase, accountModeState = null, banner = null, embedded = false, onActiveNeedsReauthChange, controller: injectedController }: {
+export default function CodexAccountPool({ apiBase, accountModeState = null, banner = null, embedded = false, onActiveNeedsReauthChange, controller: injectedController, advancedExtras = null }: {
   apiBase: string;
   accountModeState?: CodexAccountModeState | null;
   banner?: ReactNode;
   embedded?: boolean;
   onActiveNeedsReauthChange?: (needs: boolean) => void;
+  /** Whole boxes rendered inside Advanced settings. Never fold these internally. */
+  advancedExtras?: ReactNode;
   /**
    * WP3: when Providers owns the controller, every surface shares one instance so a
    * mutation on Overview is immediately visible on the Accounts tab. The standalone
@@ -62,9 +66,10 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
   const { accounts, activeId, loadState, switchingId, pauseUpdatingId, priorityUpdatingId, pausingExhausted, activePinnedId, load } = controller;
   const [confirm, setConfirm] = useState<CodexAccountEntry | null>(null);
   const [showAdd, setShowAdd] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [reauthId, setReauthId] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
-  const [actionFeedbackTone, setActionFeedbackTone] = useState<"ok" | "err" | null>(null);
+  const [actionFeedbackTone, setActionFeedbackTone] = useState<NoticeTone | null>(null);
   const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [refreshingQuota, setRefreshingQuota] = useState(false);
   const [resetPopup, setResetPopup] = useState<CodexAccountEntry | null>(null);
@@ -74,10 +79,10 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
   const [creditDetailsLoading, setCreditDetailsLoading] = useState(false);
   const doctorCopy = useCopyFeedback<string>();
 
-  const showActionFeedback = useCallback((text: string, error = false) => {
+  const showActionFeedback = useCallback((text: string, tone: NoticeTone = "ok") => {
     if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
     setActionFeedback(text);
-    setActionFeedbackTone(error ? "err" : "ok");
+    setActionFeedbackTone(tone);
     feedbackTimerRef.current = setTimeout(() => {
       setActionFeedback(null);
       setActionFeedbackTone(null);
@@ -139,9 +144,14 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
     setReauthId(null);
   }, []);
 
-  const handleAccountAdded = useCallback(() => {
+  const handleAccountAdded = useCallback((completion: CodexAccountMutationCompletion) => {
     void controller.syncAfterAccountAdded();
-    showActionFeedback(t("codexAuth.accountAdded"));
+    showActionFeedback(
+      t(completion.catalogRefreshPending
+        ? "codexAuth.catalogRefreshPending"
+        : "codexAuth.accountAdded"),
+      completion.catalogRefreshPending ? "warn" : "ok",
+    );
     closeAddModal();
   }, [closeAddModal, controller, showActionFeedback, t]);
 
@@ -149,7 +159,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
     const result = await controller.switchAccount(id);
     if (!result.ok) {
       if (result.reason === "busy") return;
-      showActionFeedback(t("codexAuth.switchFailed"), true);
+      showActionFeedback(t("codexAuth.switchFailed"), "err");
       return;
     }
     setConfirm(null);
@@ -166,7 +176,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
     const entered = window.prompt(t("prov.aliasPrompt"), account.alias ?? "");
     if (entered === null) return;
     const result = await controller.saveAlias(account.id, entered);
-    showActionFeedback(t(result.ok ? "prov.aliasSaved" : "prov.aliasSaveFailed"), !result.ok);
+    showActionFeedback(t(result.ok ? "prov.aliasSaved" : "prov.aliasSaveFailed"), result.ok ? "ok" : "err");
   };
 
   const togglePaused = async (account: CodexAccountEntry) => {
@@ -178,7 +188,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
       ? paused ? "codexAuth.pauseSucceeded" : "codexAuth.resumeSucceeded"
       : paused ? "codexAuth.pauseFailed" : "codexAuth.resumeFailed", {
       email: account.alias ?? account.email,
-    }), !result.ok);
+    }), result.ok ? "ok" : "err");
   };
 
   const changePriority = async (account: CodexAccountEntry, priority: number) => {
@@ -194,7 +204,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
     if (!result.ok && result.reason === "busy") return;
     showActionFeedback(t(result.ok ? "accountPool.priorityUpdated" : "accountPool.priorityUpdateFailed", {
       email: account.alias ?? account.email,
-    }), !result.ok);
+    }), result.ok ? "ok" : "err");
   };
 
   const remove = async (id: string) => {
@@ -202,7 +212,9 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
     if (!window.confirm(t("codexAuth.removeConfirm", { id: label }))) return;
     const result = await controller.removeAccount(id);
     if (!result.ok) {
-      showActionFeedback(t("codexAuth.removeFailed"), true);
+      showActionFeedback(t("codexAuth.removeFailed"), "err");
+    } else if (result.catalogRefreshPending) {
+      showActionFeedback(t("codexAuth.catalogRefreshPending"), "warn");
     }
   };
 
@@ -210,7 +222,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
     setRefreshingQuota(true);
     try {
       const ok = await load(true);
-      showActionFeedback(t(ok ? "codexAuth.quotaRefreshed" : "codexAuth.quotaRefreshFailed"), !ok);
+      showActionFeedback(t(ok ? "codexAuth.quotaRefreshed" : "codexAuth.quotaRefreshFailed"), ok ? "ok" : "err");
     } finally {
       setRefreshingQuota(false);
     }
@@ -223,7 +235,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
       ? result.pausedCount > 0
         ? t("codexAuth.pauseExhaustedSucceeded", { count: String(result.pausedCount) })
         : t("codexAuth.pauseExhaustedNone")
-      : t("codexAuth.pauseExhaustedFailed"), !result.ok);
+      : t("codexAuth.pauseExhaustedFailed"), result.ok ? "ok" : "err");
   };
 
   const openResetPopup = async (account: CodexAccountEntry) => {
@@ -253,7 +265,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
         setResetConfirm(false);
       }
       if (result.toast) {
-        showActionFeedback(result.toast, !result.ok);
+        showActionFeedback(result.toast, result.ok ? "ok" : "err");
       }
     } finally {
       setRedeeming(false);
@@ -355,33 +367,40 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
         </>
       )}
 
-      {poolStrategy !== null && (
-        <CodexAutoSwitchSetting
-          threshold={autoSwitch.threshold}
-          draft={autoSwitch.draft}
-          strategy={poolStrategy}
-          hydrated={autoSwitch.hydrated}
-          saving={autoSwitch.saving}
-          loadError={autoSwitch.loadError}
-          feedback={autoSwitch.feedback}
-          onDraftChange={autoSwitch.setDraft}
-          onEditingChange={autoSwitch.setEditing}
-          onCommit={autoSwitch.commit}
-          onCancel={autoSwitch.cancel}
-          onToggle={autoSwitch.toggle}
-          onRetry={() => {
-            autoSwitch.retry();
-            void load();
-          }}
-        />
-      )}
-
       <CodexPoolStrategySetting
         apiBase={apiBase}
         subscribeLoadObserver={controller.subscribeLoadObserver}
         readLastActive={controller.readLastActive}
         onStrategyResolved={setPoolStrategy}
       />
+
+      <CodexAuthAdvancedSettings
+        t={t}
+        open={advancedOpen}
+        onToggle={() => setAdvancedOpen(open => !open)}
+      >
+        {poolStrategy !== null && (
+          <CodexAutoSwitchSetting
+            threshold={autoSwitch.threshold}
+            draft={autoSwitch.draft}
+            strategy={poolStrategy}
+            hydrated={autoSwitch.hydrated}
+            saving={autoSwitch.saving}
+            loadError={autoSwitch.loadError}
+            feedback={autoSwitch.feedback}
+            onDraftChange={autoSwitch.setDraft}
+            onEditingChange={autoSwitch.setEditing}
+            onCommit={autoSwitch.commit}
+            onCancel={autoSwitch.cancel}
+            onToggle={autoSwitch.toggle}
+            onRetry={() => {
+              autoSwitch.retry();
+              void load();
+            }}
+          />
+        )}
+        {advancedExtras}
+      </CodexAuthAdvancedSettings>
 
       {confirm && (
         <CodexAccountSwitchModal

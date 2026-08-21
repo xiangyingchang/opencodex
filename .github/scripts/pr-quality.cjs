@@ -33,11 +33,12 @@ const REVIEW_READINESS_ITEMS = [
 
 /**
  * Which checklist box each bot-verifiable claim maps to. The order must stay
- * in sync with REVIEW_READINESS_ITEMS: index 0 is the CI claim, index 1 is
- * the latest-dev claim, and index 2 is the Codex/CodeRabbit findings claim.
+ * in sync with REVIEW_READINESS_ITEMS: index 1 is the latest-dev claim and
+ * index 2 is the Codex/CodeRabbit findings claim. Index 0 (local CI) is an
+ * author attestation only — fork contributors cannot start repository CI — so
+ * the gate never disproves it; head-drift still resets every box.
  */
 const REVIEW_READINESS_CLAIM_INDEX = {
-  ci_green: 0,
   latest_dev: 1,
   review_findings: 2
 };
@@ -57,8 +58,8 @@ const PR_TEMPLATE_BOILERPLATE_LINES = new Set([
 
 /** Case-insensitive whole-word match for the GUI surface (repo convention: `gui/`). */
 const GUI_CUE_RE = /\bgui\b/i;
-/** HTML comments, which GitHub never renders. */
-const HTML_COMMENT_RE = /<!--[\s\S]*?-->/g;
+/** HTML comments, which GitHub never renders. An unclosed comment runs through EOF. */
+const HTML_COMMENT_RE = /<!--[\s\S]*?(?:-->|$)/g;
 /** Fenced code blocks (``` or ~~~) whose content GitHub does not render. */
 const FENCED_CODE_RE = /(?:^|\n)[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[ \t]*(?=\n|$)/gm;
 /** Embedded markdown image (`![alt](url)`), as GitHub renders for dropped images. */
@@ -146,7 +147,7 @@ function assessPrDescription(body) {
   const withoutTemplate = stripPrTemplateBoilerplate(withoutReadiness);
   const cleaned = clean(withoutTemplate);
   if (!cleaned) {
-    const strippedComments = withoutTemplate.replace(/<!--[\s\S]*?-->/g, "").trim();
+    const strippedComments = withoutTemplate.replace(HTML_COMMENT_RE, "").trim();
     if (!strippedComments) return { ok: false, reason: "empty" };
     if (isPlaceholderOnlyValue(strippedComments)) {
       return { ok: false, reason: "placeholder" };
@@ -169,15 +170,45 @@ function assessPrDescription(body) {
 }
 
 /**
+ * True when any changed path is the gui directory or inside it (slash-guarded).
+ * Mirrors `guiPathsChanged` in `scripts/doctor-gui-if-changed.ts`.
+ */
+function guiPathsChanged(files) {
+  return files.some(
+    (file) => file === "gui" || file.startsWith("gui/")
+  );
+}
+
+/**
+ * True when the changed-file list from `pulls.listFiles` cannot be trusted to
+ * be complete for screenshot gating. Missing or non-integer counts, a head
+ * mismatch between the count snapshot and the paginated list, or a count above
+ * the returned list length all fail closed.
+ */
+function isChangedFileListTruncated(changedFilesCount, listedLength, headMatches = true) {
+  if (!headMatches) return true;
+  if (!Number.isInteger(changedFilesCount) || changedFilesCount < 0) return true;
+  return changedFilesCount > listedLength;
+}
+
+/**
  * True when the PR title or description names the GUI surface as a whole word.
  * The description is template-stripped first so the template's own screenshot
- * instruction cannot arm the gate on its own.
+ * instruction cannot arm the gate on its own. Negated phrases such as "no gui
+ * changes" are not treated as cues (see `segmentHasAffirmativeGuiCue`).
  */
+function segmentHasAffirmativeGuiCue(text) {
+  if (typeof text !== "string" || !text.trim()) return false;
+  const segments = text.split(/(?<=[.!?\n])/);
+  return segments.some((segment) => {
+    if (!GUI_CUE_RE.test(segment)) return false;
+    const withoutNegated = segment.replace(GUI_OVERRIDE_RE, "");
+    return GUI_CUE_RE.test(withoutNegated);
+  });
+}
+
 function hasGuiCue(title, body) {
-  return (
-    (typeof title === "string" && GUI_CUE_RE.test(title)) ||
-    (typeof body === "string" && GUI_CUE_RE.test(body))
-  );
+  return segmentHasAffirmativeGuiCue(title) || segmentHasAffirmativeGuiCue(body);
 }
 
 /**
@@ -214,7 +245,13 @@ function hasGuiOverride({ comments = [] }) {
  * fenced code blocks. Image syntax there is literal text, not evidence.
  */
 function stripNonRenderedRegions(body) {
-  return body.replace(HTML_COMMENT_RE, "").replace(FENCED_CODE_RE, "");
+  // Fenced code MUST be removed first. GFM treats fence contents as literal
+  // text, so a `<!--` inside a fence never opens an HTML comment. Stripping
+  // comments first let an unclosed comment-like literal in a code sample run
+  // through EOF and swallow the real body after it, which rejected valid
+  // descriptions: a GUI PR whose screenshot followed such an example lost its
+  // evidence, and an issue lost the sections it was validated on.
+  return body.replace(FENCED_CODE_RE, "").replace(HTML_COMMENT_RE, "");
 }
 
 /**
@@ -447,7 +484,14 @@ function collectPrQualityFailures({
   /** True when baseRef is another open PR's head (stacked child). */
   stackedBase = false,
   /** Issue comments; a maintainer comment waives the GUI-screenshot gate. */
-  guiOverrideComments = []
+  guiOverrideComments = [],
+  /** Changed file paths from `pulls.listFiles` (repo-relative). */
+  changedFilePaths = [],
+  /**
+   * True when `pulls.listFiles` returned fewer paths than `pulls.get`
+   * `changed_files` (GitHub caps the file list at 3,000 entries).
+   */
+  filesTruncated = false
 }) {
   const failures = [];
   const wrongBase = !allowedBases.includes(baseRef) && !stackedBase;
@@ -475,14 +519,12 @@ function collectPrQualityFailures({
     failures.push({ code: "bad_description", reason: desc.reason });
   }
 
-  // GUI-cued PRs must prove the UI change visually. The template's own
-  // screenshot instruction is boilerplate, so it cannot trigger this gate. A
-  // maintainer comment saying the change does not touch the GUI waives it.
+  // PRs that change gui/ must prove the UI change visually. Text cues in the
+  // title or description are not enough — "no gui changes" in the body must
+  // not arm the gate when the diff is backend-only. A maintainer comment saying
+  // the change does not touch the GUI still waives a gui/ diff false positive.
   if (
-    hasGuiCue(
-      title,
-      typeof body === "string" ? stripPrTemplateBoilerplate(body) : "",
-    ) &&
+    (guiPathsChanged(changedFilePaths) || filesTruncated) &&
     !hasScreenshotEvidence(body) &&
     !hasGuiOverride({ comments: guiOverrideComments })
   ) {
@@ -500,6 +542,8 @@ module.exports = {
   isWrongAncestry,
   authorHasPushPermission,
   assessPrDescription,
+  guiPathsChanged,
+  isChangedFileListTruncated,
   hasGuiCue,
   hasGuiOverride,
   hasScreenshotEvidence,

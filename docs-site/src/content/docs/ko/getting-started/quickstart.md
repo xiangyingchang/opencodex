@@ -13,7 +13,7 @@ ocx init
 
 `ocx init`은 다음 과정을 안내합니다:
 
-1. **프로바이더 선택** — 내장 레지스트리 프리셋 76개 중 하나를 고르거나 `custom`을 선택해 base URL과 adapter를 직접 입력합니다.
+1. **프로바이더 선택** — 내장 레지스트리 프리셋 79개 중 하나를 고르거나 `custom`을 선택해 base URL과 adapter를 직접 입력합니다.
 2. **API 키** — 키를 붙여넣거나 `${ANTHROPIC_API_KEY}` 같은 환경 변수를 참조합니다.
 3. **기본 모델** — 키, 로컬, custom 프로바이더에서는 프리셋을 그대로 쓰거나 모델 ID를 직접 입력합니다.
 4. **프록시 포트** — 기본값은 `10100`입니다.
@@ -23,7 +23,7 @@ ocx init
 결과는 `$OPENCODEX_HOME/config.json`(기본값 `~/.opencodex/config.json`)에 저장됩니다.
 
 :::note[GPT-5.6 적용 항목]
-현재 안정 버전은 ChatGPT 패스스루, OpenAI API 키, OpenRouter, 실험 단계의 Cursor adapter에 GPT-5.6 Sol/Terra/Luna를 기본으로 넣습니다. 이 항목들은 해당 업스트림 계정에 접근 권한이 있을 때만 동작합니다. OpenAI API 키와 OpenRouter 프리셋은 사용 가능한 컨텍스트 창을 372,000토큰으로 제공합니다. Cursor는 자체 adapter 메타데이터를 유지합니다.
+현재 안정 버전은 ChatGPT 패스스루, OpenAI API 키, OpenRouter, 실험 단계의 Cursor adapter에 GPT-5.6 Sol/Terra/Luna를 기본으로 넣습니다. 이 항목들은 해당 업스트림 계정에 접근 권한이 있을 때만 동작합니다. OpenAI API 키와 OpenRouter 프리셋은 사용 가능한 컨텍스트 창을 922,000토큰으로 제공합니다. Cursor는 자체 adapter 메타데이터를 유지합니다.
 :::
 
 ## 2. 프록시 시작

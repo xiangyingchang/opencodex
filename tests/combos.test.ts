@@ -10,10 +10,13 @@ import {
   comboConfigError,
   comboConfigIssues,
   comboDefaultEffort,
+  comboDisabledModelId,
+  comboDisabledModelSelectors,
   comboFailureDecision,
   comboIdFromRawBody,
   comboModelId,
   comboPublicModelId,
+  comboRequestHasImageInput,
   concreteComboRequestBody,
   coolComboTarget,
   getCombo,
@@ -170,6 +173,18 @@ describe("combo namespace primitives", () => {
     expect(targetKey({ provider: "a", model: "m1" })).toBe("a/m1");
   });
 
+  test("keeps native-alias discovery disables separate from the bare native key", () => {
+    const nativeAlias = {
+      alias: "gpt-5.6-sol",
+      nativeAlias: true,
+      displayName: "Nova1 - Sol",
+    };
+    expect(comboDisabledModelId("nova-sol", nativeAlias)).toBe("combo/nova-sol");
+    expect(comboDisabledModelSelectors("nova-sol", nativeAlias)).toEqual(["combo/nova-sol"]);
+    expect(comboDisabledModelSelectors("regular", { alias: "daily-fast" }))
+      .toEqual(["combo/regular", "daily-fast"]);
+  });
+
   test("resolves canonical ids before exact aliases and ignores unknown bare ids", () => {
     const config = baseConfig({
       combos: {
@@ -198,6 +213,48 @@ describe("combo request cloning", () => {
     expect(comboIdFromRawBody({ model: "a/m1" }, config)).toBeNull();
     expect(comboIdFromRawBody({ model: 1 }, config)).toBeNull();
     expect(comboIdFromRawBody(null, config)).toBeNull();
+  });
+
+  test("comboRequestHasImageInput scans Responses input only, not tools or metadata", () => {
+    expect(comboRequestHasImageInput({
+      model: "combo/free",
+      input: [{ role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,aGVsbG8=" }] }],
+    })).toBe(true);
+    expect(comboRequestHasImageInput({
+      model: "combo/free",
+      input: [{ type: "input_image", image_url: "https://example.test/i.png" }],
+    })).toBe(true);
+    expect(comboRequestHasImageInput({
+      model: "combo/free",
+      input: [{
+        type: "function_call_output",
+        call_id: "call_1",
+        output: [{ type: "input_image", image_url: "https://example.test/tool.png" }],
+      }],
+    })).toBe(true);
+    // Tool schemas / metadata may legally mention the same type string without
+    // carrying image content for the model.
+    expect(comboRequestHasImageInput({
+      model: "combo/free",
+      input: [{ role: "user", content: "text only" }],
+      tools: [{
+        type: "function",
+        name: "describe",
+        parameters: {
+          type: "object",
+          properties: {
+            kind: { type: "string", enum: ["input_image", "input_text"] },
+            example: { type: "input_image" },
+          },
+        },
+      }],
+      metadata: { note: { type: "input_image" } },
+    })).toBe(false);
+    expect(comboRequestHasImageInput({
+      model: "combo/free",
+      input: "plain text",
+      tools: [{ type: "function", function: { name: "x", parameters: { type: "input_image" } } }],
+    })).toBe(false);
   });
 
   test("clones the untouched body and injects an omitted combo default", () => {
@@ -300,6 +357,19 @@ describe("combo failure policy and advancement", () => {
     expect(comboFailureDecision(409, "conflict")).toBe("stop");
     expect(comboFailureDecision(499, "client cancelled")).toBe("stop");
     expect(comboFailureDecision(422, "invalid_api_key")).toBe("hop");
+    // #1524: a LOCAL input-admission refusal means "this candidate cannot fit the request",
+    // not "the request is impossible". The next candidate may have a larger context window,
+    // so the chain must continue instead of ending at the first incompatible target.
+    //
+    // The decision keys on the STRUCTURED code, which the proxy now preserves through
+    // classifyError. Matching raw text instead would let any upstream override a terminal
+    // verdict by echoing the token, so that shape must NOT hop.
+    expect(comboFailureDecision(413, 'refused', { code: 'input_admission_refused' })).toBe('hop');
+    expect(comboFailureDecision(400, 'upstream mentions input_admission_refused in prose')).toBe('stop');
+    // An UPSTREAM context verdict still stops: retrying that elsewhere is guesswork, and a
+    // generic 413 with no structured code keeps its existing conservative handling.
+    expect(comboFailureDecision(400, "context_length_exceeded")).toBe("stop");
+    expect(comboFailureDecision(413, "request too large")).toBe("stop");
   });
 
   test("failure clears the active sticky target without adding a success", () => {
@@ -396,6 +466,41 @@ describe("deterministic combo selection", () => {
     });
   });
 
+  test("an explicitly configured native alias resolves before canonical OpenAI routing", () => {
+    const config = baseConfig({
+      codexAccountNamespaces: { main: "@main" },
+      combos: {
+        nova: {
+          alias: "gpt-5.6-sol",
+          nativeAlias: true,
+          displayName: "Nova1 - Sol",
+          targets: [{ provider: "a", model: "m1" }],
+        },
+      },
+    });
+    config.providers.openai = {
+      adapter: "openai-responses",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      codexAccountMode: "direct",
+    };
+
+    expect(routeModel(config, "gpt-5.6-sol")).toMatchObject({
+      providerName: "a",
+      modelId: "m1",
+      combo: { comboId: "nova", target: { provider: "a", model: "m1" } },
+    });
+    expect(routeModel(config, "combo/nova")).toMatchObject({
+      providerName: "a",
+      modelId: "m1",
+    });
+    const accountQualified = routeModel(config, "main/gpt-5.6-sol");
+    expect(accountQualified).toMatchObject({
+      providerName: "openai",
+      modelId: "gpt-5.6-sol",
+    });
+    expect(accountQualified.combo).toBeUndefined();
+  });
+
   test("eligibility, exclusions, and state reset are deterministic", () => {
     const config = rrConfig(1, [1, 1]);
     expect(pickComboTarget(config, "free", { exclude: ["a/m1"] })?.target.provider).toBe("b");
@@ -431,10 +536,42 @@ describe("combo validation and normalization", () => {
     expect(comboAliasIssues("new", "vendor/model", combos)).toEqual([]);
     expect(comboAliasIssues("new", "combo/model", combos)[0]?.message).toContain("reserved");
     expect(comboAliasIssues("new", "gpt-5", combos)[0]?.message).toContain("OpenAI native family");
+    expect(comboAliasIssues("new", "gpt-5.6-sol", combos, { allowNativeAlias: true })).toEqual([]);
     expect(comboAliasIssues("new", "deepseek-v4-flash", combos)[0]?.message).toContain("already used");
     expect(comboAliasIssues("renamed", "deepseek-v4-flash", combos, {
       excludeComboId: "free",
     })).toEqual([]);
+  });
+
+  test("requires an explicit labeled opt-in before a combo can own a native alias", () => {
+    const providers = baseConfig().providers;
+    expect(comboConfigError("nova", {
+      ...VALID_COMBO,
+      alias: "gpt-5.6-sol",
+    }, providers)).toContain("nativeAlias=true");
+    expect(comboConfigError("nova", {
+      ...VALID_COMBO,
+      alias: "gpt-5.6-sol",
+      nativeAlias: true,
+    }, providers)).toContain("displayName is required");
+    expect(comboConfigError("nova", {
+      ...VALID_COMBO,
+      alias: "deepseek-v4-flash",
+      nativeAlias: true,
+      displayName: "Not native",
+    }, providers)).toContain("requires a currently supported bare OpenAI-native");
+    expect(comboConfigError("nova", {
+      ...VALID_COMBO,
+      alias: "gpt-future-preview",
+      nativeAlias: true,
+      displayName: "Future model",
+    }, providers)).toContain("requires a currently supported bare OpenAI-native");
+    expect(comboConfigError("nova", {
+      ...VALID_COMBO,
+      alias: "gpt-5.6-sol",
+      nativeAlias: true,
+      displayName: "Nova1 - Sol",
+    }, providers)).toBeNull();
   });
 
   test("reports every validation row with a stable path and message", () => {
@@ -508,7 +645,10 @@ describe("combo validation and normalization", () => {
       strategy: "failover",
       stickyLimit: 1,
       defaultEffort: "high",
+      imageInput: "auto",
       alias: null,
+      nativeAlias: false,
+      displayName: null,
       targets: [{ provider: "a", model: "m1", weight: 2 }],
     });
     expect(normalizeComboConfig({ targets: [{ provider: "a", model: "m1" }] }).defaultEffort).toBeNull();

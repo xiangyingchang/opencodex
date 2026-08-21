@@ -27,25 +27,42 @@ export function applyProviderContextCap(contextWindow: number | undefined, cap: 
   return contextWindow > cap ? cap : contextWindow;
 }
 
+/**
+ * 上游没报窗口时，已开启的 Context cap 就是实际窗口。
+ * 128k 只是 Codex 解析器的兼容底线，不能当成“已发现窗口”再拿去和 cap 做 min。
+ */
+export function resolveUnknownRoutedContextWindow(cap: number | undefined): number {
+  const window = isValidContextCap(cap) ? Math.floor(cap) : 0;
+  return window > 0 ? window : 128_000;
+}
+
 /** Effective global cap value: explicit config value, else the built-in default. */
 export function globalContextCapValue(config: Pick<OcxConfig, "contextCapValue">): number {
   const value = config.contextCapValue;
   return isValidContextCap(value) ? Math.floor(value) : DEFAULT_PROVIDER_CONTEXT_CAP;
 }
 
-export function setProviderContextCap(config: OcxConfig, provider: string, enabled: boolean): void {
+export function setProviderContextCap(config: OcxConfig, provider: string, enabled: boolean, value?: number): void {
   const next = providerContextCaps(config);
-  if (enabled) next[provider] = globalContextCapValue(config);
-  else delete next[provider];
+  if (enabled) {
+    next[provider] = isValidContextCap(value) ? Math.floor(value) : globalContextCapValue(config);
+  } else {
+    delete next[provider];
+  }
   if (Object.keys(next).length > 0) config.providerContextCaps = next;
   else delete config.providerContextCaps;
 }
 
-/** Set the global cap value and re-point every already-enabled provider to it. */
-export function setGlobalContextCapValue(config: OcxConfig, value: number): void {
+/**
+ * Set the global cap value (the default used by per-provider toggles and "set all").
+ * Re-points every already-enabled provider only when `applyToAll` is true (the dashboard's
+ * "apply to every routed provider" toggle); otherwise each provider keeps its own cap value.
+ */
+export function setGlobalContextCapValue(config: OcxConfig, value: number, applyToAll: boolean): void {
   if (!isValidContextCap(value)) return;
   const next = Math.floor(value);
   config.contextCapValue = next;
+  if (!applyToAll) return;
   const caps = providerContextCaps(config);
   for (const provider of Object.keys(caps)) caps[provider] = next;
   if (Object.keys(caps).length > 0) config.providerContextCaps = caps;

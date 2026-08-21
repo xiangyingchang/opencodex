@@ -12,7 +12,10 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import { act } from "react";
 import type { Root } from "react-dom/client";
-import { CLIENTS } from "../src/components/apikeys-workspace/client-config-clients";
+import {
+  CLIENTS,
+  CLIENT_LABEL_KEYS,
+} from "../src/components/apikeys-workspace/client-config-clients";
 import { LanguageProvider } from "../src/i18n/provider";
 import ClientConfigPanel from "../src/components/apikeys-workspace/ClientConfigPanel";
 
@@ -167,6 +170,13 @@ function rowButton(container: HTMLElement, name: string, label: string): HTMLBut
     .find(el => el.textContent?.trim() === label)!;
 }
 
+test("the API download surface includes DSH and MiniMax Code as clients", () => {
+  expect(CLIENTS).toEqual(["opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode"]);
+  expect(CLIENT_LABEL_KEYS.dsh).toBe("api.clientConfig.clientDsh");
+  expect(CLIENT_LABEL_KEYS.mcode).toBe("api.clientConfig.clientMcode");
+  expect(CLIENT_LABEL_KEYS.zcode).toBe("api.clientConfig.clientZcode");
+});
+
 test("each row fetches its own client and its dialog renders that client's exact bytes", async () => {
   // Carries the guard the client-switch test owned: payload identity per client.
   // Destination-only assertions would have lost it.
@@ -190,7 +200,7 @@ test("each row fetches its own client and its dialog renders that client's exact
   await act(async () => { root.unmount(); });
 });
 
-test("the config JSON is not rendered at rest", async () => {
+test("the config bytes are not rendered at rest", async () => {
   // The core of the request: rows carry the actions, not the payload.
   stubRoute(client => Response.json(client === "pi" ? PI_ENVELOPE : OPENCODE_ENVELOPE));
   const { root, container } = await mountPanel();
@@ -199,7 +209,7 @@ test("the config JSON is not rendered at rest", async () => {
   expect(container.querySelector(".awi-clientconfig-json")).toBeNull();
   expect(container.querySelector("dialog")).toBeNull();
   // Both transport actions stay on the surface; only inspection is demoted.
-  expect(rowButton(container, "OpenCode", "Copy JSON").disabled).toBe(false);
+  expect(rowButton(container, "OpenCode", "Copy config").disabled).toBe(false);
   expect(rowButton(container, "OpenCode", "Download").disabled).toBe(false);
 
   await act(async () => { rowButton(container, "OpenCode", "Details").click(); });
@@ -233,7 +243,7 @@ test("row actions carry client-qualified accessible names", async () => {
   stubRoute(client => Response.json(client === "pi" ? PI_ENVELOPE : OPENCODE_ENVELOPE));
   const { root, container } = await mountPanel();
 
-  expect(rowButton(container, "Pi", "Copy JSON").getAttribute("aria-label")).toBe("Copy Pi config JSON");
+  expect(rowButton(container, "Pi", "Copy config").getAttribute("aria-label")).toBe("Copy Pi config");
   expect(rowButton(container, "Pi", "Download").getAttribute("aria-label")).toBe("Download Pi config");
   expect(rowButton(container, "Pi", "Details").getAttribute("aria-label")).toBe("Pi config details");
   expect(container.querySelector(".awi-clientconfig-rows")?.getAttribute("aria-label")).toBe("Connect a client");
@@ -434,14 +444,14 @@ test("one client's failure isolates to its row, with no partial JSON and the bas
     .toEqual(["Retry"]);
 
   // The sibling row is untouched by its neighbour's 503.
-  expect(rowButton(container, "OpenCode", "Copy JSON").disabled).toBe(false);
+  expect(rowButton(container, "OpenCode", "Copy config").disabled).toBe(false);
   expect(rowButton(container, "OpenCode", "Download").disabled).toBe(false);
 
   await act(async () => { rowButton(container, "Pi", "Retry").click(); });
 
   expect(piAttempts).toBe(2);
   expect(row(container, "Pi").textContent).toContain(PI_ENVELOPE.destination);
-  expect(rowButton(container, "Pi", "Copy JSON").disabled).toBe(false);
+  expect(rowButton(container, "Pi", "Copy config").disabled).toBe(false);
 
   await act(async () => { root.unmount(); });
 });
@@ -468,7 +478,7 @@ test("no-key state is informational and leaves copy and download enabled", async
 
   // Row actions never block on a missing key: an agent may legitimately want the
   // shape first.
-  expect(rowButton(container, "OpenCode", "Copy JSON").disabled).toBe(false);
+  expect(rowButton(container, "OpenCode", "Copy config").disabled).toBe(false);
   expect(rowButton(container, "OpenCode", "Download").disabled).toBe(false);
 
   await act(async () => { rowButton(container, "OpenCode", "Details").click(); });

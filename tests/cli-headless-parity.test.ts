@@ -87,6 +87,7 @@ describe("headless GUI parity CLI", () => {
       ["/api/injection", "ocx agent"],
       ["/api/keys", "ocx access"],
       ["/api/logs", "ocx observe"],
+      ["/api/lab", "ocx lab"],
       ["/api/config", "ocx config"],
       ["/api/settings", "ocx system"],
       // Routing Intelligence (RI-04..RI-10): profiles + dry-run are mirrored by
@@ -209,13 +210,44 @@ describe("headless GUI parity CLI", () => {
     expect(runtime.requests[0]).toEqual({ path: "/api/provider-context-caps", method: "PUT", body: { setAll: true } });
   });
 
+  test("model context value maps with an explicit set-all flag", async () => {
+    const runtime = fakeRuntime();
+    const code = await handleModelsRuntimeCommand("context", ["value", "128_000", "--set-all", "--json"], runtime.deps);
+    expect(code).toBe(0);
+    expect(runtime.requests[0]).toEqual({ path: "/api/provider-context-caps", method: "PUT", body: { value: 128_000, setAll: true } });
+
+    // Without --set-all only the shared default changes.
+    const defaultRuntime = fakeRuntime();
+    const defaultCode = await handleModelsRuntimeCommand("context", ["value", "256_000", "--json"], defaultRuntime.deps);
+    expect(defaultCode).toBe(0);
+    expect(defaultRuntime.requests[0]).toEqual({ path: "/api/provider-context-caps", method: "PUT", body: { value: 256_000 } });
+  });
+
+  test("model context provider maps to the atomic GUI endpoint with an optional value", async () => {
+    const runtime = fakeRuntime();
+    const code = await handleModelsRuntimeCommand("context", ["provider", "openai", "on", "--value", "128_000", "--json"], runtime.deps);
+    expect(code).toBe(0);
+    expect(runtime.requests[0]).toEqual({ path: "/api/provider-context-caps", method: "PUT", body: { provider: "openai", enabled: true, value: 128_000 } });
+
+    const offRuntime = fakeRuntime();
+    const offCode = await handleModelsRuntimeCommand("context", ["provider", "openai", "off", "--json"], offRuntime.deps);
+    expect(offCode).toBe(0);
+    expect(offRuntime.requests[0]).toEqual({ path: "/api/provider-context-caps", method: "PUT", body: { provider: "openai", enabled: false } });
+
+    // --value is only valid with `on`; the rejected form must not send any request.
+    const rejectedRuntime = fakeRuntime();
+    const rejectedCode = await handleModelsRuntimeCommand("context", ["provider", "openai", "off", "--value", "128_000", "--json"], rejectedRuntime.deps);
+    expect(rejectedCode).toBe(2);
+    expect(rejectedRuntime.requests).toEqual([]);
+  });
+
   test("combo set parses ordered weighted targets", async () => {
     const runtime = fakeRuntime();
     const code = await handleComboCommand([
       "set", "fast", "--targets", "ark/model-a:2,openai/gpt-5.5", "--strategy", "failover", "--json",
     ], runtime.deps);
     expect(code).toBe(0);
-    expect(runtime.requests[0]?.body).toEqual({
+    expect(runtime.requests.find(request => request.method === "PUT")?.body).toEqual({
       id: "fast",
       combo: {
         strategy: "failover",
@@ -226,6 +258,57 @@ describe("headless GUI parity CLI", () => {
         ],
       },
     });
+  });
+
+  test("combo set forwards the explicit native-alias compatibility contract", async () => {
+    const runtime = fakeRuntime();
+    const code = await handleComboCommand([
+      "set", "nova-sol",
+      "--targets", "Nova1/codex/gpt-5.6-sol",
+      "--alias", "gpt-5.6-sol",
+      "--native-alias",
+      "--display-name", "Nova1 - codex-gpt-5.6-sol",
+      "--json",
+    ], runtime.deps);
+    expect(code).toBe(0);
+    expect(runtime.requests.find(request => request.method === "PUT")?.body).toMatchObject({
+      id: "nova-sol",
+      combo: {
+        alias: "gpt-5.6-sol",
+        nativeAlias: true,
+        displayName: "Nova1 - codex-gpt-5.6-sol",
+        targets: [{ provider: "Nova1", model: "codex/gpt-5.6-sol" }],
+      },
+    });
+  });
+
+  test("combo set round-trips an existing disabled image-input capability", async () => {
+    let persisted: Record<string, unknown> = {
+      id: "text-only",
+      imageInput: "disabled",
+      targets: [{ provider: "ark", model: "old-model" }],
+    };
+    const runtime = fakeRuntime((req, body) => {
+      if (req.method === "GET") return { combos: [persisted] };
+      if (req.method === "PUT") {
+        const update = body as { id: string; combo: Record<string, unknown> };
+        persisted = { id: update.id, ...update.combo };
+        return { combo: persisted };
+      }
+      return undefined;
+    });
+
+    expect(await handleComboCommand([
+      "set", "text-only", "--targets", "ark/new-model", "--json",
+    ], runtime.deps)).toBe(0);
+    expect(await handleComboCommand(["show", "text-only", "--json"], runtime.deps)).toBe(0);
+
+    expect(persisted).toMatchObject({
+      id: "text-only",
+      imageInput: "disabled",
+      targets: [{ provider: "ark", model: "new-model" }],
+    });
+    expect(runtime.requests.map(request => request.method)).toEqual(["GET", "PUT", "GET"]);
   });
 
   test("agent effort and roster use the same live mutation routes as GUI", async () => {
@@ -343,6 +426,70 @@ describe("headless GUI parity CLI", () => {
     }
   });
 
+
+  test("config set applies onto the disk state, not a snapshot read before the lock (#1835)", async () => {
+    // The read used to happen outside the mutation lock, so a concurrent edit landing
+    // between it and the whole-snapshot save was silently reverted.
+    const home = mkdtempSync(join(tmpdir(), "ocx-cli-set-race-"));
+    const previous = process.env.OPENCODEX_HOME;
+    process.env.OPENCODEX_HOME = home;
+    const configPath = join(home, "config.json");
+    const base = {
+      port: 10100,
+      providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" } },
+      defaultProvider: "openai",
+    };
+    try {
+      writeFileSync(configPath, JSON.stringify(base));
+      expect(await handleConfigCommand(["set", "autoSwitchThreshold", "50", "--json"])).toBe(0);
+
+      // A competing writer adds a provider the CLI never saw.
+      const onDisk = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, any>;
+      onDisk.providers.competitor = {
+        adapter: "openai-chat",
+        baseUrl: "https://competitor.example/v1",
+        apiKey: "competitor-key",
+      };
+      writeFileSync(configPath, JSON.stringify(onDisk));
+
+      expect(await handleConfigCommand(["set", "autoSwitchThreshold", "70", "--json"])).toBe(0);
+
+      const after = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, any>;
+      expect(after.autoSwitchThreshold).toBe(70);
+      // The competing edit survives: the mutation was applied to the fresh disk state.
+      expect(Object.keys(after.providers)).toEqual(expect.arrayContaining(["openai", "competitor"]));
+      expect(after.providers.competitor).toMatchObject({ apiKey: "competitor-key" });
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previous;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("config unset actually removes the key through the mutation primitive (#1835)", async () => {
+    // A merge-only callback cannot delete, so unset would report success and change nothing.
+    const home = mkdtempSync(join(tmpdir(), "ocx-cli-unset-"));
+    const previous = process.env.OPENCODEX_HOME;
+    process.env.OPENCODEX_HOME = home;
+    const configPath = join(home, "config.json");
+    try {
+      writeFileSync(configPath, JSON.stringify({
+        port: 10100,
+        providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" } },
+        defaultProvider: "openai",
+        autoSwitchThreshold: 50,
+      }));
+      expect(await handleConfigCommand(["unset", "autoSwitchThreshold", "--json"])).toBe(0);
+
+      const after = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, any>;
+      expect(Object.hasOwn(after, "autoSwitchThreshold")).toBe(false);
+      expect(after.providers.openai).toBeDefined();
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previous;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
   test("config set releases the manual pin when it writes the selection order", async () => {
     const home = mkdtempSync(join(tmpdir(), "ocx-cli-priority-pin-"));
     const previous = process.env.OPENCODEX_HOME;

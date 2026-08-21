@@ -9,13 +9,22 @@ review and merge policy.
 | --- | --- | --- |
 | [@lidge-jun](https://github.com/lidge-jun) | Project owner | Project direction, releases, repository administration, and final governance decisions |
 | [@Ingwannu](https://github.com/Ingwannu) | Maintainer | Issue and pull-request triage, `dev` integration, security review, and repository maintenance |
-| [@Wibias](https://github.com/Wibias) | Maintainer | Issue and pull-request triage, `dev` integration, and provider/CI maintenance |
 
 The table describes project responsibilities. Actual repository permissions remain controlled
 through GitHub repository settings.
 
 `dev` is the only integration line. The former `dev2-go` carry duty is retired;
 see [The retired `dev2-go` line](#the-retired-dev2-go-line).
+
+## Former maintainers
+
+| GitHub account | Project role | Period |
+| --- | --- | --- |
+| [@Wibias](https://github.com/Wibias) | Maintainer | 2026-07-27 – 2026-08-19 |
+
+Former maintainers keep contributor standing and are welcome to open issues and pull requests like
+anyone else. Authorship credit in git history, release notes, and code comments is not rewritten
+when a maintainer steps down.
 
 ## Review and merge policy
 
@@ -35,10 +44,13 @@ see [The retired `dev2-go` line](#the-retired-dev2-go-line).
   commits are pushed afterwards, the gate moves the PR back to draft, resets
   the checklist and the notification, and asks the author to test and tick the
   boxes again against the latest code.
-  Before a completion is accepted, the gate verifies the two checklist claims
-  it can check itself: the head's `ci` check must be green, and the branch
-  must be on the latest `dev` commit or at most 10 commits behind it. A
-  disproved claim unticks the matching box and keeps the PR a draft.
+  Before a completion is accepted, the gate verifies the checklist claims
+  it can check itself: the branch must be on the latest `dev` commit or at
+  most 10 commits behind it, and Codex/CodeRabbit findings must be resolved.
+  The local-CI box is an author attestation only — fork contributors cannot
+  start repository CI; a maintainer has to — so the gate never disproves it;
+  a new push still resets every box. A disproved claim unticks the matching
+  box and keeps the PR a draft.
   Authors with repository push permission skip the ancestry heuristic only. As
   with the approval requirement above, this is enforced by convention until
   branch protection is configured (see the note under the change log).
@@ -95,6 +107,24 @@ Adding or removing a maintainer requires:
 
 ### Change log
 
+- 2026-08-19 — [@Wibias](https://github.com/Wibias) stepped down as a maintainer
+  and is now a contributor. This follows his own decision to stop developing
+  opencodex; it is not a disciplinary action, and it was made with the owner's
+  agreement (requirement 1). Requirement 2 does not apply to a maintainer's own
+  resignation, which needs no second maintainer to ratify it. Requirement 3 is
+  met by this file and `.github/CODEOWNERS`, where the default-reviewer line
+  and the four runtime paths that listed him (`/src/adapters/`,
+  `/src/providers/`, `/src/codex/`, `/src/server/`) drop back to the two
+  remaining maintainers. Repository permission was reduced to read access at
+  the same time, so the roster and the GitHub settings agree again.
+
+  Nothing he authored is being unwound. His commits, the pull requests he
+  merged, the release-note attributions, and the code comments citing his
+  reviews stay exactly as they are, and the trust-lane gate derived from his
+  work in `.github/scripts/pr-sponsored-surface.cjs` keeps its attribution.
+  Returning to the maintainer table later would go through the same three
+  requirements that govern every addition.
+
 - 2026-07-27 — [@Wibias](https://github.com/Wibias) added as a maintainer.
   Requirement 1 (agreement from the project owner) is met: the owner requested
   the addition. **Requirement 2 (review by another current maintainer) was
@@ -102,10 +132,10 @@ Adding or removing a maintainer requires:
   carried the addition (`a2693c02`, `dc3a4ade`, `02bbd47a`) landed on `dev` as
   direct owner pushes with no associated pull request, so no second maintainer
   reviewed them. Requirement 3 is met by this file and `.github/CODEOWNERS`.
-  The addition is in effect regardless: @Wibias holds write access on the
-  repository and has been merging pull requests since 2026-07-26. This entry
-  records the gap rather than papering over it — a later maintainer change
-  should go through a reviewed pull request.
+  The addition took effect regardless: @Wibias held write access on the
+  repository and merged pull requests from 2026-07-26 until he stepped down on
+  2026-08-19. This entry records the gap rather than papering over it — a later
+  maintainer change should go through a reviewed pull request.
 
   Scope covers issue and pull-request triage, `dev` integration, and
   provider/CI maintenance. (This entry originally also described carrying

@@ -31,7 +31,7 @@ function unwrapSingleEnclosingFence(text) {
  */
 function normalizeRawSectionValue(raw) {
   if (typeof raw !== "string") return null;
-  let value = raw.replace(/<!--[\s\S]*?-->/g, "").trim();
+  let value = raw.replace(/<!--[\s\S]*?(?:-->|$)/g, "").trim();
   if (!value) return null;
 
   // A lone fenced block whose entire body is a stand-in is still a stand-in
@@ -66,45 +66,104 @@ function isPlaceholderOnlyValue(raw) {
  */
 function stripMediaTokens(text) {
   if (typeof text !== "string") return "";
-  // Indented code lines render as literal code in GitHub Markdown. Protect
-  // them first so neither the HTML nor the Markdown media stripper can
-  // remove example syntax; restore the lines afterwards.
+  // Fenced and indented code render literally in GitHub Markdown. Protect
+  // them first so neither media stripper can remove example syntax. The
+  // protector deliberately leaves indented children of an unindented HTML
+  // media block visible: those lines are HTML children, not Markdown code.
   const protectedText = protectIndentedCodeLines(text);
   const markdownStripped = stripMarkdownImages(stripHtmlMedia(protectedText.text));
   const referenceStripped = stripReferenceImages(markdownStripped);
-  return restoreIndentedCodeLines(referenceStripped, protectedText.lines);
+  return restoreIndentedCodeLines(referenceStripped, protectedText);
 }
 
 /**
- * Replace every indented code line (4+ leading spaces or a tab) with a
- * placeholder of equal length so media stripping cannot touch it. Returns the
- * masked text plus the original lines for restoration.
+ * Replace fenced code and indented code outside HTML media blocks with opaque
+ * tokens. Restoration is token-based rather than line-position-based because
+ * stripping a multiline media block may collapse or remove lines.
  */
 function protectIndentedCodeLines(text) {
   const lines = [];
+  let markerPrefix = "\u0000OCX_ISSUE_CODE_";
+  while (text.includes(markerPrefix)) markerPrefix += "_";
+  let mediaDepth = 0;
+  let pendingMediaTag = null;
+  let fence = null;
+
+  const mask = (line) => {
+    const index = lines.push(line) - 1;
+    return `${markerPrefix}${index}\u0000`;
+  };
+
   const masked = text.split("\n").map((line) => {
-    if (/^(?: {4,}|\t)/.test(line)) {
-      lines.push(line);
-      return "\u0000" + line.replace(/[^\n]/g, " ").slice(1);
+    if (fence) {
+      const closing = new RegExp(`^ {0,3}${fence.char}{${fence.length},}[ \\t]*$`);
+      if (closing.test(line)) fence = null;
+      return mask(line);
     }
-    lines.push(null);
+
+    const fenceStart = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (fenceStart) {
+      fence = { char: fenceStart[1][0], length: fenceStart[1].length };
+      return mask(line);
+    }
+
+    // Four-space/tab lines inside an active unindented HTML media block are
+    // child markup or fallback text. Treating them as code would keep an
+    // otherwise media-only <picture>/<video> block alive.
+    if (mediaDepth === 0 && pendingMediaTag === null && /^(?: {4,}|\t)/.test(line)) {
+      return mask(line);
+    }
+
+    const mediaScan = htmlMediaDepthDelta(line, pendingMediaTag);
+    mediaDepth = Math.max(0, mediaDepth + mediaScan.delta);
+    pendingMediaTag = mediaScan.pendingTag;
     return line;
   });
-  return { text: masked.join("\n"), lines };
+  return { text: masked.join("\n"), lines, markerPrefix };
 }
 
 /**
- * Restore masked indented-code lines from their original content. Placeholder
- * lines are identified by the leading \u0000 marker and matched positionally.
+ * Count opening/closing block-media tags while carrying an unfinished opening
+ * tag across lines until `>`. Self-closing tags do not create a block. This
+ * scanner only decides whether indentation belongs to HTML; stripHtmlMedia
+ * remains the authority for removing media.
  */
-function restoreIndentedCodeLines(text, lines) {
-  const out = text.split("\n").map((line, i) => {
-    if (lines[i] !== null && line.startsWith("\u0000")) {
-      return lines[i];
+function htmlMediaDepthDelta(line, pendingTag = null) {
+  let delta = 0;
+  let cursor = 0;
+
+  const completeTag = (tag) => {
+    if (/^<\s*\//.test(tag)) delta -= 1;
+    else if (!/\/\s*>$/.test(tag)) delta += 1;
+  };
+
+  if (pendingTag !== null) {
+    const end = line.indexOf(">");
+    if (end === -1) return { delta, pendingTag: `${pendingTag}\n${line}` };
+    completeTag(`${pendingTag}\n${line.slice(0, end + 1)}`);
+    pendingTag = null;
+    cursor = end + 1;
+  }
+
+  const opening = /<(\/)?(picture|video|audio)\b/gi;
+  opening.lastIndex = cursor;
+  for (let match = opening.exec(line); match !== null; match = opening.exec(line)) {
+    const end = line.indexOf(">", opening.lastIndex);
+    if (end === -1) {
+      pendingTag = line.slice(match.index);
+      break;
     }
-    return line;
-  });
-  return out.join("\n");
+    completeTag(line.slice(match.index, end + 1));
+    opening.lastIndex = end + 1;
+  }
+  return { delta, pendingTag };
+}
+
+/** Restore protected code from ordered tokens, independent of line count. */
+function restoreIndentedCodeLines(text, protection) {
+  const escapedPrefix = protection.markerPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const token = new RegExp(`${escapedPrefix}(\\d+)\\u0000`, "g");
+  return text.replace(token, (_match, rawIndex) => protection.lines[Number(rawIndex)] ?? "");
 }
 
 /**
@@ -120,7 +179,7 @@ function stripHtmlMedia(text) {
   if (typeof text !== "string") return "";
   let s = text
     .replace(/<img\b[^>]*>/gi, " ")
-    .replace(/<!--[\s\S]*?-->/g, " ");
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, " ");
 
   // Whole media blocks: replace only when the inner content is not
   // substantive text (no word characters outside tags).
@@ -131,10 +190,17 @@ function stripHtmlMedia(text) {
         .replace(/<[^>]+>/g, " ")
         .replace(/[\s_*~`]+/g, " ")
         .trim();
-      return innerStripped.length === 0 ? " " : match;
+      // Only GitHub's exact generated "No response" value is empty here.
+      // Whole-field stand-ins such as TBD/N/A/None are valid media captions.
+      return innerStripped.length === 0 || isGitHubNoResponseMediaPlaceholder(inner) ? " " : match;
     },
   );
   return s;
+}
+
+function isGitHubNoResponseMediaPlaceholder(inner) {
+  const text = inner.replace(/<[^>]+>/g, " ");
+  return /^[\s_*~`]*No response[\s_*~`]*$/.test(text);
 }
 
 /**
@@ -356,9 +422,126 @@ function isMediaOnly(text) {
 /**
  * Strip HTML comments, placeholder-only values, and trim whitespace.
  */
+function stripHtmlCommentsOutsideCode(raw) {
+  const text = String(raw);
+  // Linear scanner, deliberately not a regex. The previous masker combined a
+  // variable-length delimiter capture, a lazy whole-input scan and a
+  // backreference, which backtracks catastrophically on adversarial input: a
+  // 60k-character issue body took ~10.5s, inside an automation trust boundary
+  // that anyone can post to. This walks the string once.
+  //
+  // It also fixes two GFM cases the regex got wrong: a closing fence may be
+  // LONGER than its opener, and a code span may contain a line ending.
+  let out = "";
+  let i = 0;
+  let atLineStart = true;
+
+  const lineEnd = (from) => {
+    const nl = text.indexOf("\n", from);
+    return nl === -1 ? text.length : nl;
+  };
+
+  while (i < text.length) {
+    const ch = text[i];
+
+    // Fenced block: at most three leading spaces, then >= 3 backticks or tildes.
+    if (atLineStart && (ch === "`" || ch === "~" || ch === " " || ch === "\t")) {
+      let j = i;
+      let indent = 0;
+      while (j < text.length && (text[j] === " " || text[j] === "\t") && indent < 4) { j++; indent++; }
+      const marker = text[j];
+      if (indent < 4 && (marker === "`" || marker === "~")) {
+        let run = 0;
+        while (text[j + run] === marker) run++;
+        if (run >= 3) {
+          // Copy the opening line verbatim, then everything up to a closing
+          // fence of the SAME character and AT LEAST the same length.
+          // `cursor` is the index of the newline ending the current line, so the
+          // next line starts at cursor + 1.
+          let cursor = lineEnd(j + run);
+          let closed = false;
+          while (cursor < text.length) {
+            const start = cursor + 1;
+            let p = start;
+            let ind = 0;
+            while (p < text.length && (text[p] === " " || text[p] === "\t") && ind < 4) { p++; ind++; }
+            let closeRun = 0;
+            while (text[p + closeRun] === marker) closeRun++;
+            const after = p + closeRun;
+            const rest = text.slice(after, lineEnd(after));
+            if (ind < 4 && closeRun >= run && rest.trim() === "") {
+              const end = lineEnd(after);
+              out += text.slice(i, end);
+              i = end;
+              closed = true;
+              break;
+            }
+            const next = lineEnd(start);
+            if (next <= cursor) break;
+            cursor = next;
+          }
+          if (closed) { atLineStart = true; continue; }
+          // Unclosed fence runs to end of input, per GFM.
+          out += text.slice(i);
+          return out;
+        }
+      }
+    }
+
+    // Inline code span: a run of N backticks closed by the next run of exactly N.
+    if (ch === "`") {
+      let run = 0;
+      while (text[i + run] === "`") run++;
+      let p = i + run;
+      let close = -1;
+      while (p < text.length) {
+        if (text[p] === "`") {
+          let r = 0;
+          while (text[p + r] === "`") r++;
+          if (r === run) { close = p + r; break; }
+          p += r;
+          continue;
+        }
+        p++;
+      }
+      if (close !== -1) {
+        out += text.slice(i, close);
+        atLineStart = false;
+        i = close;
+        continue;
+      }
+    }
+
+    // HTML comment outside any code region. An unclosed one runs to EOF.
+    if (ch === "<" && text.startsWith("<!--", i)) {
+      const end = text.indexOf("-->", i + 4);
+      if (end === -1) return out;
+      i = end + 3;
+      continue;
+    }
+
+    out += ch;
+    atLineStart = ch === "\n";
+    i++;
+  }
+  return out;
+}
+
+/**
+ * Strip HTML comments, placeholder-only values, and trim whitespace.
+ */
+/**
+ * Strip HTML comments, placeholder-only values, and trim whitespace.
+ */
 function clean(raw) {
   if (typeof raw !== "string") return "";
-  let s = raw.replace(/<!--[\s\S]*?-->/g, "");
+  // Comment stripping must not reach inside fenced code. GFM treats fence
+  // contents as literal text, so a `<!--` in a code sample never opens a
+  // comment; letting an unclosed one run through EOF swallowed the rest of the
+  // section and rejected valid issues as "too vague to act on". Fence contents
+  // are preserved, not deleted -- they are legitimate reproduction evidence
+  // that emptiness and duplicate detection still need to see.
+  let s = stripHtmlCommentsOutsideCode(raw);
   // Media-only sections (a lone screenshot or embed) carry no reportable
   // text. Strip the media tokens so the section participates in emptiness and
   // duplicate detection like any other blank section. This closes the
@@ -1068,10 +1251,8 @@ const REPRO_PATH_RE = new RegExp([
     "~?/[\\w.@-]+(?:/[\\w.@-]+)+",
     "[A-Za-z]:\\\\(?:[\\w.@-]+\\\\)+[\\w.@-]+",
     "~?/[\\w.@-]+/[\\w.@-]+\\.(?:json|yaml|yml|toml|conf|log|env|txt|ts|js|tsx|jsx|sh|ps1|py)",
-    "[\\w.@-]+\\.(?:json|yaml|yml|toml|conf|log|env)\\b",
-].join("|"));
-const ACTIONABLE_REPRO_RE = new RegExp(
-  [REPRO_COMMAND_RE.source, REPRO_FAILURE_RE.source, REPRO_PATH_RE.source].join("|"),
+    "(?:^|[^\\w.@-])[\\w.@-]+\\.(?:json|yaml|yml|toml|conf|log|env)\\b",
+].join("|"),
   "i",
 );
 
@@ -1085,9 +1266,18 @@ const EMPTY_FENCE_RE = /^[ \t]{0,3}(?:```+|~~~+)\s*\n\s*\n[ \t]{0,3}(?:```+|~~~+
  * count as actionable when their body contains non-whitespace content.
  */
 function hasActionableReproductionDetail(text) {
+  if (typeof text !== "string") return false;
+  // Avoid Markdown cleanup and path matching when the raw input cannot contain
+  // actionable syntax. Fences remain eligible through their ` / ~ sigils.
+  if (!/[./\\`~]/.test(text) && !REPRO_COMMAND_RE.test(text) && !REPRO_FAILURE_RE.test(text)) {
+    return false;
+  }
   const c = clean(text);
   if (!c) return false;
-  if (ACTIONABLE_REPRO_RE.test(c)) return true;
+  if (REPRO_COMMAND_RE.test(c) || REPRO_FAILURE_RE.test(c)) return true;
+  // A boundary-anchored filename avoids retrying the same long token from each
+  // successive character while preserving case-insensitive extension matches.
+  if (/[./\\]/.test(c) && REPRO_PATH_RE.test(c)) return true;
   // Fenced blocks: only count when the body has non-whitespace content.
   if (/```|~~~/.test(c)) {
     const parts = stripFencedActionableContent(c);

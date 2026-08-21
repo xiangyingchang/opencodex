@@ -9,6 +9,8 @@ const {
   authorHasPushPermission,
   assessPrDescription,
   hasGuiCue,
+  guiPathsChanged,
+  isChangedFileListTruncated,
   hasGuiOverride,
   hasScreenshotEvidence,
   buildReviewReadinessSection,
@@ -64,6 +66,10 @@ describe("assessPrDescription", () => {
     assert.equal(assessPrDescription("   ").ok, false);
     assert.equal(
       assessPrDescription("<!-- release notes by coderabbit.ai -->\n\n<!-- end -->").reason,
+      "empty",
+    );
+    assert.equal(
+      assessPrDescription("<!--\n![proof](https://example.invalid/screenshot.png)").reason,
       "empty",
     );
   });
@@ -137,6 +143,16 @@ describe("hasGuiCue", () => {
     );
   });
 
+  it("does not match negated gui phrases", () => {
+    assert.equal(hasGuiCue("", "no gui changes in this PR"), false);
+    assert.equal(hasGuiCue("", "Without gui changes"), false);
+    assert.equal(hasGuiCue("No GUI changes", ""), false);
+    assert.equal(
+      hasGuiCue("", "This does not change the API. Please add a gui screenshot."),
+      true,
+    );
+  });
+
   it("does not match gui inside other words", () => {
     assert.equal(hasGuiCue("Add contributor guidance", ""), false);
     assert.equal(hasGuiCue("", "Fix the guild invitation bug"), false);
@@ -146,6 +162,28 @@ describe("hasGuiCue", () => {
   it("does not match missing or non-string inputs", () => {
     assert.equal(hasGuiCue(undefined, undefined), false);
     assert.equal(hasGuiCue(null, null), false);
+  });
+});
+
+describe("guiPathsChanged", () => {
+  it("matches gui/ paths with a slash guard", () => {
+    assert.equal(guiPathsChanged(["gui/src/App.tsx"]), true);
+    assert.equal(guiPathsChanged(["gui"]), true);
+    assert.equal(guiPathsChanged(["scripts/foo.ts", "gui/package.json"]), true);
+    assert.equal(guiPathsChanged(["scripts/foo.ts"]), false);
+    assert.equal(guiPathsChanged(["guitools/x.ts"]), false);
+    assert.equal(guiPathsChanged([]), false);
+  });
+});
+
+describe("isChangedFileListTruncated", () => {
+  it("treats head drift, invalid counts, and oversized lists as truncated", () => {
+    assert.equal(isChangedFileListTruncated(10, 10, false), true);
+    assert.equal(isChangedFileListTruncated(undefined, 10, true), true);
+    assert.equal(isChangedFileListTruncated(10.5, 10, true), true);
+    assert.equal(isChangedFileListTruncated(11, 10, true), true);
+    assert.equal(isChangedFileListTruncated(10, 10, true), false);
+    assert.equal(isChangedFileListTruncated(5, 10, true), false);
   });
 });
 
@@ -255,6 +293,10 @@ describe("hasScreenshotEvidence", () => {
     );
     assert.equal(
       hasScreenshotEvidence('<!-- <img src="https://example.com/ui.png"> -->'),
+      false,
+    );
+    assert.equal(
+      hasScreenshotEvidence("<!--\n![after](https://example.com/after.png)"),
       false,
     );
   });
@@ -552,16 +594,16 @@ describe("uncheckReviewReadinessBoxes", () => {
 
   it("unchecks only the requested boxes", () => {
     const body = uncheckReviewReadinessBoxes(checkedBody, [
-      REVIEW_READINESS_CLAIM_INDEX.ci_green,
+      REVIEW_READINESS_CLAIM_INDEX.latest_dev,
     ]);
-    assert.ok(body.includes("- [ ] All CI tests are green on my local testing."));
-    assert.ok(body.includes("- [x] I pushed my PR to the latest dev commit."));
+    assert.ok(body.includes("- [x] All CI tests are green on my local testing."));
+    assert.ok(body.includes("- [ ] I pushed my PR to the latest dev commit."));
     assert.ok(body.includes("- [x] My PR is ready for review."));
   });
 
   it("can uncheck several boxes at once", () => {
     const body = uncheckReviewReadinessBoxes(checkedBody, [
-      REVIEW_READINESS_CLAIM_INDEX.ci_green,
+      0,
       REVIEW_READINESS_CLAIM_INDEX.latest_dev,
     ]);
     assert.ok(body.includes("- [ ] All CI tests are green on my local testing."));
@@ -792,7 +834,21 @@ describe("collectPrQualityFailures", () => {
     assert.ok(failures.some((f) => f.code === "wrong_base"));
   });
 
-  it("flags a gui title without a screenshot", () => {
+  it("flags gui/ file changes without a screenshot", () => {
+    const failures = collectPrQualityFailures({
+      baseRef: "dev",
+      allowedBases: allowed,
+      title: "Fix dashboard spacing",
+      body: richBody,
+      behindMain: 0,
+      behindBase: 0,
+      authorPermission: "read",
+      changedFilePaths: ["gui/src/App.tsx"],
+    });
+    assert.ok(failures.some((f) => f.code === "missing_ui_screenshot"));
+  });
+
+  it("does not flag a gui title when no gui/ files changed", () => {
     const failures = collectPrQualityFailures({
       baseRef: "dev",
       allowedBases: allowed,
@@ -801,11 +857,65 @@ describe("collectPrQualityFailures", () => {
       behindMain: 0,
       behindBase: 0,
       authorPermission: "read",
+      changedFilePaths: ["scripts/foo.ts"],
+    });
+    assert.ok(!failures.some((f) => f.code === "missing_ui_screenshot"));
+  });
+
+  it("flags truncated file lists even when gui/ is not in the partial list", () => {
+    const truncatedPaths = Array.from({ length: 3000 }, (_, index) => `scripts/file-${index}.ts`);
+    const failures = collectPrQualityFailures({
+      baseRef: "dev",
+      allowedBases: allowed,
+      title: "Large refactor",
+      body: richBody,
+      behindMain: 0,
+      behindBase: 0,
+      authorPermission: "read",
+      changedFilePaths: truncatedPaths,
+      filesTruncated: true,
     });
     assert.ok(failures.some((f) => f.code === "missing_ui_screenshot"));
   });
 
-  it("flags a gui mention in the body without a screenshot", () => {
+  it("flags truncated file lists when gui/ appears in the partial list", () => {
+    const truncatedPaths = Array.from({ length: 2999 }, (_, index) => `scripts/file-${index}.ts`);
+    truncatedPaths.push("gui/src/App.tsx");
+    const failures = collectPrQualityFailures({
+      baseRef: "dev",
+      allowedBases: allowed,
+      title: "Large refactor with gui tweak",
+      body: richBody,
+      behindMain: 0,
+      behindBase: 0,
+      authorPermission: "read",
+      changedFilePaths: truncatedPaths,
+      filesTruncated: true,
+    });
+    assert.ok(failures.some((f) => f.code === "missing_ui_screenshot"));
+  });
+
+  it("does not flag no gui changes text without gui/ file changes", () => {
+    const failures = collectPrQualityFailures({
+      baseRef: "dev",
+      allowedBases: allowed,
+      title: "Fix proxy routing",
+      body: [
+        "## Summary",
+        "No gui changes in this PR; proxy routing only.",
+        "",
+        "## Test plan",
+        "- Ran bun test tests/ci-workflows.test.ts",
+      ].join("\n"),
+      behindMain: 0,
+      behindBase: 0,
+      authorPermission: "read",
+      changedFilePaths: ["scripts/foo.ts"],
+    });
+    assert.ok(!failures.some((f) => f.code === "missing_ui_screenshot"));
+  });
+
+  it("flags a gui mention in the body without a screenshot when gui/ changed", () => {
     const failures = collectPrQualityFailures({
       baseRef: "dev",
       allowedBases: allowed,
@@ -820,6 +930,7 @@ describe("collectPrQualityFailures", () => {
       behindMain: 0,
       behindBase: 0,
       authorPermission: "read",
+      changedFilePaths: ["gui/src/styles.css"],
     });
     assert.ok(failures.some((f) => f.code === "missing_ui_screenshot"));
   });
@@ -839,6 +950,7 @@ describe("collectPrQualityFailures", () => {
       behindMain: 0,
       behindBase: 0,
       authorPermission: "read",
+      changedFilePaths: ["gui/src/App.tsx"],
       guiOverrideComments: [
         { author_association: "OWNER", body: "no gui changes here" },
       ],
@@ -861,6 +973,7 @@ describe("collectPrQualityFailures", () => {
       behindMain: 0,
       behindBase: 0,
       authorPermission: "read",
+      changedFilePaths: ["gui/src/App.tsx"],
       guiOverrideComments: [
         { author_association: "CONTRIBUTOR", body: "no gui changes here" },
       ],
@@ -885,6 +998,7 @@ describe("collectPrQualityFailures", () => {
       behindMain: 0,
       behindBase: 0,
       authorPermission: "read",
+      changedFilePaths: ["gui/src/App.tsx"],
     });
     assert.ok(!failures.some((f) => f.code === "missing_ui_screenshot"));
   });
@@ -908,11 +1022,12 @@ describe("collectPrQualityFailures", () => {
       behindMain: 0,
       behindBase: 0,
       authorPermission: "read",
+      changedFilePaths: ["gui/src/App.tsx"],
     });
     assert.ok(!failures.some((f) => f.code === "missing_ui_screenshot"));
   });
 
-  it("still flags a gui title when image syntax is only inside a code fence", () => {
+  it("still flags gui/ changes when image syntax is only inside a code fence", () => {
     const failures = collectPrQualityFailures({
       baseRef: "dev",
       allowedBases: allowed,
@@ -931,6 +1046,7 @@ describe("collectPrQualityFailures", () => {
       behindMain: 0,
       behindBase: 0,
       authorPermission: "read",
+      changedFilePaths: ["gui/src/App.tsx"],
     });
     assert.ok(failures.some((f) => f.code === "missing_ui_screenshot"));
   });
@@ -958,5 +1074,30 @@ describe("collectPrQualityFailures", () => {
       authorPermission: "read",
     });
     assert.ok(!failures.some((f) => f.code === "missing_ui_screenshot"));
+  });
+});
+
+describe("comment stripping respects fenced code (regression)", () => {
+  it("keeps a screenshot that follows a comment-like literal in a fence", () => {
+    // GFM treats fence contents as literal text, so `<!--` inside a code sample
+    // never opens an HTML comment. Stripping comments before fences let the
+    // unclosed literal run to EOF and swallow the real screenshot below it,
+    // rejecting a valid GUI PR.
+    const body = [
+      "Example of a raw HTML comment:",
+      "",
+      "```html",
+      "<!-- literal unclosed-comment example",
+      "```",
+      "",
+      "![after](https://example.invalid/after.png)",
+    ].join("\n");
+
+    assert.equal(hasScreenshotEvidence(body), true);
+  });
+
+  it("still ignores a screenshot inside a real HTML comment", () => {
+    const body = ["<!--", "![hidden](https://example.invalid/hidden.png)", "-->"].join("\n");
+    assert.equal(hasScreenshotEvidence(body), false);
   });
 });

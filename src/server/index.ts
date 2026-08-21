@@ -16,6 +16,7 @@ import {
   armClaudeCodeBaseline,
   loadConfig,
   saveConfig,
+  getConfigDir,
   websocketsEnabled,
 } from "../config";
 import { reconcileOAuthProviders } from "../oauth";
@@ -23,15 +24,17 @@ import { withCatalogWriteSerialization } from "../codex/catalog-write-serializat
 import { invalidateCodexModelsCacheWithPermit } from "../codex/catalog/sync";
 import { getCodexHome } from "../codex/paths";
 import { desiredCodexRoutingMode, shouldSyncCodexOnStart } from "../codex/desired-state";
-import { inspectNativeCodexOwnership } from "../integrations/native/ownership-preflight";
+import {
+  inspectNativeCodexOwnership,
+  type OwnershipInspection,
+} from "../integrations/native/ownership-preflight";
 import { installedSplitBridgeAdmissionTokenPath } from "../codex/split-bridge-launchd";
 import { registerCodexCooldownRecoveryProbeWorker } from "../codex/auth-api";
-import { startMemoryWatchdog } from "./memory-watchdog";
 import {
   reconcileLiveStateStores,
   setLiveStateStoreConfig,
 } from "../lib/state-store-registrations";
-import { startStateStoreSweeper } from "../lib/state-store-sweeper";
+import { startUserCostOverlayReconciler } from "../usage/user-cost-overlay-reconciler";
 import {
   configureAppOwnedMemoryBudget,
   enforceAppOwnedMemoryBudget,
@@ -42,19 +45,26 @@ import {
   registerDefaultAppOwnedMemoryStores,
   registerDefaultAppOwnedObservedBuffers,
 } from "../lib/app-owned-memory-stores";
-import { setStorageCleanupPolicyLiveSink } from "../storage/policy";
-import { setStorageCleanupPolicyJobLiveApply } from "../storage/policy-job";
-import { scheduleStorageCleanupStartupRun, startStorageCleanupScheduler } from "../storage/policy-scheduler";
+import { acquireServerBackgroundLifecycle } from "./background-lifecycle";
+import { activateLab, labActivationRequired } from "../lib/lab-activation";
 import { runOpenAiTierStartupMigration } from "../providers/openai-tier-startup";
 import { runAlibabaRegionStartupMigration } from "../providers/alibaba-region-startup";
-import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers";
+import { runModelRenameStartupMigration } from "../providers/model-rename-startup";
+import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 import { providerCodexAccountMode } from "../providers/registry";
 import type { StorageCleanupPolicy } from "../types";
+import { MAX_DECOMPRESSED_BODY_BYTES } from "./request-decompress";
 import {
   CodexAccountCooldownError,
   cooldownErrorMessage,
 } from "../codex/auth-context";
 import { codexAccountNamespaceForModel } from "../codex/account-namespace-match";
+import { codexAccountNamespaceEntries, isMainCodexAccountTarget } from "../codex/account-namespaces";
+import { MAIN_CODEX_ACCOUNT_ID } from "../codex/main-account";
+import {
+  availableAccountGatedNativeModels,
+  resolveCodexModelEntitlements,
+} from "../codex/model-entitlements";
 export {
   clearThreadAccountMap,
   formatCodexProviderForLog,
@@ -93,7 +103,6 @@ import {
   addFinalRequestLog,
   hydrateRequestLogsFromDisk,
   httpStatusForRequestLogTerminal,
-  httpStatusForTerminalStatus,
   inspectResponseLogSsePayload,
   nextRequestLogId,
   recordFirstOutput,
@@ -171,6 +180,7 @@ import { buildDesktop3pRegistry } from "../claude/desktop-3p";
 import { runClaudeAuthModeMigration } from "../claude/auth-mode-migration";
 import {
   bindNativeMainStartupLifecycle,
+  blockNativeMainStartupForUnownedServiceHome,
   releaseNativeMainStartupLifecycle,
   startNativeMainStartupLifecycle,
   type NativeMainStartupGateDeps,
@@ -194,12 +204,44 @@ import {
   createLocalAttestationSecret,
 } from "../lib/local-management-attestation";
 import { SYSTEM_RESTART_CAPABILITY_VERSION } from "../lib/system-restart-contract";
+import { LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION } from "../lib/local-provider-reload-contract";
 import { createReadinessGate, type ReadinessGate } from "./readiness";
 
-const MAX_WS_FRAME_BYTES = 50 * 1024 * 1024;
+export const MAX_WS_FRAME_BYTES = 50 * 1024 * 1024;
 const WEBSOCKET_IDLE_TIMEOUT_SECONDS = 0;
 const LIVE_SIDEBAND_PENDING_MAX = 32;
+const LIVE_SIDEBAND_PENDING_BYTES_MAX = 1024 * 1024;
 const LIVE_SIDEBAND_CLOSE_FALLBACK_MS = 1_000;
+
+export function exceedsLiveSidebandFrameByteLimit(frameBytes: number): boolean {
+  return frameBytes > MAX_WS_FRAME_BYTES;
+}
+
+export function exceedsLiveSidebandPendingByteLimit(pendingBytes: number, incomingBytes: number): boolean {
+  return incomingBytes > LIVE_SIDEBAND_PENDING_BYTES_MAX - pendingBytes;
+}
+
+function webSocketFrameBytes(frame: string | ArrayBuffer | ArrayBufferView | Blob | Buffer): number {
+  if (typeof frame === "string") return Buffer.byteLength(frame);
+  if (frame instanceof ArrayBuffer || ArrayBuffer.isView(frame)) return frame.byteLength;
+  return frame.size;
+}
+
+export type LiveSidebandPendingEnqueueResult = "queued" | "too-many-frames" | "too-many-bytes";
+
+export function enqueueLiveSidebandPendingFrame(
+  data: Pick<WsData, "livePending" | "livePendingBytes">,
+  frame: string | Buffer,
+  frameBytes = webSocketFrameBytes(frame),
+): LiveSidebandPendingEnqueueResult {
+  const pending = data.livePending ?? (data.livePending = []);
+  if (pending.length >= LIVE_SIDEBAND_PENDING_MAX) return "too-many-frames";
+  const pendingBytes = data.livePendingBytes ?? 0;
+  if (exceedsLiveSidebandPendingByteLimit(pendingBytes, frameBytes)) return "too-many-bytes";
+  pending.push(frame);
+  data.livePendingBytes = pendingBytes + frameBytes;
+  return "queued";
+}
 
 type LiveSidebandWebSocketFactory = (
   url: string,
@@ -211,6 +253,22 @@ function releaseLiveSidebandAdmission(ws: ServerWebSocket<WsData>): void {
   ws.data.liveTurnAdmissionLease = undefined;
 }
 
+/**
+ * Send one live-sideband frame to the upstream socket.
+ *
+ * Bun's `WebSocket.send` accepts `string | Blob | BufferSource`, but the DOM-lib
+ * `Buffer` can be backed by a `SharedArrayBuffer`, which `BufferSource` rejects.
+ * `Uint8Array.from` copies into a fresh `ArrayBuffer`-backed view, so a frame
+ * arriving from `node:buffer` still round-trips byte-for-byte.
+ */
+function sendUpstreamFrame(upstream: WebSocket, frame: string | Buffer): void {
+  if (typeof frame === "string") {
+    upstream.send(frame);
+    return;
+  }
+  upstream.send(Uint8Array.from(frame));
+}
+
 function finalizeLiveSideband(ws: ServerWebSocket<WsData>, upstream?: WebSocket): void {
   if (upstream && ws.data.liveUpstream !== upstream) return;
   if (ws.data.liveCloseFallback !== undefined) {
@@ -219,6 +277,7 @@ function finalizeLiveSideband(ws: ServerWebSocket<WsData>, upstream?: WebSocket)
   }
   ws.data.liveUpstream = undefined;
   ws.data.livePending = undefined;
+  ws.data.livePendingBytes = undefined;
   ws.data.cancel = undefined;
   releaseLiveSidebandAdmission(ws);
 }
@@ -243,7 +302,10 @@ function armLiveSidebandCloseFallback(ws: ServerWebSocket<WsData>, upstream: Web
     // close event. That is still an observed CLOSED transport and is safe to
     // finalize. CONNECTING/CLOSING peers keep the lease so profile switching
     // fails at its own bounded drain deadline instead of racing live traffic.
-    if (upstream.readyState === WebSocket.CLOSED) finalizeLiveSideband(ws, upstream);
+    // The earlier CLOSED check narrowed `readyState` to 0|1|2 in the type
+    // system, but the socket can still transition to CLOSED (3) before this
+    // fallback fires; the cast keeps the runtime-identical check.
+    if ((upstream.readyState as number) === 3) finalizeLiveSideband(ws, upstream);
   }, LIVE_SIDEBAND_CLOSE_FALLBACK_MS);
 }
 
@@ -251,9 +313,12 @@ function closeLiveSideband(ws: ServerWebSocket<WsData>, code = 1000, reason = ""
   if (ws.data.liveClosing) return;
   ws.data.liveClosing = true;
   ws.data.livePending = undefined;
+  ws.data.livePendingBytes = undefined;
   ws.data.cancel = undefined;
   const upstream = ws.data.liveUpstream;
-  if (!upstream || upstream.readyState === WebSocket.CLOSED) {
+  // Bun's `WebSocket` type narrows `readyState` to 0|1|2 even though the DOM
+  // constant CLOSED is 3; the numeric literal is the runtime-identical check.
+  if (!upstream || upstream.readyState === 3) {
     finalizeLiveSideband(ws, upstream);
   } else {
     // The sideband holds a native-main admission lease. Do not release it just
@@ -304,9 +369,10 @@ function attachLiveSidebandUpstream(
     ws.data.liveOpened = true;
     const pending = ws.data.livePending ?? [];
     ws.data.livePending = undefined;
+    ws.data.livePendingBytes = undefined;
     for (const frame of pending) {
       try {
-        upstream.send(frame);
+        sendUpstreamFrame(upstream, frame);
       } catch {
         closeLiveSideband(ws, 1011, "upstream send failed");
         return;
@@ -316,6 +382,10 @@ function attachLiveSidebandUpstream(
   upstream.addEventListener("message", (event) => {
     if (ws.data.liveUpstream !== upstream || ws.data.liveClosing) return;
     try {
+      if (exceedsLiveSidebandFrameByteLimit(webSocketFrameBytes(event.data))) {
+        closeLiveSideband(ws, 1009, "message too large");
+        return;
+      }
       logLiveSidebandFrame("u2c", event.data);
       if (typeof event.data === "string") ws.send(event.data);
       else if (event.data instanceof ArrayBuffer) ws.send(event.data);
@@ -355,6 +425,8 @@ function attachLiveSidebandUpstream(
 // upstream cannot hold Codex open after response.completed; darwin no-rewrite traffic
 // requires explicit config-eager opt-in (`auto` always stays tee on darwin).
 // selectEagerPath(process.platform, needsClientRewrite, config.streamMode ?? "auto")
+// Codex upstream WS runtime gating and the forced bounded single-reader branch
+// are owned by responses/ws-upstream.ts and responses/core.ts respectively.
 // relaySseEagerBounded(upstreamResponse.body, turnAc,
 // new Response(eagerBody,
 // Default shape (tee + background inspection):
@@ -376,6 +448,8 @@ export interface StartServerDeps {
   managementApi?: ManagementApiDeps;
   /** Test-only native-main recovery dependencies; production constructs the normal manager. */
   nativeMainStartup?: NativeMainStartupGateDeps;
+  /** Test-only ownership evidence; production inspects the installed service state. */
+  inspectNativeCodexOwnership?: typeof inspectNativeCodexOwnership;
   /** Test-only seam for an upstream that cannot complete its WebSocket close handshake. */
   liveSidebandWebSocketFactory?: LiveSidebandWebSocketFactory;
   /** Test-only seam; production derives a fresh local-attestation secret per process. */
@@ -384,6 +458,17 @@ export interface StartServerDeps {
   readinessGate?: ReadinessGate;
   /** Split activation's owner-only gateway token; omitted for legacy-local mode. */
   splitBridgeAdmissionToken?: string | null;
+}
+
+function inspectStartupOwnership(deps: StartServerDeps): OwnershipInspection {
+  try {
+    return (deps.inspectNativeCodexOwnership ?? inspectNativeCodexOwnership)();
+  } catch {
+    return {
+      ownership: "unknown",
+      reason: "service-home ownership inspection failed",
+    };
+  }
 }
 
 /*
@@ -407,9 +492,19 @@ export function consumeStartupCacheInvalidationWrite(): boolean {
   return wrote;
 }
 
+export function warnAgentTaskRecoveryStartup(config: {
+  agentTaskRecovery?: { enabled?: boolean };
+}): void {
+  if (config.agentTaskRecovery?.enabled !== true) return;
+  console.warn("⚠️  Experimental encrypted V2 task recovery is enabled.");
+  console.warn("   A scoped cache miss may send an additional authenticated request to ChatGPT and may consume quota or add latency; concurrent misses can share one request.");
+  console.warn("   Recovered plaintext assignment data is retained only in a bounded, process-local in-memory cache; exact fidelity is not guaranteed and the path depends on undocumented backend behavior.");
+}
+
 export function startServer(port?: number, deps: StartServerDeps = {}): Server<WsData> {
   const localAttestationSecret = deps.localAttestationSecret ?? createLocalAttestationSecret();
-  const config = runAlibabaRegionStartupMigration(runOpenAiTierStartupMigration(loadConfig()));
+const config = runModelRenameStartupMigration(runAlibabaRegionStartupMigration(runOpenAiTierStartupMigration(loadConfig())));
+  warnAgentTaskRecoveryStartup(config);
   const splitModeActive = desiredCodexRoutingMode(config) === "split";
   const configuredSplitBridgeAdmissionToken = splitModeActive
     ? deps.splitBridgeAdmissionToken === undefined
@@ -428,6 +523,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   applyProxyEnv(config);
   assertServerAuthConfig(config);
   const managementAuth = deps.managementAuthState ?? initializeManagementAuthState(config);
+  let userCostOverlayReconciler: { stop(): void } | null = null;
   // Arm synchronously before listen. A pending journal therefore makes __main__ unusable
   // before any request can resolve its physical credential, while health/management/Pool stay live.
   // Refresh OAuth provider presets (models/noReasoningModels) from the registry so a proxy update
@@ -463,21 +559,28 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       if (migrated) saveConfig(config);
     }
   }
+  // Resolve unattended service-home authority before any Codex lock, cache, owner,
+  // journal, or credential path. Both positive foreign evidence and an unprovable
+  // ownership state are non-authority.
+  startupCacheInvalidationWrote = false;
+  const startupCacheOwnership = inspectStartupOwnership(deps);
   // Startup cache invalidation is best-effort and must never block the server from
   // serving. It now takes K so it cannot race a convergence commit, but both the
   // home resolution and the acquisition can fail on a machine with no Codex home —
   // `getCodexHome()` THROWS when CODEX_HOME names a missing directory, which would
   // otherwise turn "no Codex installed" into "proxy will not start".
-  try {
-    const startupCodexHome = getCodexHome();
-    // #1046: record whether this actually rewrote the cache. `handleStart` ORs this
-    // with the later startup sync and warns ONCE about stale app-servers; warning
-    // here instead would read a catalog mtime the sync is about to move.
-    const outcome = withCatalogWriteSerialization(startupCodexHome, permit =>
-      invalidateCodexModelsCacheWithPermit(permit, startupCodexHome));
-    // A refused permit is not a write; only a completed run that returned true is.
-    startupCacheInvalidationWrote = outcome.kind === "completed" && outcome.value === true;
-  } catch { /* no readable Codex home: nothing to invalidate */ }
+  if (startupCacheOwnership.ownership === "owned") {
+    try {
+      const startupCodexHome = getCodexHome();
+      // #1046: record whether this actually rewrote the cache. `handleStart` ORs this
+      // with the later startup sync and warns ONCE about stale app-servers; warning
+      // here instead would read a catalog mtime the sync is about to move.
+      const outcome = withCatalogWriteSerialization(startupCodexHome, permit =>
+        invalidateCodexModelsCacheWithPermit(permit, startupCodexHome));
+      // A refused permit is not a write; only a completed run that returned true is.
+      startupCacheInvalidationWrote = outcome.kind === "completed" && outcome.value === true;
+    } catch { /* no readable Codex home: nothing to invalidate */ }
+  }
   // Arm the `claudeCode` hand-edit guard (devlog 260726_claude_auth_auto/040 H1) BEFORE
   // the server can serve a request, and AFTER the startup migrations above — those run
   // against a config nobody else holds and are the documented exception to the save
@@ -488,16 +591,12 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   // usage.jsonl already persists every request; rehydrate the in-memory Logs ring so
   // /api/logs (and the GUI) survive `ocx stop` / `ocx start` process restarts.
   hydrateRequestLogsFromDisk();
-  // #314: warn-only RSS observability (unref'd, idempotent — safe under repeated
-  // startServer(0) in tests). Snapshot surfaces via GET /api/system/memory.
-  startMemoryWatchdog();
   registerDefaultAppOwnedMemoryStores();
   registerDefaultAppOwnedObservedBuffers();
   registerAppOwnedMemorySweepFallback();
   configureAppOwnedMemoryBudget(resolveAppOwnedMemoryBudgetBytes(config.appOwnedMemoryBudgetMb));
   enforceAppOwnedMemoryBudget();
   registerCodexCooldownRecoveryProbeWorker(config);
-  startStateStoreSweeper();
   // Issue #42 Phase 3: opt-in archived auto-cleanup (default OFF). Unref'd hourly
   // tick for daily/weekly; startup evaluation is fire-and-forget after listen.
   // Heavy work runs in a Worker via the single-flight job controller.
@@ -505,9 +604,6 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   const applyPolicy = (policy: StorageCleanupPolicy) => {
     config.storageCleanupPolicy = policy;
   };
-  setStorageCleanupPolicyLiveSink(applyPolicy);
-  setStorageCleanupPolicyJobLiveApply(applyPolicy);
-  startStorageCleanupScheduler();
 
   const listenPort = port ?? config.port ?? 10100;
   setCorsOrigin(listenPort);
@@ -559,6 +655,13 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     }
     if (path === "/v1/responses/compact") return req.method === "POST";
     if (path === "/v1/models") return req.method === "GET";
+    // Standalone realtime voice sessions (codex-rs thread/realtime/start, WebSocket
+    // transport) — a directly-spawned `codex app-server` needs these for desktop
+    // voice the same way it needs /v1/responses. WebSocket upgrades only; plain
+    // HTTP on these paths stays rejected.
+    if (path === "/v1/realtime" || path === "/v1/live") {
+      return req.headers.get("upgrade")?.toLowerCase() === "websocket";
+    }
     return false;
   }
 
@@ -643,10 +746,20 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   // CODEX_HOME. When the user has disabled the Codex integration, starting the
   // proxy must not manufacture those Codex artifacts merely to serve other
   // clients; no Codex request can use this lifecycle in that state.
-  const nativeOwnership = inspectNativeCodexOwnership();
+  // Re-probe here instead of trusting the earlier cache decision: startup work
+  // between the two sites must not widen the service-install race.
+  const nativeOwnership = inspectStartupOwnership(deps);
   const nativeMainLifecycle: NativeMainStartupLifecycle = shouldSyncCodexOnStart(config)
-    && nativeOwnership.ownership !== "foreign"
-    ? startNativeMainStartupLifecycle(deps.nativeMainStartup)
+    ? nativeOwnership.ownership === "owned"
+      ? startNativeMainStartupLifecycle(deps.nativeMainStartup)
+      : blockNativeMainStartupForUnownedServiceHome(
+        nativeOwnership.ownership === "foreign" ? "foreign-ownership" : "ownership-unknown",
+        // #2108: an `unknown` verdict means the probe could not answer, not that this host
+        // is unownable. Hand the fence a way to re-ask so a host that becomes answerable
+        // after boot reopens on its own instead of needing `ocx restart`. A `foreign`
+        // verdict ignores this by design — that one is a fact, not a question.
+        { reprobe: () => inspectStartupOwnership(deps).ownership },
+      )
     : {
       homeId: null,
       settled: Promise.resolve({ status: "ready", homeId: null }),
@@ -654,9 +767,17 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     };
   let server: Server<WsData>;
   let loopbackServer: Server<WsData> | null = null;
+  let backgroundLifecycle: ReturnType<typeof acquireServerBackgroundLifecycle> | null = null;
   try {
+    backgroundLifecycle = acquireServerBackgroundLifecycle(applyPolicy);
+    // External `ocx config set` / direct config.json edits run in other
+    // processes; poll the file so Logs/Usage display prices follow them live.
+    // Started inside the guarded startup transaction so the catch below can
+    // release the owner-scoped lease on any listener failure.
+    userCostOverlayReconciler = startUserCostOverlayReconciler({ liveConfig: config });
     const serveOptions = {
       idleTimeout: 255,
+      maxRequestBodySize: MAX_DECOMPRESSED_BODY_BYTES,
       async fetch(req: Request, requestServer: Server<WsData>): Promise<Response> {
       // The unauthenticated loopback listener (#1102) serves a fixed allowlist and nothing
       // else. Rejecting here, before any handler runs, is what keeps the surface from growing
@@ -759,6 +880,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           pid: process.pid,
           port: healthPort,
           restartCapability: SYSTEM_RESTART_CAPABILITY_VERSION,
+          providerReloadCapability: LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION,
         }, 200, req, policy);
         const challenge = req.headers.get(LOCAL_ATTESTATION_CHALLENGE_HEADER);
         if (challenge) {
@@ -831,8 +953,12 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           return withCors(formatErrorResponse(403, "origin_rejected", "cross-origin data-plane request blocked"), req, policy);
         }
         let goModels;
+        let modelEntitlements;
         try {
-          goModels = await fetchAllModels(config);
+          [goModels, modelEntitlements] = await Promise.all([
+            fetchAllModels(config),
+            resolveCodexModelEntitlements(config),
+          ]);
         } catch (error) {
           if (error instanceof CatalogGatherBusyError) {
             return withCors(new Response(JSON.stringify({ error: { type: "server_error", code: "catalog_busy", message: error.message } }), {
@@ -842,15 +968,58 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           }
           throw error;
         }
-        const { applyNativeVisibility, buildCatalogEntries, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, orderForSubagents, filterCatalogVisibleModels, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../codex/catalog");
+        const { accountBoundNativeOpenAiSlugsBySelector, applyNativeVisibility, buildCatalogEntries, configuredNativeAliasSlugs, desktopAllowlistSuppressedNativeSlugs, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeContextLimits, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, orderForSubagents, filterCatalogVisibleModels, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../codex/catalog");
+        const { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } = await import("../codex/catalog/native-models");
         const includeNativeOpenAi = shouldIncludeNativeOpenAi(config);
         const includeAccountBoundNativeOpenAi = shouldIncludeAccountBoundNativeOpenAi(config);
-        const nativeSlugs = includeNativeOpenAi ? nativeOpenAiSlugs() : [];
+        const bareEligibleAccountIds = providerCodexAccountMode(
+          OPENAI_CODEX_PROVIDER_ID,
+          config.providers[OPENAI_CODEX_PROVIDER_ID],
+        ) === "direct" ? new Set([MAIN_CODEX_ACCOUNT_ID]) : undefined;
+        const availableBareGatedNativeSlugs = availableAccountGatedNativeModels(
+          modelEntitlements,
+          bareEligibleAccountIds,
+        );
+        const availableAccountGatedNativeSlugs = availableAccountGatedNativeModels(modelEntitlements);
+        const availableBareNativeSlugs = NATIVE_OPENAI_MODELS.filter(slug => (
+          !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableBareGatedNativeSlugs.has(slug)
+        ));
+        const availableAccountNativeSlugs = NATIVE_OPENAI_MODELS.filter(slug => (
+          !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableAccountGatedNativeSlugs.has(slug)
+        ));
+        const nativeSlugs = includeNativeOpenAi
+          ? nativeOpenAiSlugs().filter(slug => (
+              !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableBareGatedNativeSlugs.has(slug)
+            ))
+          : [];
         const disabledNatives = disabledNativeSlugs(config);
         const disabledModels = new Set(config.disabledModels ?? []);
+        const shadowedNativeSlugs = configuredNativeAliasSlugs(config);
+        const suppressedBareNativeSlugs = new Set([
+          ...desktopAllowlistSuppressedNativeSlugs(config),
+          ...[...ACCOUNT_GATED_NATIVE_OPENAI_MODELS].filter(slug => !availableBareGatedNativeSlugs.has(slug)),
+        ]);
         const accountSelectors = includeAccountBoundNativeOpenAi
           ? visibleCodexAccountSelectors(config)
           : [];
+        const accountTargets = new Map(codexAccountNamespaceEntries(config));
+        const accountNativeSlugsBySelector = includeAccountBoundNativeOpenAi
+          ? new Map([...accountBoundNativeOpenAiSlugsBySelector(config)].map(([selector, slugs]) => {
+            const target = accountTargets.get(selector);
+            const accountId = target && isMainCodexAccountTarget(target) ? MAIN_CODEX_ACCOUNT_ID : target;
+            const entitled = accountId ? modelEntitlements.modelsByAccount.get(accountId) : undefined;
+            const confirmed = accountId ? modelEntitlements.confirmedAccountIds.has(accountId) : false;
+            return [selector, slugs.filter(slug => (
+              !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || (confirmed && entitled?.has(slug) === true)
+            ))] as const;
+          }))
+          : new Map<string, readonly string[]>();
+        const accountNativeSlugs = [...new Set(
+          [...accountNativeSlugsBySelector.values()].flatMap(slugs => [...slugs]),
+        )];
+        const desktopNativeSlugs = desktopVisibleNativeSlugs(config).filter(slug => (
+          !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableBareGatedNativeSlugs.has(slug)
+        ));
         const goEnabled = filterCatalogVisibleModels(goModels, config);
         const goOrdered = orderForSubagents(goEnabled, config.subagentModels);
         // Claude Code / Claude Desktop gateway model discovery (GET /v1/models with
@@ -867,7 +1036,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           if (config.claudeCode?.enabled === false) return jsonResponse({ data: [] }, 200, req, policy);
           // Build Desktop 3P registry so inbound alias resolution works for subsequent requests.
           buildDesktop3pRegistry(
-            [...desktopVisibleNativeSlugs(config)],
+            desktopNativeSlugs,
             goOrdered.map(m => ({ provider: m.provider, id: m.id, contextWindow: m.contextWindow })),
             config.claudeCode?.desktopProfile,
           );
@@ -884,7 +1053,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             : idsParam === "desktop"
               ? "desktop3p" as const
               : (/^claude-code\//i.test(req.headers.get("user-agent") ?? "") ? "readable" as const : "desktop3p" as const);
-          const data = buildAnthropicModelInfos([...desktopVisibleNativeSlugs(config)], goOrdered, resolveAutoContext(config.claudeCode), idStyle, activeDesktop3pAlias);
+          const data = buildAnthropicModelInfos(desktopNativeSlugs, goOrdered, resolveAutoContext(config.claudeCode), idStyle, activeDesktop3pAlias, nativeContextLimits(config));
           return jsonResponse({ data }, 200, req, policy);
         }
         if (url.searchParams.has("client_version")) {
@@ -898,14 +1067,33 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           // newly re-enabled native reappear under each selector before the next sync, while the
           // no-selector path keeps nativeOpenAiSlugs()'s existing visibility-sensitive behavior.
           const catalogNativeSlugs = accountSelectors.length > 0
-            ? NATIVE_OPENAI_MODELS
+            ? [...new Set([
+              ...availableAccountNativeSlugs,
+              ...accountNativeSlugs,
+            ])]
             : nativeSlugs;
-          const entries = buildCatalogEntries(loadCatalogTemplate(), catalogNativeSlugs, goOrdered, config.subagentModels, websocketsEnabled(config), maMode as "v1" | "default" | "v2", exactComboCatalogSlugs(config), accountSelectors);
+          const entries = buildCatalogEntries(
+            loadCatalogTemplate(),
+            catalogNativeSlugs,
+            goOrdered,
+            config.subagentModels,
+            websocketsEnabled(config),
+            maMode as "v1" | "default" | "v2",
+            exactComboCatalogSlugs(config),
+            accountSelectors,
+            suppressedBareNativeSlugs,
+            new Set(),
+            nativeContextLimits(config),
+            accountNativeSlugs,
+            accountNativeSlugsBySelector,
+            config.keepNativeChatGptOnV1 === true,
+          );
           return jsonResponse({
             models: applyNativeVisibility(
               entries,
               disabledModels,
               accountSelectors.length > 0,
+              new Set(accountNativeSlugs),
             ),
           }, 200, req, policy);
         }
@@ -949,13 +1137,18 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         // for both bare and qualified rows. Without selectors, the live catalog continues to own
         // bare availability.
         const selectorNativeSlugs = accountSelectors.length > 0
-          ? NATIVE_OPENAI_MODELS.filter(slug => !disabledNatives.has(slug))
+          ? availableBareNativeSlugs.filter(slug => !disabledNatives.has(slug))
+          : [];
+        const bareSelectorNativeSlugs = accountSelectors.length > 0
+          ? selectorNativeSlugs
           : [];
         const visibleNatives = includeNativeOpenAi
-          ? accountSelectors.length > 0 ? selectorNativeSlugs : visibleNativeSlugs(config)
+          ? accountSelectors.length > 0
+            ? bareSelectorNativeSlugs.filter(slug => !shadowedNativeSlugs.has(slug))
+            : visibleNativeSlugs(config)
           : [];
         const visibleAccountNatives = accountSelectors.flatMap(selector =>
-          selectorNativeSlugs.flatMap(metadataId => {
+          (accountNativeSlugsBySelector.get(selector) ?? []).filter(metadataId => !disabledNatives.has(metadataId)).flatMap(metadataId => {
             const id = `${selector}/${metadataId}`;
             return disabledModels.has(id) ? [] : [{ id, metadataId }];
           })
@@ -997,7 +1190,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         return runAdmittedHttpTurn(req, policy, async turnAdmissionLease => {
           let response: Response;
           try {
-            response = await handleResponsesCompact(req, config, logCtx, turnAdmissionLease, splitBridgeAccountSelector(req));
+response = await handleResponsesCompact(req, config, logCtx, turnAdmissionLease, admission);
           } catch {
             response = formatErrorResponse(500, "server_error", "Unexpected compact request failure");
           }
@@ -1091,7 +1284,6 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       }
 
       if (url.pathname === "/v1/responses" && req.method === "POST") {
-        disableResponsesRequestTimeout(req, requestServer);
         if (isDraining()) {
           return drainingResponse(req, policy);
         }
@@ -1108,6 +1300,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           ...admissionFields(admission),
           inboundProtocol: "responses",
         };
+        if (req.headers.get("x-opencodex-grok") === "1") logCtx.surface = "grok";
         let logged = false;
         const finalizeNativePassthroughLog = (
           status: number,
@@ -1120,11 +1313,13 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         return runAdmittedHttpTurn(req, policy, async turnAdmissionLease => {
           const response = await handleResponses(req, config, logCtx, {
             turnAdmissionLease,
+            admission,
+            onRequestBodyRead: () => disableResponsesRequestTimeout(req, requestServer),
             abortSignal: req.signal,
             requiredCodexAccountSelector: splitBridgeAccountSelector(req),
             onFirstOutput: () => recordFirstOutput(logCtx, start),
             onNativePassthroughTerminal: status => {
-              finalizeNativePassthroughLog(httpStatusForTerminalStatus(status), {
+              finalizeNativePassthroughLog(httpStatusForRequestLogTerminal(status, logCtx), {
                 terminalStatus: status,
                 closeReason: "terminal",
               });
@@ -1150,7 +1345,11 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         if (!isAllowedRequestOrigin(req, policy)) {
           return withCors(anthropicErrorResponse(403, "cross-origin data-plane request blocked", "permission_error"), req, policy);
         }
-        return runAdmittedHttpTurn(req, policy, async () => withCors(await handleClaudeCountTokens(req, config), req, policy));
+        return runAdmittedHttpTurn(req, policy, async () => withCors(
+          await handleClaudeCountTokens(req, config, policy),
+          req,
+          policy,
+        ));
       }
 
       if (url.pathname === "/v1/messages" && req.method === "POST") {
@@ -1177,9 +1376,9 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         // pre-translation stream + native passthrough callbacks) — do not re-wrap the
         // translated Anthropic stream here.
         return runAdmittedHttpTurn(req, policy, async turnAdmissionLease => withCors(
-          await handleClaudeMessages(req, config, logCtx, { requestId, start, turnAdmissionLease }),
+          await handleClaudeMessages(req, config, logCtx, { requestId, start, turnAdmissionLease }, policy),
           req,
-          config,
+          policy,
         ));
       }
 
@@ -1204,7 +1403,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           inboundProtocol: "chat",
         };
         return runAdmittedHttpTurn(req, policy, async turnAdmissionLease => withCors(
-          await handleChatCompletions(req, config, logCtx, { requestId, start, turnAdmissionLease }),
+          await handleChatCompletions(req, config, logCtx, { requestId, start, turnAdmissionLease, admission }),
           req,
           config,
         ));
@@ -1246,10 +1445,13 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         });
       }
 
-      // Voice / Realtime sideband WebSocket: Frameless joins /v1/live/{callId}; Realtime v1 joins
-      // /v1/realtime?call_id= (or /v1/realtime/calls/{callId}). Transparent bidirectional relay.
+      // Voice / Realtime WebSocket relay. Sideband joins: Frameless /v1/live/{callId};
+      // Realtime v1 /v1/realtime?call_id= (or /v1/realtime/calls/{callId}). Standalone
+      // sessions (codex-rs thread/realtime/start, WebSocket transport — the desktop voice
+      // path): /v1/realtime?intent=quicksilver&model= and /v1/live?model=.
+      // Transparent bidirectional relay.
       const liveSidebandTarget = req.headers.get("upgrade")?.toLowerCase() === "websocket"
-        ? parseLiveSidebandTarget(url.pathname, url.searchParams)
+        ? parseLiveSidebandTarget(url.pathname, url.searchParams, url.search.replace(/^\?/, ""))
         : null;
       if (liveSidebandTarget) {
         if (isDraining()) {
@@ -1288,6 +1490,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             liveUpstreamUrl: resolved.upstreamWsUrl,
             liveUpstreamHeaders: resolved.headers,
             livePending: [],
+            livePendingBytes: 0,
             liveOpened: false,
             liveTurnAdmissionLease: turnAdmissionLease,
           } satisfies WsData,
@@ -1321,6 +1524,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       return withCors(formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${url.pathname}`), req, config);
     },
     websocket: {
+      maxPayloadLength: MAX_WS_FRAME_BYTES,
       idleTimeout: WEBSOCKET_IDLE_TIMEOUT_SECONDS,
       // Responses WebSocket data plane (phase 120.2). Re-frames the same SSE pipeline onto the
       // socket: parse response.create → run handleResponses unchanged → pump its SSE body as WS
@@ -1345,15 +1549,23 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       message(ws: ServerWebSocket<WsData>, raw: string | Buffer) {
         if (ws.data.kind === "live-sideband") {
           if (ws.data.liveClosing) return;
+          const rawBytes = webSocketFrameBytes(raw);
+          if (exceedsLiveSidebandFrameByteLimit(rawBytes)) {
+            closeLiveSideband(ws, 1009, "message too large");
+            return;
+          }
           logLiveSidebandFrame("c2u", raw);
           const upstream = ws.data.liveUpstream;
           if (!upstream || upstream.readyState === WebSocket.CONNECTING || !ws.data.liveOpened) {
-            const pending = ws.data.livePending ?? (ws.data.livePending = []);
-            if (pending.length >= LIVE_SIDEBAND_PENDING_MAX) {
+            const enqueueResult = enqueueLiveSidebandPendingFrame(ws.data, raw, rawBytes);
+            if (enqueueResult === "too-many-frames") {
               closeLiveSideband(ws, 1009, "too many pending frames");
               return;
             }
-            pending.push(raw);
+            if (enqueueResult === "too-many-bytes") {
+              closeLiveSideband(ws, 1009, "too many pending bytes");
+              return;
+            }
             return;
           }
           if (upstream.readyState !== WebSocket.OPEN) {
@@ -1361,7 +1573,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             return;
           }
           try {
-            upstream.send(raw);
+            sendUpstreamFrame(upstream, raw);
           } catch {
             closeLiveSideband(ws, 1011, "upstream send failed");
           }
@@ -1458,6 +1670,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           try {
             let terminalRecorder: ((status: ResponsesTerminalStatus, httpStatusOverride?: number) => void) | undefined;
             const response = await handleResponses(req, config, logCtx, {
+              ...(wsAdmission ? { admission: wsAdmission } : {}),
               forceEmptyResponseId: true,
               inboundTransport: "websocket",
               abortSignal: turnAbort.signal,
@@ -1551,6 +1764,8 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       }
     }
   } catch (error) {
+    userCostOverlayReconciler?.stop();
+    backgroundLifecycle?.releaseAfterFailedStart();
     void nativeMainLifecycle.release();
     throw error;
   }
@@ -1569,8 +1784,14 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           ...(loopbackListenerRef
             ? [() => loopbackListenerRef.stop(closeActiveConnections)]
             : []),
+          async () => {
+            userCostOverlayReconciler?.stop();
+          },
         ],
-        () => releaseNativeMainStartupLifecycle(server),
+        async () => {
+          await backgroundLifecycle.release();
+          await releaseNativeMainStartupLifecycle(server);
+        },
       );
     },
   });
@@ -1608,13 +1829,31 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     && isCanonicalOpenAiForwardProvider(openAiProvider)
     && providerCodexAccountMode("openai", openAiProvider) === "pool"
   ) {
-    import("../codex/auth-api")
+    import("../codex/plan-from-token")
+      .then(({ reconcileCodexPlansFromTokens }) => {
+        try {
+          reconcileCodexPlansFromTokens(config);
+        } catch {
+          // Derived plan metadata must not block WHAM priming.
+        }
+        return import("../codex/auth-api");
+      })
       .then(({ primeCodexPoolQuotas }) => primeCodexPoolQuotas(config, "startup"))
       .catch(() => {});
   }
 
   // Opt-in storage policy (default OFF). Never blocks listen; cancellable on shutdown.
-  scheduleStorageCleanupStartupRun();
+  backgroundLifecycle.scheduleStartupRun();
+
+  // Compatibility Lab is optional: wire it only for installs that actually use it -- any
+  // routing profile, or automation enabled on disk. This runs synchronously before
+  // startServer returns, in the same turn as Bun.serve, so a policy route can never be
+  // evaluated before its evidence provider is registered. That ordering is load-bearing:
+  // the subagent-fallback chain routes synchronously and has nowhere to await.
+  const labConfigDir = getConfigDir();
+  if (labActivationRequired(config, labConfigDir)) {
+    activateLab(config, labConfigDir);
+  }
 
   return server;
 }

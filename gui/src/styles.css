@@ -22,6 +22,7 @@
 @import "./styles-usage-workspace.css";
 @import "./styles-claudecode-workspace.css";
 @import "./styles-apikeys-workspace.css";
+@import "./styles-compatibility-matrix.css";
 
 :root {
   /* default: follow the OS; [data-theme] below pins color-scheme so light-dark() obeys it */
@@ -383,9 +384,19 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .stop-toggle { color: var(--red); }
 .stop-toggle:hover { background: var(--red-soft); color: var(--red); }
 .stop-toggle:disabled { opacity: 0.5; cursor: default; }
+/* Proxy lifecycle actions: two circular satellites (stop, restart Codex) sharing the
+   row with a quiet label. The stop control used to be a full-width button; pairing it
+   with restart as icons keeps the foot from growing a fifth stacked row and puts the
+   destructive action next to the recovery action it is most often confused with. */
+.sidebar-action-row { display: flex; align-items: center; gap: 4px; min-width: 0; padding: 8px 10px; }
+.sidebar-action-label { flex: 1 1 auto; min-width: 0; color: var(--muted); font-size: var(--text-control); }
+.sidebar-action-orbs { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+.sidebar-orb--danger { color: var(--red); }
+.sidebar-orb--danger:hover:not(:disabled) { background: var(--red-soft); color: var(--red); border-color: var(--red); }
+.sidebar-orb:disabled { opacity: 0.5; cursor: default; }
 
 .main { min-width: 0; }
-.main-inner { max-width: 980px; margin: 0 auto; padding: 32px 36px 64px; }
+.main-inner { max-width: 980px; margin: 0 auto; padding: 32px 36px 64px; container-type: inline-size; }
 .main-inner.main-inner--combos {
   max-width: none;
   margin: 0;
@@ -425,6 +436,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 */
 .main-inner.main-inner--combos > .page-head,
 .main-inner.main-inner--combos > .page-tabs,
+.main-inner.main-inner--combos > .codex-stale-banner,
 .main-inner.main-inner--combos > .page-sub {
   flex-shrink: 0;
   padding-inline: 36px;
@@ -434,6 +446,12 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 /* ---- page header ---- */
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 6px; }
 .page-head h2 { font-size: var(--text-title); }
+/* Staleness banner: shown only when the proxy reports a running app-server older
+   than the catalog. It sits above the tab strip so it is visible on every models
+   sub-tab, not only the catalog one. */
+.page-head-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.codex-stale-banner { display: flex; align-items: center; gap: 10px; margin: 8px 0 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--raised); color: var(--text); }
+.codex-stale-banner-text { flex: 1 1 auto; min-width: 0; font-size: var(--text-control); }
 .page-sub { color: var(--muted); font-size: var(--text-body); margin: 4px 0 22px; max-width: var(--prose-measure); }
 
 /* Page-level underline tabs (Logs & Debug / Dashboard). Distinct from pill .segmented filters. */
@@ -794,8 +812,8 @@ a.btn, a.btn:hover { text-decoration: none; }
 /* Explicit column counts for balanced rows at every width */
 .stat-row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 28px; }
 .stat-row > .stat { min-height: 80px; display: flex; flex-direction: column; justify-content: center; }
-@media (max-width: 1100px) { .stat-row { grid-template-columns: repeat(3, 1fr); } }
-@media (max-width: 640px) { .stat-row { grid-template-columns: repeat(2, 1fr); } }
+@container (max-width: 820px) { .stat-row { grid-template-columns: repeat(3, 1fr); } }
+@container (max-width: 480px) { .stat-row { grid-template-columns: repeat(2, 1fr); } }
 .stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; transition: border-color var(--motion-fast); }
 .stat:hover { border-color: var(--faint); }
 .stat .label { font-size: var(--text-label); color: var(--muted); margin-bottom: 6px; display: flex; align-items: center; gap: 6px; font-weight: var(--weight-medium); }
@@ -804,6 +822,8 @@ a.btn, a.btn:hover { text-decoration: none; }
 .stat .value.mono { font-family: var(--font-code); font-size: var(--text-subtitle); }
 
 .startup-health-bar {
+  box-sizing: border-box;
+  width: 100%;
   min-height: var(--control-lg);
   margin: calc(-1 * var(--space-3)) 0 var(--space-6);
   padding: 0 var(--space-3);
@@ -813,10 +833,14 @@ a.btn, a.btn:hover { text-decoration: none; }
   min-width: 0;
   color: var(--muted);
   background: var(--hover);
+  border: none;
   border-block: 1px solid var(--border-soft);
   text-decoration: none;
+  font: inherit;
   font-size: var(--text-control);
   line-height: var(--leading-ui);
+  text-align: start;
+  cursor: pointer;
   transition: background var(--motion-fast), color var(--motion-fast);
 }
 .startup-health-bar:hover { background: var(--raised); color: var(--text); }
@@ -865,8 +889,8 @@ a.btn, a.btn:hover { text-decoration: none; }
 /* Four scalars in the shared 6-column .stat-row left a third of the panel empty
    and squeezed each figure into two lines. Give this row its own track count. */
 .mem-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 0; }
-@media (max-width: 900px) { .mem-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 520px) { .mem-stats { grid-template-columns: minmax(0, 1fr); } }
+@container (max-width: 660px) { .mem-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@container (max-width: 380px) { .mem-stats { grid-template-columns: minmax(0, 1fr); } }
 .mem-stats .stat-sub {
   font-size: var(--text-caption);
   color: var(--faint);
@@ -1164,6 +1188,45 @@ select.input { appearance: none; }
 
 .notice { font-size: var(--text-control); line-height: var(--leading-body); padding: 9px 12px; border-radius: var(--radius-sm); margin-bottom: 14px; display: flex; align-items: center; gap: 8px; max-width: var(--prose-measure); }
 .notice svg { width: 15px; height: 15px; flex-shrink: 0; }
+
+/* Portaled status toast — out of document flow so Providers (etc.) do not reflow. */
+.toast-notice-host {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 12vh 16px 16px;
+  pointer-events: none;
+}
+.toast-notice {
+  pointer-events: auto;
+  margin-bottom: 0;
+  max-width: min(var(--prose-measure), calc(100vw - 32px));
+  box-shadow: var(--shadow);
+  animation: toast-notice-in var(--motion-normal) ease-out;
+}
+.toast-notice-copy { flex: 1; min-width: 0; }
+.toast-notice-dismiss {
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  opacity: 0.7;
+  cursor: pointer;
+  font-size: 1.1rem;
+  line-height: 1;
+  padding: 0 2px;
+}
+.toast-notice-dismiss:hover { opacity: 1; }
+@keyframes toast-notice-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast-notice { animation: none; }
+}
 /* Tone pairs: ink is a shade of the tint (not gray-on-color), AA on both themes. */
 .notice-ok {
   background: light-dark(#ecfdf5, color-mix(in oklab, var(--green) 18%, var(--surface)));
@@ -1292,9 +1355,9 @@ dialog.modal-overlay::backdrop {
 .sep-line { flex: 1; height: 1px; background: var(--border); }
 .quota-compact { padding: 0 16px 10px; display: grid; gap: 4px; }
 /* Fixed slot so pending skeleton and real bars occupy the same vertical space.
-   Sized for two compact rows — a 1-bar plan must not shrink the card under settings. */
+   Sized for one compact meter row — extra windows grow the card only after fill. */
 .codex-account-quota-slot {
-  min-height: 48px;
+  min-height: 22px;
   box-sizing: border-box;
 }
 /* Display:contents so main/section/empty keep the same margins as the ready tree. */
@@ -1356,11 +1419,11 @@ dialog.modal-overlay::backdrop {
   min-width: 2.25rem;
   justify-content: center;
 }
-/* Pending skeletons must fit the same 48px slot as ready bars — otherwise main shrinks. */
+/* Pending skeletons must fit the same one-row slot as ready bars — otherwise main jumps. */
 .quota-compact--pending {
-  height: 48px;
-  min-height: 48px;
-  max-height: 48px;
+  height: 22px;
+  min-height: 22px;
+  max-height: 22px;
   overflow: hidden;
   box-sizing: border-box;
 }
@@ -1382,7 +1445,7 @@ dialog.modal-overlay::backdrop {
 .quota-skel--time { width: 34px; }
 .quota-skel--bar { width: 100%; height: 5px; align-self: center; }
 .quota-skel--val { width: 28px; justify-self: end; }
-.quota-row { display: grid; grid-template-columns: minmax(34px, max-content) 34px minmax(34px, 44px) minmax(38px, 42px) minmax(58px, 1fr) minmax(30px, max-content); align-items: center; gap: 8px; min-width: 0; }
+.quota-row { display: grid; grid-template-columns: minmax(34px, max-content) max-content minmax(34px, max-content) minmax(38px, max-content) minmax(58px, 1fr) minmax(30px, max-content); align-items: center; gap: 8px; min-width: 0; }
 .quota-label { font-size: var(--text-caption); color: var(--muted); font-weight: var(--weight-semibold); }
 .quota-val { font-size: var(--text-caption); font-family: var(--font-code); color: var(--text); text-align: right; }
 .quota-reset-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-caption); color: var(--faint); }
@@ -1435,6 +1498,40 @@ dialog.modal-overlay::backdrop {
 .codex-request-user-input-controls > .toggle { margin-left: auto; }
 .codex-request-user-input-feedback { flex: 1 0 100%; margin-top: -8px; color: var(--muted); font-size: var(--text-label); line-height: var(--leading-body); text-align: right; }
 .codex-request-user-input-feedback.is-error { color: var(--red); }
+.codex-account-picker-card { gap: 16px; flex-wrap: wrap; margin-top: 16px; }
+.codex-auth-advanced { margin-top: 8px; }
+.codex-auth-advanced__toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 2px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--text-label);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  text-align: left;
+}
+.codex-auth-advanced__toggle:hover { color: var(--text); }
+.codex-auth-advanced__chevron { transition: transform var(--motion-fast, .12s); }
+.codex-auth-advanced__chevron.is-open { transform: rotate(90deg); }
+.codex-auth-advanced__boxes { display: grid; gap: 0; }
+
+.codex-account-picker-copy { flex: 1 1 34rem; min-width: 0; }
+.codex-account-picker-copy .card-sub { padding: 4px 0 0; }
+.codex-account-picker-controls { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; margin-left: auto; }
+.codex-account-picker-feedback {
+  flex: 1 0 100%;
+  margin-top: -8px;
+  font-size: var(--text-label);
+  line-height: var(--leading-body);
+  text-align: right;
+}
+.codex-account-picker-feedback.is-ok { color: var(--green); }
+.codex-account-picker-feedback.is-warn { color: var(--amber); }
+.codex-account-picker-feedback.is-err { color: var(--red); }
 /* The toggle now lives in the slot below, which carries the auto margin itself. */
 /*
   Toggle slot: matches the height of the threshold compound so the 20px toggle centres against
@@ -1598,6 +1695,12 @@ dialog.modal-overlay::backdrop {
   white-space: nowrap;
 }
 .codex-auth-page-head__feedback.is-ok { color: var(--green); }
+.codex-auth-page-head__feedback.is-warn {
+  color: var(--amber);
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
 .codex-auth-page-head__feedback.is-err { color: var(--red); }
 .codex-auth-pause-label {
   display: inline-block;
@@ -1676,7 +1779,9 @@ dialog.modal-overlay::backdrop {
 .codex-pool-strategy-card .card-sub { padding: 0; }
 /* Inline selection-order row on an account card: label and trigger share one line, and the
    trigger is scaled down to the card's hint text so it reads as part of the card, not a form. */
-.codex-account-priority { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 0 16px 10px; min-width: 0; }
+.codex-account-identity { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 16px 6px; min-width: 0; }
+.codex-account-identity-copy { font-size: var(--text-label); line-height: var(--leading-body); color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
+.codex-account-priority { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 0; min-width: 0; flex: 0 0 auto; }
 .codex-account-priority-label { font-size: var(--text-label); color: var(--muted); font-weight: var(--weight-medium); white-space: nowrap; }
 .codex-account-priority .select-trigger { max-width: 100%; padding: 4px 9px; font-size: var(--text-label); }
 
@@ -2025,6 +2130,11 @@ button.prov-account-row.active { cursor: default; }
   }
   .mobile-topbar .brand { flex: 1 1 auto; min-width: 0; padding: 4px; }
   .mobile-topbar .stop-toggle { width: auto; min-width: 44px; min-height: 44px; justify-content: center; padding: 8px; }
+  /* Both orbs keep the 44x44 touch target the single stop button had; a bare 28px
+     .sidebar-orb would be a regression on the surface where it matters most. */
+  .mobile-topbar-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+  .mobile-topbar-actions .sidebar-orb { width: 44px; height: 44px; flex: 0 0 44px; min-width: 44px; min-height: 44px; }
+  .mobile-topbar-actions .sidebar-orb svg { width: 18px; height: 18px; }
   .menu-toggle { display: inline-flex; }
   /* drawer: the desktop sidebar kept intact (nav groups + foot + GitHub link), off-canvas */
   .sidebar {
@@ -2083,10 +2193,12 @@ button.prov-account-row.active { cursor: default; }
 .usage-segmented-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: none; background: transparent; color: var(--muted); padding: 4px 12px; border-radius: var(--radius-pill); cursor: pointer; font: inherit; white-space: nowrap; }
 .usage-segmented-btn.active { background: var(--raised); color: var(--text); font-weight: var(--weight-semibold); }
 .usage-source-mark { width: var(--icon-sm); height: var(--icon-sm); flex: 0 0 auto; object-fit: contain; }
-:root[data-theme="dark"] .usage-source-mark { filter: invert(1); }
+/* Only monochrome source marks (Grok) are inverted for dark themes. Brand-colored
+   marks (Claude, Codex/OpenAI) must keep their brand color; inverting shifts the hue. */
+:root[data-theme="dark"] .usage-source-mark--mono { filter: invert(1); }
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .usage-source-mark { filter: invert(1); }
+  :root:not([data-theme="light"]) .usage-source-mark--mono { filter: invert(1); }
 }
 
 @media (max-width: 760px) {

@@ -12,10 +12,11 @@ description: 리스너, 원격 접근, admission 키, 타임아웃, 저장소, �
 | `port` | `number` | `10100` | 프록시 수신 포트입니다. |
 | `hostname?` | `string` | `"127.0.0.1"` | 바인드 주소입니다. 루프백이 아닌 바인드에는 `OPENCODEX_API_AUTH_TOKEN`이 필요합니다. |
 | `proxy?` | `string` | — | 송신용 HTTP(S) 프록시 URL 또는 `${ENV_VAR}`입니다. 해당 변수가 비어 있을 때만 `HTTP_PROXY` / `HTTPS_PROXY`에 적용되며, 루프백은 `NO_PROXY`에 그대로 남습니다. |
+| `emptyCompletionRetry?` | `boolean` | `false` | 텍스트나 도구 호출 없이 완료된 Responses 요청을 한 번 동일하게 재시도하도록 선택합니다. 재시도에는 비용이 발생할 수 있습니다. `OCX_EMPTY_COMPLETION_RETRY=0`은 설정을 바꾸지 않고 비활성화하며, combo 및 routed-compaction turn은 제외됩니다. |
 | `stallTimeoutSec?` | `number` | `300` | 업스트림 데이터가 없을 때 `response.incomplete`가 되기까지의 초 수입니다. 최소 1입니다. |
 | `connectTimeoutMs?` | `number` | `200000` | 시도별 DNS/TCP/TLS/최종 헤더 기한입니다. 본문 생성 전에 끝납니다. |
 | `shutdownTimeoutMs?` | `number` | `5000` | 진행 중인 turn을 중단하기 전에 허용하는 정상 종료 드레인 기한입니다. |
-| `websockets?` | `boolean` | `false` | Responses WebSocket 경로에 `supports_websockets`를 광고합니다. `false`이면 HTTP/SSE를 유지합니다. |
+| `websockets?` | `boolean` | `false` | 클라이언트용 Responses WebSocket 경로를 광고하고 허용합니다. `false`이면 클라이언트는 HTTP/SSE를 사용하며, 적격 canonical ChatGPT 업스트림 WS 최적화는 비활성화하지 않습니다. |
 | `corsAllowOrigins?` | `string[]` | `[]` | CORS에서 추가로 허용할 정확한 origin입니다. 루프백 origin은 항상 허용됩니다. `chrome-extension://<extension-id>` 같은 authority 기반 브라우저 확장 origin을 지원하며, `*`는 와일드카드가 아닙니다. Firefox와 Safari는 확장 UUID를 (설치/브라우저 실행 때마다) 새로 만드므로 origin이 바뀌면 항목을 갱신하세요. |
 | `apiKeys?` | `OcxApiKey[]` | `[]` | 비루프백 바인드에서 관리 API와 데이터 플레인 인증이 허용하는 생성된 `ocx_…` 자격 증명입니다. 대시보드에서 관리합니다. |
 | `storageCleanupPolicy?` | `StorageCleanupPolicy` | disabled | 선택적으로 활성화하는 보관 세션 정리 정책입니다. 절대 암묵적으로 활성화되지 않습니다. |
@@ -50,9 +51,15 @@ x-opencodex-api-key: your-secret-token
 | `/v1/responses` | 허용되지 않음 | **필수** | 허용되지 않음 |
 | `/v1/chat/completions` | 허용되지 않음 | **필수** | 허용되지 않음 |
 | `/v1/messages` | 허용됨 | 허용됨 | 허용됨 |
+| `/v1/messages/count_tokens` | 허용됨 | 허용됨 | 허용됨 |
 | `/v1/models` | 허용됨 | 허용됨 | 허용됨 |
 
 Responses와 Chat Completions는 `Authorization`을 향후 Codex Direct 패스스루 용도로 예약해 두므로, 여기서는 전용 admission 헤더만 허용됩니다. 대시보드에서 생성한 `apiKeys`는 시작 후 환경 토큰을 대체할 수 있으며, 후보 값은 상수 시간으로 비교합니다.
+
+Messages와 `count_tokens`는 라우팅 클라이언트 호환성을 위해 세 admission 형식을 계속 허용합니다. 하지만 비루프백
+바인드의 네이티브 Anthropic 패스스루는 프록시 admission을 `x-opencodex-api-key`로만 받고,
+`Authorization`과 `x-api-key`를 Anthropic 자격 증명용으로 예약합니다. 이 provider 헤더에 들어간
+프록시 admission secret은 upstream 전달 전에 제거됩니다.
 
 :::caution[LAN exposure]
 `0.0.0.0` 바인드는 프록시와 설정된 provider 접근을 LAN에 노출합니다. 신뢰할 수 있는 네트워크에서 강한 토큰과 함께만 사용합니다.
@@ -84,7 +91,7 @@ ssh -L 20100:localhost:10100 -L 1455:localhost:1455 you@remote
 
 ## Claude Code (`claudeCode`)
 
-이 설정은 `/v1/messages`, `ocx claude` 실행기, 그리고 Claude 대시보드 페이지를 제어합니다.
+이 설정은 `/v1/messages`, `/v1/messages/count_tokens`, `ocx claude` 실행기, 그리고 Claude 대시보드 페이지를 제어합니다.
 
 | 키 | 형식 | 기본값 | 설명 |
 | --- | --- | --- | --- |
@@ -144,9 +151,10 @@ OpenAI 백엔드는 ChatGPT 로그인과 활성화된 ChatGPT `forward` provider
 | `enabled?` | `boolean` | on when usable | 주 이미지 설명 스위치입니다. |
 | `backend?` | `"openai" \| "anthropic"` | auto | web search와 같은, 명시값 우선 및 Anthropic 자격 증명 인식 선택 방식입니다. |
 | `model?` | `string` | backend-dependent | OpenAI는 `gpt-5.4-mini`, Anthropic은 `claude-sonnet-5`입니다. |
+| `reasoning?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `"low"` | OpenAI Responses 추론 강도입니다. Anthropic은 무시합니다. |
 | `maxDescriptionsPerTurn?` | `number` | `8` | 메인 턴당 허용되는 새 설명 캐시 미스 수입니다. `0`이면 호출이 비활성화되며, 잘못된 값은 기본값을 사용합니다. |
-| `timeoutMs?` | `number` | `45000` | 사이드카 fetch 제한 시간입니다. |
+| `timeoutMs?` | `number` | `45000` | 사이드카 fetch 제한 시간입니다. 정수 1–2147483647. |
 
-Vision은 provider의 `noVisionModels`에 속한 모델로 보낸 이미지에만 활성화됩니다. OpenAI는 검색과 같은 로그인/forward 요건을 갖고 있으며, 명시적으로 선택한 Anthropic은 사용할 수 있는 자격 증명이 없으면 닫힌 상태로 실패합니다. 성공한 `data:` 설명은 backend, model, detail, image bytes, 그리고 정규화된 메시지 컨텍스트를 키로 하는 bounded cache를 사용합니다. 히트와 같은 턴의 중복은 한도를 소모하지 않습니다. 원격 `https:` 이미지와 실패했거나 비어 있는 설명은 캐시하지 않습니다.
+지원되는 수준은 업스트림 제공자의 역량과 선택한 모델이 공개한 추론 사다리에 따라 제한됩니다. Vision은 provider의 `noVisionModels`에 속한 모델로 보낸 이미지에만 활성화됩니다. OpenAI는 검색과 같은 로그인/forward 요건을 갖고 있으며, 명시적으로 선택한 Anthropic은 사용할 수 있는 자격 증명이 없으면 닫힌 상태로 실패합니다. 성공한 `data:` 설명은 backend, model, detail, image bytes, 그리고 정규화된 메시지 컨텍스트를 키로 하는 bounded cache를 사용합니다. OpenAI 키에는 reasoning effort도 포함됩니다(Anthropic 키에는 없습니다). 히트와 같은 턴의 중복은 한도를 소모하지 않습니다. 원격 `https:` 이미지와 실패했거나 비어 있는 설명은 캐시하지 않습니다.
 
 Anthropic OAuth 사이드카는 opencodex의 기존 Claude Code OAuth fingerprint를 재사용합니다. 의도한 계정과 워크로드로 소크 테스트를 수행합니다.

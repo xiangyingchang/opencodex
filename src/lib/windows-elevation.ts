@@ -21,6 +21,13 @@ type TrustedSystemDirectoryResolver = () => string;
 type IsUserAnAdmin = () => number;
 type WindowsElevationProbe = () => boolean | null;
 
+export class WindowsSystemDirectoryFfiUnavailableError extends Error {
+  constructor() {
+    super("Failed to load GetSystemDirectoryW from kernel32.dll.");
+    this.name = "WindowsSystemDirectoryFfiUnavailableError";
+  }
+}
+
 let getSystemDirectoryWFn: GetSystemDirectoryW | null | undefined;
 let trustedSystemDirectoryResolverForTests: TrustedSystemDirectoryResolver | null = null;
 let isUserAnAdminFn: (() => boolean) | null | undefined;
@@ -114,7 +121,7 @@ export function resolveTrustedWindowsSystemDirectory(): string {
   }
   const getSystemDirectoryW = loadGetSystemDirectoryW();
   if (!getSystemDirectoryW) {
-    throw new Error("Failed to load GetSystemDirectoryW from kernel32.dll.");
+    throw new WindowsSystemDirectoryFfiUnavailableError();
   }
 
   let size = 260;
@@ -168,7 +175,7 @@ export function assertTrustedSystemExecutableForTests(candidate: string, label: 
   return assertTrustedSystemExecutable(candidate, label);
 }
 
-type ElevationExeOverrides = { powershell?: string; schtasks?: string };
+type ElevationExeOverrides = { powershell?: string; schtasks?: string; taskkill?: string; icacls?: string };
 let elevationExeOverridesForTests: ElevationExeOverrides | null = null;
 
 /**
@@ -202,6 +209,24 @@ export function resolveTrustedWindowsSchtasksExe(): string {
   }
   const candidate = join(resolveTrustedWindowsSystemDirectory(), "schtasks.exe");
   return assertTrustedSystemExecutable(candidate, "schtasks.exe");
+}
+
+/** Absolute path to System32\\taskkill.exe from a trusted system directory. */
+export function resolveTrustedWindowsTaskkillExe(): string {
+  if (elevationExeOverridesForTests?.taskkill) {
+    return elevationExeOverridesForTests.taskkill;
+  }
+  const candidate = join(resolveTrustedWindowsSystemDirectory(), "taskkill.exe");
+  return assertTrustedSystemExecutable(candidate, "taskkill.exe");
+}
+
+/** Absolute path to System32\\icacls.exe from a trusted system directory. */
+export function resolveTrustedWindowsIcaclsExe(): string {
+  if (elevationExeOverridesForTests?.icacls) {
+    return elevationExeOverridesForTests.icacls;
+  }
+  const candidate = join(resolveTrustedWindowsSystemDirectory(), "icacls.exe");
+  return assertTrustedSystemExecutable(candidate, "icacls.exe");
 }
 
 /** Stable machine-readable marker for a denied `schtasks /create`. Crosses the CLI→proxy boundary. */
@@ -598,6 +623,49 @@ export function runWindowsElevated(file: string, args: string[]): Promise<number
     `if ($null -eq $p) { exit ${OCX_ELEVATED_UAC_CANCELLED} }`,
     "$null = $p.Handle;",
     // Missing ExitCode is a protocol failure for single-file elevation (not success).
+    `if ($null -eq $p.ExitCode) { exit ${OCX_ELEVATED_PROTOCOL_FAILED} }`,
+    "exit $p.ExitCode",
+  ].join("");
+
+  return startPowerShellCommand(script).completion.then(result => result.exitCode);
+}
+
+/**
+ * Register one scheduled-task definition without exposing a mutable XML pathname to
+ * the elevated process. The XML bytes are fixed in the encoded PowerShell command
+ * before UAC; Register-ScheduledTask receives that string directly after elevation.
+ */
+export function runWindowsElevatedScheduledTaskRegistration(
+  taskName: string,
+  xml: string,
+): Promise<number> {
+  const xmlBase64 = Buffer.from(xml, "utf16le").toString("base64");
+  const powerShellPath = windowsPowerShell();
+  const powerShellDirectory = powerShellPath.replace(/[\\/][^\\/]+$/, "");
+  const scheduledTasksModule = `${powerShellDirectory}\\Modules\\ScheduledTasks\\ScheduledTasks.psd1`;
+  const inner = [
+    `$taskName = ${psSingleQuote(taskName)}`,
+    `$xmlBase64 = ${psSingleQuote(xmlBase64)}`,
+    "$xml = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($xmlBase64))",
+    `$module = Microsoft.PowerShell.Core\\Import-Module -Name ${psSingleQuote(scheduledTasksModule)} -PassThru -Force -ErrorAction Stop`,
+    "$registerTask = $module.ExportedCommands['Register-ScheduledTask']",
+    "if ($null -eq $registerTask) { throw 'Trusted ScheduledTasks module does not export Register-ScheduledTask.' }",
+    "& $registerTask -TaskName $taskName -Xml $xml -Force -ErrorAction Stop | Out-Null",
+  ].join("; ");
+  const encodedCommand = Buffer.from(inner, "utf16le").toString("base64");
+  const script = [
+    `$p = Start-Process -FilePath ${psSingleQuote(powerShellPath)}`,
+    ` -ArgumentList ${psSingleQuote(buildWindowsElevatedArgumentList([
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      encodedCommand,
+    ]))}`,
+    " -Verb RunAs -WindowStyle Hidden -PassThru -Wait;",
+    `if ($null -eq $p) { exit ${OCX_ELEVATED_UAC_CANCELLED} }`,
+    "$null = $p.Handle;",
     `if ($null -eq $p.ExitCode) { exit ${OCX_ELEVATED_PROTOCOL_FAILED} }`,
     "exit $p.ExitCode",
   ].join("");

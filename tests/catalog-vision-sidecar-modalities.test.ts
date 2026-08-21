@@ -45,6 +45,32 @@ describe("vision-sidecar catalog modalities", () => {
     const hinted = applyProviderConfigHints("opencode-go", prov, { id: "glm-5.2", provider: "opencode-go" });
     expect(hinted.inputModalities).toEqual(["text", "image"]);
   });
+
+  test("MiMo token-plan sends only the Pro model through the sidecar (#1927)", () => {
+    const canonical: OcxProviderConfig = {
+      adapter: "openai-chat",
+      baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
+      authMode: "key",
+    };
+    enrichProviderFromRegistry("mimo", canonical);
+    expect(canonical.noVisionModels).toEqual(["mimo-v2.5-pro"]);
+    expect(applyProviderConfigHints("mimo", canonical, {
+      id: "mimo-v2.5-pro",
+      provider: "mimo",
+    }).inputModalities).toEqual(["text", "image"]);
+    expect(applyProviderConfigHints("mimo", canonical, {
+      id: "mimo-v2.5",
+      provider: "mimo",
+    }).inputModalities).toBeUndefined();
+
+    const customDestination: OcxProviderConfig = {
+      adapter: "openai-chat",
+      baseUrl: "https://mimo-compatible.example/v1",
+      authMode: "key",
+    };
+    enrichProviderFromRegistry("mimo", customDestination);
+    expect(customDestination.noVisionModels).toBeUndefined();
+  });
 });
 
 describe("vision-sidecar custom-model override (#349/#344)", () => {
@@ -156,6 +182,7 @@ describe("vision-capable provider models feed combo modalities", () => {
   test("xAI grok chat models declare image input in the registry", () => {
     const xai = PROVIDER_REGISTRY.find(entry => entry.id === "xai");
     for (const model of [
+      "grok-4.6",
       "grok-4.5",
       "grok-4.3",
       "grok-4.20-0309-reasoning",

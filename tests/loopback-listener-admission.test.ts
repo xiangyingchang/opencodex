@@ -12,6 +12,7 @@
  * kernel refuses remote connections and there is no address to judge.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   isAllowedRequestOrigin,
   requestPolicyView,
@@ -38,7 +39,7 @@ describe("loopback listener policy view", () => {
 
   test("the loopback view admits without a credential and names it loopback", () => {
     const policy = requestPolicyView(wildcardConfig, "127.0.0.1");
-    expect(resolveResponsesApiAuth(request(), policy)).toEqual({ kind: "loopback" });
+    expect(resolveResponsesApiAuth(request(), policy)).toEqual({ kind: "loopback", source: "loopback" });
   });
 
   test("the view carries no bind address other than the one it was given", () => {
@@ -55,7 +56,30 @@ describe("loopback listener policy view", () => {
     expect(resolveResponsesApiAuth(
       request("/v1/responses", { "x-opencodex-api-key": "ocx_data_realsecret" }),
       wildcardConfig,
-    )).toEqual({ kind: "configured", keyId: "k1" });
+    )).toEqual({ kind: "configured", keyId: "k1", source: "dedicated" });
+  });
+
+  test("both Anthropic routes finish CORS with the listener-effective policy", () => {
+    const source = readFileSync(new URL("../src/server/index.ts", import.meta.url), "utf8");
+    const countTokensStart = source.indexOf('url.pathname === "/v1/messages/count_tokens"');
+    const messagesStart = source.indexOf('url.pathname === "/v1/messages"', countTokensStart + 1);
+    const chatStart = source.indexOf('url.pathname === "/v1/chat/completions"', messagesStart);
+    expect(countTokensStart).toBeGreaterThan(-1);
+    expect(messagesStart).toBeGreaterThan(countTokensStart);
+    expect(chatStart).toBeGreaterThan(messagesStart);
+    expect(source.slice(countTokensStart, messagesStart)).toContain(
+      "await handleClaudeCountTokens(req, config, policy)",
+    );
+    expect(source.slice(messagesStart, chatStart)).toContain(
+      "await handleClaudeMessages(req, config, logCtx, { requestId, start, turnAdmissionLease }, policy)",
+    );
+    for (const branch of [
+      source.slice(countTokensStart, messagesStart),
+      source.slice(messagesStart, chatStart),
+    ]) {
+      expect(branch).toContain("req,\n          policy,\n        ));");
+      expect(branch).not.toContain("req,\n          config,\n        ));");
+    }
   });
 });
 
@@ -173,5 +197,6 @@ describe("injected Codex provider block", () => {
     const block = buildProviderTableBlock(10200, false, false, "0.0.0.0");
     expect(block).toContain('base_url = "http://127.0.0.1:10200/v1"');
     expect(block).not.toContain("env_http_headers");
+    expect(block).not.toContain("env_key");
   });
 });

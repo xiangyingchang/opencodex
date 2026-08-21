@@ -7,36 +7,46 @@
  */
 import { execFileSync, execSync, spawnSync } from "node:child_process";
 import { findLiveProxy, proxyIdentityAt, SERVICE_STOP_LIVENESS } from "./server/proxy-liveness";
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, posix, resolve, win32 } from "node:path";
 import { expandUserPath, getConfigDir, readPid, removePid, removeRuntimePort, verifyPidIdentity } from "./config";
 import { loadConfig } from "./config";
 import { restoreNativeCodex, restoreNativeCodexAsync } from "./codex/inject";
 import { stripGrokConfig } from "./grok/inject";
-import { isWslRuntime } from "./codex/home";
+import { isWslRuntime, resolveCodexHomeDir, type CodexHomeDeps } from "./codex/home";
 import { BUN_RUNTIME_PATH_ENV, BUN_RUNTIME_SOURCE_ENV, durableBunRuntime } from "./lib/bun-runtime";
 import type { BunRuntimeSource } from "./lib/bun-runtime";
 import { isProcessAlive, stopProxy } from "./lib/process-control";
 import { serviceApiTokenFilePath } from "./lib/service-secrets";
+import { PROXY_ENV_KEYS } from "./lib/proxy-env";
 import { randomUUID } from "node:crypto";
 import {
   ELEVATION_REQUEST_TIMEOUT_MS,
   OCX_ELEVATED_PROTOCOL_FAILED,
   raceWithTimeout,
+  resolveTrustedWindowsPowerShellExe,
   resolveTrustedWindowsSchtasksExe,
   startElevatedSchtasksCreateAndRun,
   runWindowsElevated,
+  runWindowsElevatedScheduledTaskRegistration,
   toWindowsSchtasksError,
   WindowsElevationError,
+  WindowsSchtasksError,
   type ElevatedSchedulerOutcome,
   type ElevatedSchtasksCreateAndRunExecution,
   type ElevatedSchtasksCreateAndRunResult,
 } from "./lib/windows-elevation";
-import { defaultWinswEntry, installWinswService, startWinswService, stopWinswService, statusWinswRaw, uninstallWinswService, winswStatusSummary, winswXmlPath, WINSW_SERVICE_ID, WINSW_SHA256, WINSW_VERSION } from "./lib/winsw";
-import { hardenSecretDir, hardenSecretPath } from "./lib/windows-secret-acl";
+import { defaultWinswEntry, installWinswService, startWinswService, stopWinswService, statusWinswRaw, uninstallWinswService, winswStatusSummary, winswXmlPath, WINSW_SERVICE_ID, WINSW_SHA256, WINSW_VERSION, type WinswStatus } from "./lib/winsw";
+import {
+  forgetEphemeralSecretDir,
+  forgetEphemeralSecretPath,
+  hardenSecretDir,
+  hardenSecretPath,
+} from "./lib/windows-secret-acl";
 import { windowsEnvIndirectBatchPathList, windowsEnvIndirectBatchValue } from "./lib/win-paths";
 import { recordOwnedConfigPath } from "./lib/config-ownership";
+import { killWindowsSchedulerWrappers } from "./lib/windows-service-wrappers";
 import { maybeShowStarPrompt } from "./cli/star-prompt";
 import { SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV } from "./server/bridge-admission";
 
@@ -95,9 +105,30 @@ function serviceStatePaths(): string[] {
   return paths;
 }
 
-function currentCodexHome(): string {
-  const raw = process.env.CODEX_HOME?.trim();
-  return raw ? resolve(expandUserPath(raw)) : join(homedir(), ".codex");
+function currentCodexHome(deps: CodexHomeDeps = {}): string {
+  // Service ownership must identify the same home as the runtime. In WSL an
+  // unset CODEX_HOME can resolve to the single Windows Desktop home rather than
+  // Linux ~/.codex; recording the fallback here creates a false foreign owner.
+  return resolveCodexHomeDir(deps);
+}
+
+function currentCodexSqliteHomeAbsolute(target: "native" | "windows" = "native"): string | undefined {
+  const raw = process.env.CODEX_SQLITE_HOME?.trim();
+  if (!raw) return undefined;
+  const expanded = expandUserPath(raw);
+  // Service artifacts can be rendered by cross-platform tests and repair tooling, so an
+  // already-absolute path for the TARGET platform is preserved rather than re-anchored
+  // against the writing host. `resolve()` is host-relative in both directions: on a POSIX
+  // host it turns `C:\data` into `<cwd>/C:\data`, and on a Windows host it turns `/tmp/x`
+  // into `D:\tmp\x` — neither is a path the target can use. A relative value still resolves,
+  // because a service unit has no meaningful working directory.
+  //
+  // CODEX_HOME and OPENCODEX_HOME are carried through literally, so without this the same
+  // generated file disagreed with itself about two variables holding the same kind of value.
+  if (target === "windows") {
+    return win32.isAbsolute(expanded) ? win32.normalize(expanded) : resolve(expanded);
+  }
+  return posix.isAbsolute(expanded) ? posix.normalize(expanded) : resolve(expanded);
 }
 
 function currentOpenCodexHome(): string {
@@ -219,8 +250,8 @@ export function inspectServiceStateEvidence(
 }
 
 /** The homes this process is actually using, for comparison against a claim. */
-export function currentServiceHomes(): { codexHome: string; opencodexHome: string } {
-  return { codexHome: currentCodexHome(), opencodexHome: currentOpenCodexHome() };
+export function currentServiceHomes(deps: CodexHomeDeps = {}): { codexHome: string; opencodexHome: string } {
+  return { codexHome: currentCodexHome(deps), opencodexHome: currentOpenCodexHome() };
 }
 
 export function serviceHomeMatches(a: string, b: string): boolean {
@@ -284,11 +315,12 @@ export function serviceEnvironmentOwnedHere(): boolean {
 export function assertServiceEnvironmentMatchesInstall(): void {
   const state = readServiceInstallState();
   if (!state) return;
+  const actualCodexHome = currentCodexHome();
   const expected = normalizePathForCompare(state.codexHome);
-  const actual = normalizePathForCompare(currentCodexHome());
+  const actual = normalizePathForCompare(actualCodexHome);
   if (expected !== actual) {
     throw new ServiceOwnershipError(
-      `Service was installed with CODEX_HOME=${state.codexHome}, but current CODEX_HOME=${currentCodexHome()}. ` +
+      `Service was installed with CODEX_HOME=${state.codexHome}, but current CODEX_HOME=${actualCodexHome}. ` +
         "Run the service command from the same Codex home so native Codex restore updates the correct config.",
     );
   }
@@ -359,11 +391,12 @@ function writeServiceApiTokenFile(): string | null {
   return path;
 }
 
-export function buildPlist(): string {
+export function buildPlist(proxyEnv: { name: string; value: string }[] = resolvedProxyEnv()): string {
   const { bun, bunRuntimeSource, cli } = cliEntry();
   const log = logPath();
   const path = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
   const codexHome = process.env.CODEX_HOME?.trim();
+  const codexSqliteHome = currentCodexSqliteHomeAbsolute();
   const opencodexHome = process.env.OPENCODEX_HOME?.trim();
   const splitBridgeAdmissionTokenFile = process.env[SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV]?.trim();
   const envLines = [
@@ -372,10 +405,13 @@ export function buildPlist(): string {
     `    <key>${BUN_RUNTIME_PATH_ENV}</key><string>${plistString(bun)}</string>`,
     `    <key>PATH</key><string>${plistString(path)}</string>`,
     codexHome ? `    <key>CODEX_HOME</key><string>${plistString(codexHome)}</string>` : null,
+    codexSqliteHome ? `    <key>CODEX_SQLITE_HOME</key><string>${plistString(codexSqliteHome)}</string>` : null,
     opencodexHome ? `    <key>OPENCODEX_HOME</key><string>${plistString(opencodexHome)}</string>` : null,
     splitBridgeAdmissionTokenFile
       ? `    <key>${SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV}</key><string>${plistString(splitBridgeAdmissionTokenFile)}</string>`
       : null,
+    ...proxyEnv.map(({ name, value }) =>
+      `    <key>${name}</key><string>${plistString(value)}</string>`),
   ].filter((line): line is string => Boolean(line)).join("\n");
   const command = buildServiceShellCommand(bun, cli);
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -610,6 +646,31 @@ function systemdQuote(value: string): string {
 function systemdEnvironmentAssignment(name: string, value: string | undefined): string | null {
   if (!value) return null;
   return `Environment=${systemdQuote(`${name}=${value}`)}`;
+}
+
+/**
+ * Outbound proxy settings the installing shell had, resolved for baking into a service
+ * definition.
+ *
+ * A service manager does not inherit the environment of the shell that installed it, and
+ * `ExecStart=/bin/sh -lc` is dash on Ubuntu/WSL — login dash reads `.profile`, not
+ * `.bashrc`, which is where proxy exports usually live. So a user who needs a proxy to
+ * reach the upstream got a service that dialed direct: the socket was reset, the retry
+ * budget drained, and the request surfaced as `502 Provider unreachable` (#2107). The
+ * same install driven through `ocx codex-shim` worked, because that path spawns with
+ * `{ ...process.env }`.
+ *
+ * Lower-case variants are honored because curl-style tooling sets them and the runtime's
+ * own `applyProxyEnv` already treats both cases as equivalent. Only the canonical
+ * upper-case name is baked, so a definition never carries two spellings of one setting.
+ */
+export function resolvedProxyEnv(env: NodeJS.ProcessEnv = process.env): { name: string; value: string }[] {
+  const resolved: { name: string; value: string }[] = [];
+  for (const key of PROXY_ENV_KEYS) {
+    const value = env[key]?.trim() || env[key.toLowerCase()]?.trim();
+    if (value) resolved.push({ name: key, value });
+  }
+  return resolved;
 }
 
 function systemdOutputTarget(value: string): string {
@@ -986,6 +1047,48 @@ async function elevateSchtasks(args: string[]): Promise<void> {
   }
 }
 
+export interface WindowsSchedulerRollbackDeps {
+  queryXml?: () => string;
+  deleteTask?: () => Promise<void>;
+  probe?: () => WindowsSchedulerTaskProbe;
+}
+
+export async function rollbackWindowsSchedulerTaskOwnedByAttempt(
+  attemptNonce: string,
+  taskName = TASK,
+  deps: WindowsSchedulerRollbackDeps = {},
+): Promise<string | null> {
+  let registeredXml = "";
+  try {
+    registeredXml = (deps.queryXml ?? (() => querySchtasks(["/query", "/tn", taskName, "/xml"])))();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return `Task Scheduler task ${taskName} ownership could not be proven: ${detail}. Residual scheduler state: task ${taskName} presence is unknown; no rollback deletion was attempted.`;
+  }
+  if (!registeredXml.trim()) {
+    return `Task Scheduler task ${taskName} ownership could not be proven because its live XML was empty. Residual scheduler state: task ${taskName} presence is unknown; no rollback deletion was attempted.`;
+  }
+  if (!windowsTaskRegistrationOwnedByAttempt(registeredXml, attemptNonce)) {
+    return `Task Scheduler task ${taskName} ownership could not be proven because its attempt nonce does not match. Residual scheduler state: task ${taskName} remains registered; no rollback deletion was attempted.`;
+  }
+
+  try {
+    await (deps.deleteTask ?? (() => elevateSchtasks(["/delete", "/tn", taskName, "/f"])))();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return `Rollback deletion failed: ${detail}. Residual scheduler state: task ${taskName} may remain registered.`;
+  }
+  const probe = (deps.probe ?? (() => resolveWindowsSchedulerTaskProbe(taskName)))();
+  if (probe.status === "absent") return null;
+  if (probe.status === "unknown") {
+    return `Task Scheduler task ${taskName} presence could not be verified after rollback: ${probe.detail}. Residual scheduler state: task presence is unknown.`;
+  }
+  return `Residual scheduler state: task ${taskName} is still present after rollback.`;
+}
+
+// Legacy dashboard finalization creates and runs in one elevated child, whose protocol
+// performs its own rollback before returning. This fallback remains for indeterminate
+// protocol outcomes that predate the staged CLI transaction.
 async function rollbackElevatedSchedulerTask(taskName = TASK): Promise<string | null> {
   try {
     await elevateSchtasks(["/delete", "/tn", taskName, "/f"]);
@@ -1443,7 +1546,11 @@ function taskXmlRunLevelAcceptable(principal: string): boolean {
   return value === "leastprivilege" || value === "highestavailable";
 }
 
-export function buildWindowsServiceScript(entry = cliEntry(), port = resolveServiceListenPort()): string {
+export function buildWindowsServiceScript(
+  entry = cliEntry(),
+  port = resolveServiceListenPort(),
+  proxyEnv: { name: string; value: string }[] = resolvedProxyEnv(),
+): string {
   // Provenance rides along with the entry: a second durableBunRuntime() call here could
   // resolve differently from the binary the caller actually baked.
   const { bun, bunRuntimeSource, cli } = entry;
@@ -1459,11 +1566,16 @@ export function buildWindowsServiceScript(entry = cliEntry(), port = resolveServ
     windowsBatchSet(BUN_RUNTIME_PATH_ENV, bun, "path"),
     windowsBatchSet("PATH", path, "pathList"),
     windowsBatchSet("CODEX_HOME", process.env.CODEX_HOME?.trim(), "path"),
+    windowsBatchSet("CODEX_SQLITE_HOME", currentCodexSqliteHomeAbsolute("windows"), "path"),
     windowsBatchSet("OPENCODEX_HOME", process.env.OPENCODEX_HOME?.trim(), "path"),
+    ...proxyEnv.map(({ name, value }) => windowsBatchSet(name, value)),
     windowsBatchSet("OCX_API_TOKEN_FILE", serviceApiTokenFilePath(), "path"),
     windowsBatchSet("OCX_SERVICE_LOG", serviceLogPath(), "path"),
     windowsBatchSet("OCX_BUN", bun, "path"),
     windowsBatchSet("OCX_CLI", cli, "path"),
+    // Package root for the transactional-update restore path (#1942): cli is
+    // <pkg>\src\cli\index.ts, so the package dir is three levels up.
+    'for %%I in ("%OCX_CLI%\\..\\..\\..") do set "OCX_PKG_DIR=%%~fI"',
     'if exist "%OCX_API_TOKEN_FILE%" (',
     '  set /p OPENCODEX_API_AUTH_TOKEN=<"%OCX_API_TOKEN_FILE%"',
     ")",
@@ -1475,6 +1587,20 @@ export function buildWindowsServiceScript(entry = cliEntry(), port = resolveServ
     '>>"%OCX_SERVICE_LOG%" echo opencodex_home="%OPENCODEX_HOME%"',
     '>>"%OCX_SERVICE_LOG%" echo codex_home="%CODEX_HOME%"',
     '>>"%OCX_SERVICE_LOG%" echo token_file="%OCX_API_TOKEN_FILE%"',
+    'if not exist "%OCX_BUN%" (',
+    "  call :restore_backup",
+    ")",
+    'if not exist "%OCX_BUN%" (',
+    '  >>"%OCX_SERVICE_LOG%" echo [%DATE% %TIME%] installation is incomplete: bundled Bun is missing; reinstall opencodex, then run ocx service repair',
+    "  exit /b 3",
+    ")",
+    'if not exist "%OCX_CLI%" (',
+    "  call :restore_backup",
+    ")",
+    'if not exist "%OCX_CLI%" (',
+    '  >>"%OCX_SERVICE_LOG%" echo [%DATE% %TIME%] installation is incomplete: CLI entry is missing; reinstall opencodex, then run ocx service repair',
+    "  exit /b 3",
+    ")",
     `"%OCX_BUN%" "%OCX_CLI%" start --port ${port} >>"%OCX_SERVICE_LOG%" 2>&1`,
     "if %ERRORLEVEL% NEQ 0 (",
     '  >>"%OCX_SERVICE_LOG%" echo [%DATE% %TIME%] child exited with code %ERRORLEVEL%; restarting in 5s',
@@ -1484,12 +1610,37 @@ export function buildWindowsServiceScript(entry = cliEntry(), port = resolveServ
     "  goto loop",
     ")",
     "endlocal",
+    "goto :eof",
+    "",
+    // #1942/#1849: a power loss mid-swap leaves the live package dir missing/broken and
+    // a sibling .ocx-backup-* holding the previous version. This wrapper lives OUTSIDE
+    // the package tree, so it can restore when the launcher itself is gone — the exact
+    // window the in-launcher boot probe cannot reach.
+    ":restore_backup",
+    '>>"%OCX_SERVICE_LOG%" echo [%DATE% %TIME%] install incomplete - looking for a transactional-update backup to restore',
+    'for /f "delims=" %%B in (\'dir /b /ad /o-n "%OCX_PKG_DIR%\\..\\.ocx-backup-*" 2^>nul\') do (',
+    '  if exist "%OCX_PKG_DIR%\\..\\%%B\\opencodex\\package.json" (',
+    '    if exist "%OCX_PKG_DIR%" rmdir /s /q "%OCX_PKG_DIR%" 2>nul',
+    '    move "%OCX_PKG_DIR%\\..\\%%B\\opencodex" "%OCX_PKG_DIR%" >nul 2>&1',
+    '    if exist "%OCX_PKG_DIR%\\package.json" (',
+    '      >>"%OCX_SERVICE_LOG%" echo [%DATE% %TIME%] restored previous install from %%B',
+    "      goto :eof",
+    "    )",
+    "  )",
+    ")",
+    '>>"%OCX_SERVICE_LOG%" echo [%DATE% %TIME%] no restorable backup found',
+    "goto :eof",
   ].filter((line): line is string => Boolean(line));
   return `${lines.join("\r\n")}\r\n`;
 }
 
 export function buildWindowsSchtasksCreateArgs(script = windowsServiceScriptPath()): string[] {
   const xml = script === windowsServiceScriptPath() ? windowsTaskXmlPath() : `${script}.xml`;
+  return ["/create", "/tn", TASK, "/xml", xml, "/f"];
+}
+
+/** Build the fixed scheduler-create command from an explicit staged XML document. */
+export function buildWindowsSchtasksCreateArgsForXml(xml: string): string[] {
   return ["/create", "/tn", TASK, "/xml", xml, "/f"];
 }
 
@@ -1513,7 +1664,17 @@ export function buildWindowsLauncherVbs(script = windowsServiceScriptPath()): st
   return `${lines.join("\r\n")}\r\n`;
 }
 
-export function buildWindowsTaskXml(script = windowsServiceScriptPath(), launcher = windowsLauncherVbsPath()): string {
+function windowsTaskDescription(attemptNonce?: string): string {
+  return attemptNonce
+    ? `OpenCodex proxy service wrapper; install-attempt=${attemptNonce}`
+    : "OpenCodex proxy service wrapper";
+}
+
+export function buildWindowsTaskXml(
+  script = windowsServiceScriptPath(),
+  launcher = windowsLauncherVbsPath(),
+  attemptNonce?: string,
+): string {
   const escapedWscript = taskXmlString(windowsWscript());
   // Escape the launcher path independently for the <Arguments> element; quoting it
   // keeps spaces intact, and /b (batch mode) suppresses script error popups.
@@ -1521,7 +1682,7 @@ export function buildWindowsTaskXml(script = windowsServiceScriptPath(), launche
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>OpenCodex proxy service wrapper</Description>
+    <Description>${taskXmlString(windowsTaskDescription(attemptNonce))}</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
@@ -1641,6 +1802,21 @@ function taskXmlOptionalValueEquals(xml: string, tag: string, expected: string):
   return value?.trim().toLowerCase() === expected.toLowerCase();
 }
 
+/** True only when the exported live task carries this install attempt's nonce. */
+export function windowsTaskRegistrationOwnedByAttempt(xml: string, attemptNonce: string): boolean {
+  if (!attemptNonce) return false;
+  const scrubbed = taskXmlWithoutCommentsAndCdata(xml);
+  if (taskXmlElementCount(scrubbed, "Data") > 0 || taskXmlHasPrefixedTag(scrubbed, "Data")) return false;
+  if (taskXmlHasPrefixedTag(scrubbed, "RegistrationInfo")) return false;
+  if (taskXmlElementCount(scrubbed, "RegistrationInfo") !== 1) return false;
+  const registrationInfo = taskXmlSection(scrubbed, "RegistrationInfo");
+  return taskXmlDecodedValueEquals(
+    registrationInfo,
+    "Description",
+    windowsTaskDescription(attemptNonce),
+  );
+}
+
 /** Validate the security/lifecycle-critical fields of the registered scheduler task. */
 export function windowsTaskRegistrationHealthy(
   xml: string,
@@ -1714,7 +1890,7 @@ function installLaunchd(): void {
   // Capture this BEFORE writing: the write below makes the plist exist unconditionally,
   // so a post-write existsSync would call every fresh install an "installed" service.
   const wasInstalled = existsSync(p);
-  writeFileSync(p, buildPlist(), "utf8");
+  writeServiceDefinitionFile(p, buildPlist(), "utf8");
   // Best-effort: an absent job is fine here, and a failed unload is caught by the
   // load verification below with a better message than a raw unload error.
   runLaunchctl(["unload", p]);
@@ -1777,6 +1953,52 @@ function uninstallLaunchd(): void {
   if (existsSync(p)) unlinkSync(p);
 }
 
+/**
+ * Write a service definition with owner-only permissions.
+ *
+ * These files carry the outbound proxy environment (#2107), and a proxy URL routinely
+ * carries `user:password`. `writeFileSync` without a mode lands at 0644 under the default
+ * umask, so the credential would be world-readable on a shared host. Every other
+ * secret-bearing write in this file already uses 0600 — the service API token and the
+ * install state — and a service definition holding a proxy credential belongs in the same
+ * class.
+ *
+ * The explicit `chmodSync` is not redundant: `mode` only applies when the file is
+ * created, so an install over a definition left at 0644 by an earlier version would keep
+ * the loose mode.
+ *
+ * On Windows the POSIX bits are advisory, so the ACL is the real boundary — and whether it
+ * may soft-fail depends on what the definition actually contains. A definition carrying a
+ * proxy credential is a secret publication and fails closed like the API token and the
+ * install state do; one carrying only paths and a port is not worth refusing an install
+ * over, since before #2107 these files had no hardening at all and a failure here would
+ * regress a user who has no credential to protect.
+ */
+export function writeServiceDefinitionFile(path: string, content: string, encoding: "utf8" | "utf16le"): void {
+  writeFileSync(path, content, { encoding, mode: 0o600 });
+  try { chmodSync(path, 0o600); } catch { /* superseded by the Windows ACL below */ }
+  if (process.platform === "win32") {
+    hardenSecretPath(path, { required: definitionCarriesCredential(content) });
+  }
+}
+
+/**
+ * Does this service definition embed a credential-bearing proxy URL?
+ *
+ * Only the userinfo form leaks something: `http://user:pass@host` in any of the four proxy
+ * variables. A bare `http://127.0.0.1:7890` is not a secret, and treating it as one would
+ * make an icacls stall fail an install that had nothing to protect.
+ *
+ * The scan is over any URL in the rendered definition rather than over a `KEY=value` shape,
+ * because the three formats render differently — systemd writes `Environment="K=V"`, the
+ * plist writes `<key>K</key><string>V</string>`, and the Windows wrapper writes
+ * `set "K=V"`. Keying on the assignment syntax silently missed the plist.
+ */
+export function definitionCarriesCredential(content: string): boolean {
+  // A userinfo authority: scheme, then anything that is not a delimiter, then '@'.
+  return /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>/@]+@/i.test(content);
+}
+
 // ── Windows (Task Scheduler) ──
 /**
  * In-place service-asset write that tolerates the transient EBUSY/EPERM/EACCES Windows
@@ -1785,7 +2007,7 @@ function uninstallLaunchd(): void {
 function writeServiceAssetWithRetry(path: string, content: string, encoding: "utf8" | "utf16le"): void {
   for (let attempt = 0; ; attempt++) {
     try {
-      writeFileSync(path, content, encoding);
+      writeServiceDefinitionFile(path, content, encoding);
       return;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
@@ -1810,21 +2032,236 @@ function writeWindowsSchedulerAssets(): void {
   writeServiceAssetWithRetry(windowsTaskXmlPath(), `\uFEFF${buildWindowsTaskXml(script)}`, "utf16le");
 }
 
-function installWindows(): void {
-  recordOwnedConfigPath(getConfigDir(), serviceStatePath());
+const WINDOWS_SCHEDULER_STAGE_PREFIX = "opencodex-service-stage-";
+const ownedWindowsSchedulerStages = new Set<string>();
+
+export interface WindowsSchedulerRegistrationStageDeps {
+  createStageDir?: () => string;
+  hardenDir?: (path: string) => void;
+  writeXml?: (path: string, contents: string) => void;
+  hardenPath?: (path: string) => void;
+  removeStageDir?: (path: string) => void;
+}
+
+function cleanupWindowsSchedulerStage(
+  stageDir: string,
+  xmlPath: string,
+  removeStageDir: (path: string) => void,
+): void {
+  let cleanupError: unknown;
+  try {
+    unlinkSync(xmlPath);
+    forgetEphemeralSecretPath(xmlPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+      forgetEphemeralSecretPath(xmlPath);
+    } else {
+      cleanupError = error;
+    }
+  }
+  try {
+    removeStageDir(stageDir);
+    forgetEphemeralSecretDir(stageDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+      forgetEphemeralSecretDir(stageDir);
+    } else if (cleanupError) {
+      throw new AggregateError([cleanupError, error], "Task Scheduler staging cleanup failed.");
+    } else {
+      cleanupError = error;
+    }
+  }
+  if (cleanupError) throw cleanupError;
+}
+
+export function stageWindowsSchedulerRegistrationXml(
+  attemptNonce: string,
+  deps: WindowsSchedulerRegistrationStageDeps = {},
+): string {
+  const createStageDir = deps.createStageDir
+    ?? (() => mkdtempSync(join(tmpdir(), WINDOWS_SCHEDULER_STAGE_PREFIX)));
+  const hardenDir = deps.hardenDir
+    ?? ((path: string) => { hardenSecretDir(path, { required: true }); });
+  const writeXml = deps.writeXml ?? ((path: string, contents: string) => {
+    writeFileSync(path, contents, { encoding: "utf16le", flag: "wx", mode: 0o600 });
+  });
+  const hardenPath = deps.hardenPath
+    ?? ((path: string) => { hardenSecretPath(path, { required: true }); });
+  const removeStageDir = deps.removeStageDir
+    ?? ((path: string) => { rmdirSync(path); });
+
+  let stageDir: string | null = null;
+  let xmlPath: string | null = null;
+  try {
+    stageDir = createStageDir();
+    try { chmodSync(stageDir, 0o700); } catch { /* required Windows ACL is authoritative */ }
+    hardenDir(stageDir);
+    xmlPath = join(stageDir, "task.xml");
+    // This document points at the canonical launcher but does not publish or rewrite it.
+    // The hardened private directory prevents another local account from replacing the
+    // document while UAC is pending; the file harden independently proves its identity.
+    writeXml(
+      xmlPath,
+      `\uFEFF${buildWindowsTaskXml(windowsServiceScriptPath(), windowsLauncherVbsPath(), attemptNonce)}`,
+    );
+    hardenPath(xmlPath);
+    ownedWindowsSchedulerStages.add(xmlPath);
+    return xmlPath;
+  } catch (error) {
+    if (stageDir) {
+      try {
+        cleanupWindowsSchedulerStage(stageDir, xmlPath ?? join(stageDir, "task.xml"), removeStageDir);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "Task Scheduler staging failed and its private temporary directory could not be removed.",
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+function removeWindowsSchedulerRegistrationStage(xmlPath: string): void {
+  if (!ownedWindowsSchedulerStages.has(xmlPath)) {
+    throw new Error("Refusing to remove an unrecognized Task Scheduler staging path.");
+  }
+  const stageDir = dirname(xmlPath);
+  cleanupWindowsSchedulerStage(
+    stageDir,
+    xmlPath,
+    path => { rmdirSync(path); },
+  );
+  if (existsSync(stageDir)) {
+    throw new Error("The private Task Scheduler staging directory still exists after cleanup.");
+  }
+  ownedWindowsSchedulerStages.delete(xmlPath);
+}
+
+export interface FreshWindowsSchedulerRegistrationDeps {
+  create?: (args: string[]) => void;
+  elevate?: (taskName: string, xml: string) => Promise<void>;
+  probe?: () => WindowsSchedulerTaskProbe;
+  queryXml?: () => string;
+  rollback?: () => Promise<string | null>;
+}
+
+export async function registerFreshWindowsSchedulerTask(
+  xmlPath: string,
+  attemptNonce: string,
+  deps: FreshWindowsSchedulerRegistrationDeps = {},
+): Promise<void> {
+  const args = buildWindowsSchtasksCreateArgsForXml(xmlPath);
+  // Capture and validate the exact definition before an access-denied attempt can
+  // cross the UAC boundary. The elevated fallback receives these immutable bytes,
+  // never the caller-writable staging pathname.
+  const expectedXml = decodeSchtasksOutput(readFileSync(xmlPath));
+  if (
+    !windowsTaskRegistrationHealthy(expectedXml)
+    || !windowsTaskRegistrationOwnedByAttempt(expectedXml, attemptNonce)
+  ) {
+    throw new Error("The staged Task Scheduler registration failed OpenCodex ownership or shape validation.");
+  }
+  try {
+    (deps.create ?? schtasks)(args);
+  } catch (error) {
+    if (
+      !(error instanceof WindowsSchtasksError)
+      || error.operation !== "create"
+      || error.reason !== "access-denied"
+    ) {
+      throw error;
+    }
+    // Register from the captured XML string inside the elevated process. Another
+    // same-user process can mutate its own temp files, but cannot change this command.
+    const elevate = deps.elevate ?? (async (taskName: string, xml: string) => {
+      const exitCode = await runWindowsElevatedScheduledTaskRegistration(taskName, xml);
+      if (exitCode !== 0) throw new Error(`Background service install failed with exit code ${exitCode}.`);
+    });
+    await elevate(TASK, expectedXml);
+  }
+
+  const rollbackTask = deps.rollback ?? (() => rollbackWindowsSchedulerTaskOwnedByAttempt(attemptNonce, TASK));
+  const probe = (deps.probe ?? (() => probeWindowsSchedulerTask(TASK)))();
+  if (probe.status === "absent") {
+    throw new Error("Task Scheduler reported success, but the new registration is absent; no service cleanup was started.");
+  }
+  if (probe.status === "unknown") {
+    const rollback = await rollbackTask();
+    throw new Error(
+      `Task Scheduler registration was not verifiably present after create (${probe.detail}).`
+      + (rollback ? ` Cleanup also failed: ${rollback}` : " The unverified registration was rolled back."),
+    );
+  }
+
+  let registeredXml = "";
+  let queryDetail: string | null = null;
+  try {
+    registeredXml = (deps.queryXml ?? (() => querySchtasks(["/query", "/tn", TASK, "/xml"])))();
+  } catch (error) {
+    queryDetail = error instanceof Error ? error.message : String(error);
+  }
+  if (!registeredXml.trim()) {
+    const rollback = await rollbackTask();
+    throw new Error(
+      "Task Scheduler registration was created, but its live XML could not be verified."
+      + (queryDetail ? ` Query failed: ${queryDetail}` : " The query returned an empty document.")
+      + (rollback ? ` Cleanup also failed: ${rollback}` : " The unverified registration was rolled back."),
+    );
+  }
+  if (
+    !windowsTaskRegistrationHealthy(registeredXml)
+    || !windowsTaskRegistrationOwnedByAttempt(registeredXml, attemptNonce)
+  ) {
+    const rollback = await rollbackTask();
+    throw new Error(
+      "Task Scheduler registration was created but failed the OpenCodex action/trigger or attempt-ownership verification."
+      + (rollback ? ` Cleanup also failed: ${rollback}` : " The invalid registration was rolled back."),
+    );
+  }
+}
+
+function recordWindowsSchedulerOwnership(): boolean {
+  // Ownership claiming is deliberately conservative: a legacy non-empty config root
+  // without metadata stays unclaimed, but that must not turn a service reinstall into
+  // an outage after prepareServiceInstall has stopped the previous manager.
+  return recordOwnedConfigPath(getConfigDir(), serviceStatePath());
+}
+
+export interface RemoveNativeWindowsServiceDeps {
+  status?: () => WinswStatus;
+  uninstall?: () => void;
+  sleep?: (ms: number) => void;
+  settleChecks?: number;
+}
+
+export function removeNativeWindowsServiceForScheduler(
+  deps: RemoveNativeWindowsServiceDeps = {},
+): void {
+  const status = deps.status ?? statusWinswRaw;
+  const uninstall = deps.uninstall ?? uninstallWinswService;
+  const sleep = deps.sleep ?? Bun.sleepSync;
+  const settleChecks = Math.max(1, deps.settleChecks ?? 20);
   // Transactional backend switch: installing the scheduler backend removes a native
   // service first — two live managers would both respawn the proxy (conflict).
-  if (statusWinswRaw() !== "nonexistent") {
+  if (status() !== "nonexistent") {
     console.log("🔁 Removing the native (WinSW) service before installing the Task Scheduler backend...");
     try {
-      uninstallWinswService();
+      uninstall();
     } catch (err) {
       throw new Error(`Cannot remove the native service before switching to Task Scheduler: ${err instanceof Error ? err.message : String(err)}. Remove it manually with 'sc delete ${WINSW_SERVICE_ID}' or retry.`);
     }
-    if (statusWinswRaw() !== "nonexistent") {
-      throw new Error(`Native service registration could not be re-verified after the removal attempt — aborting switch. Check 'sc.exe query ${WINSW_SERVICE_ID}' and remove it manually if present.`);
+    for (let check = 0; check < settleChecks; check++) {
+      if (status() === "nonexistent") return;
+      if (check + 1 < settleChecks) sleep(250);
     }
+    throw new Error(`Native service registration could not be re-verified after the removal attempt — aborting switch. Check 'sc.exe query ${WINSW_SERVICE_ID}' and remove it manually if present.`);
   }
+}
+
+function installWindows(): void {
+  recordWindowsSchedulerOwnership();
+  removeNativeWindowsServiceForScheduler();
   // End a running task BEFORE rewriting the assets it is executing — cmd.exe reading the
   // script mid-rewrite runs a torn batch file, and its open handle can fail the write.
   try { stopWindows(); } catch { /* not running */ }
@@ -1996,6 +2433,22 @@ export function stopWindows(): void {
 }
 function statusWindows(): string { try { return schtasks(["/query", "/tn", TASK]); } catch { return ""; } }
 function statusWindowsXml(): string { try { return schtasks(["/query", "/tn", TASK, "/xml"]); } catch { return ""; } }
+
+/**
+ * Best-effort termination of surviving Windows scheduler launcher/wrapper processes.
+ * `schtasks /end` ends the task instance but often leaves wscript/cmd running the
+ * `:loop` batch, which brings the proxy back during a stop or restart.
+ *
+ * The matching rule — canonical paths of THIS installation, as complete
+ * command-line tokens — lives in lib/windows-service-wrappers so the update job
+ * cannot drift away from it again.
+ */
+function killWindowsServiceWrapperProcesses(): void {
+  killWindowsSchedulerWrappers({
+    scriptPath: windowsServiceScriptPath(),
+    launcherPath: windowsLauncherVbsPath(),
+  });
+}
 function uninstallWindows(): void {
   const probe = probeWindowsSchedulerTask(TASK);
   if (probe.status === "present") {
@@ -2046,11 +2499,12 @@ function unitPath(): string {
   return join(unitDir(), `${TASK}.service`);
 }
 
-export function buildUnit(): string {
+export function buildUnit(proxyEnv: { name: string; value: string }[] = resolvedProxyEnv()): string {
   const { bun, bunRuntimeSource, cli } = cliEntry();
   const log = logPath();
   const path = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
   const codexHome = systemdEnvironmentAssignment("CODEX_HOME", process.env.CODEX_HOME?.trim());
+  const codexSqliteHome = systemdEnvironmentAssignment("CODEX_SQLITE_HOME", currentCodexSqliteHomeAbsolute());
   const opencodexHome = systemdEnvironmentAssignment("OPENCODEX_HOME", process.env.OPENCODEX_HOME?.trim());
   const envLines = [
     systemdEnvironmentAssignment("OCX_SERVICE", "1"),
@@ -2058,7 +2512,9 @@ export function buildUnit(): string {
     systemdEnvironmentAssignment(BUN_RUNTIME_PATH_ENV, bun),
     systemdEnvironmentAssignment("PATH", path),
     codexHome,
+    codexSqliteHome,
     opencodexHome,
+    ...proxyEnv.map(({ name, value }) => systemdEnvironmentAssignment(name, value)),
   ].filter((line): line is string => Boolean(line)).join("\n");
   return `[Unit]
 Description=OpenCodex Proxy Server
@@ -2119,7 +2575,7 @@ function installSystemd(): void {
   recordOwnedConfigPath(getConfigDir(), serviceStatePath());
   if (!existsSync(getConfigDir())) mkdirSync(getConfigDir(), { recursive: true });
   writeServiceApiTokenFile();
-  writeFileSync(unitPath(), buildUnit(), "utf8");
+  writeServiceDefinitionFile(unitPath(), buildUnit(), "utf8");
   sh("systemctl --user daemon-reload");
   sh(`systemctl --user enable ${TASK}`);
   sh(`systemctl --user restart ${TASK}`);
@@ -2422,6 +2878,105 @@ export async function installServiceSafely(
   await install();
 }
 
+export interface FreshWindowsSchedulerInstallDeps {
+  stageRegistrationXml?: (attemptNonce: string) => string;
+  register?: (xmlPath: string, attemptNonce: string) => Promise<void>;
+  recordOwnership?: () => boolean;
+  prepare?: () => Promise<void>;
+  removeNativeService?: () => void;
+  publishAssets?: () => void;
+  runTask?: () => void;
+  writeState?: () => void;
+  rollbackTask?: (attemptNonce: string) => Promise<string | null>;
+  removeStagedXml?: (xmlPath: string) => void;
+}
+
+/**
+ * Fresh Windows scheduler install with UAC before the destructive commit.
+ *
+ * The registration is created but never run before `prepare`: UAC cancellation and
+ * create failure therefore cannot stop the existing proxy or trigger its native-routing
+ * cleanup. Rollback proves ownership from the live registration's attempt nonce before
+ * deleting, because the fixed task name can be replaced by another process at any time.
+ */
+export async function installFreshWindowsSchedulerSafely(
+  deps: FreshWindowsSchedulerInstallDeps = {},
+): Promise<void> {
+  const stage = deps.stageRegistrationXml ?? stageWindowsSchedulerRegistrationXml;
+  const register = deps.register ?? registerFreshWindowsSchedulerTask;
+  const recordOwnership = deps.recordOwnership ?? recordWindowsSchedulerOwnership;
+  const prepare = deps.prepare ?? (() => prepareServiceInstall("scheduler"));
+  const removeNativeService = deps.removeNativeService ?? removeNativeWindowsServiceForScheduler;
+  const publishAssets = deps.publishAssets ?? writeWindowsSchedulerAssets;
+  const runTask = deps.runTask ?? startWindows;
+  const writeState = deps.writeState ?? (() => writeServiceInstallState("scheduler"));
+  const rollbackTask = deps.rollbackTask ?? ((attemptNonce: string) => (
+    rollbackWindowsSchedulerTaskOwnedByAttempt(attemptNonce, TASK)
+  ));
+  const removeStagedXml = deps.removeStagedXml ?? ((path: string) => {
+    removeWindowsSchedulerRegistrationStage(path);
+  });
+
+  let stagedXml: string | null = null;
+  const attemptNonce = randomUUID();
+  const configRootWasAbsent = !existsSync(getConfigDir());
+  let registered = false;
+  let started = false;
+  try {
+    stagedXml = stage(attemptNonce);
+    await register(stagedXml, attemptNonce);
+    registered = true;
+
+    // The destructive boundary begins only after Task Scheduler accepted the definition.
+    // The registration has consumed its temporary XML. Remove it before claiming a newly
+    // created config root, because ownership initialization intentionally requires emptiness.
+    removeStagedXml(stagedXml);
+    stagedXml = null;
+    const ownershipRecorded = recordOwnership();
+    if (!ownershipRecorded && configRootWasAbsent) {
+      throw new Error(
+        "The fresh OpenCodex config root could not be claimed for safe uninstall; "
+        + "aborting before service-manager cleanup or asset publication.",
+      );
+    }
+    await prepare();
+    removeNativeService();
+    publishAssets();
+    runTask();
+    started = true;
+    writeState();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (registered && !started) {
+      const rollback = await rollbackTask(attemptNonce);
+      throw new Error(
+        `${detail}\n`
+        + (rollback
+          ? `The new Task Scheduler registration may remain: ${rollback}`
+          : "The new Task Scheduler registration was rolled back. The previous proxy/routing state was not assumed restored."),
+      );
+    }
+    if (started) {
+      throw new Error(
+        `${detail}\nThe scheduler task started, but install state was not published. `
+        + "The task was left in place; inspect `ocx service status` before retrying.",
+      );
+    }
+    throw error;
+  } finally {
+    if (stagedXml) {
+      try { removeStagedXml(stagedXml); } catch (error) {
+        const code = error && typeof error === "object" && "code" in error
+          ? String((error as NodeJS.ErrnoException).code)
+          : "";
+        console.error(
+          `⚠️  Failed to remove the private Task Scheduler staging directory${code ? ` (${code})` : ""}.`,
+        );
+      }
+    }
+  }
+}
+
 /**
  * If a service is installed, stop it so the process manager doesn't respawn after `ocx stop`.
  * Returns true if a service was found and stopped.
@@ -2443,6 +2998,10 @@ export function stopServiceIfInstalled(): boolean {
     if (statusWinswRaw() !== "nonexistent") {
       try { stopWinswService(); stopped = true; } catch { /* best-effort */ }
     }
+    // `schtasks /end` ends the task instance but the cmd `:loop` wrapper survives and
+    // respawns its child seconds later (issue #764), resurrecting the proxy during a
+    // stop or a tray restart. Kill the launcher/wrapper processes outright.
+    killWindowsServiceWrapperProcesses();
     if (stopped) return true;
   } else if (process.platform === "linux" && isSystemd() && existsSync(unitPath())) {
     try { stopSystemd(); return true; } catch { return false; }
@@ -2457,33 +3016,53 @@ function removeServiceInstallState(): void {
   }
 }
 
+type UninstallServiceHooksForTests = {
+  platform: typeof process.platform;
+  assertEnvironment: () => void;
+  probeWindowsTask: () => WindowsSchedulerTaskProbe;
+  uninstallWindowsTask: () => void;
+  nativeStatus: () => WinswStatus;
+  uninstallNative: () => void;
+  removeInstallState: () => void;
+};
+
+let uninstallServiceHooksForTests: UninstallServiceHooksForTests | null = null;
+
+/** Test-only hooks for full-uninstall service removal. */
+export function setUninstallServiceHooksForTests(hooks: UninstallServiceHooksForTests | null): void {
+  uninstallServiceHooksForTests = hooks;
+}
+
 /**
  * Best-effort service removal for full uninstall. Unlike `ocx service uninstall`, this is quiet
- * when no service exists and never exits the process just because the platform has no service
- * manager.
+ * when no service exists or the platform has no service manager. An installed native Windows
+ * service or scheduler task that cannot be removed throws so the caller cannot erase state and
+ * report success.
  */
 export function uninstallServiceIfInstalled(): boolean {
-  assertServiceEnvironmentMatchesInstall();
-  if (process.platform === "darwin") {
+  const hooks = uninstallServiceHooksForTests;
+  (hooks?.assertEnvironment ?? assertServiceEnvironmentMatchesInstall)();
+  const platform = hooks?.platform ?? process.platform;
+  if (platform === "darwin") {
     if (existsSync(plistPath())) {
       try { uninstallLaunchd(); removeServiceInstallState(); return true; } catch { return false; }
     }
-  } else if (process.platform === "win32") {
+  } else if (platform === "win32") {
     let removed = false;
-    try {
-      const q = schtasks(["/query", "/tn", TASK]);
-      if (q.includes(TASK)) { uninstallWindows(); removed = true; }
-    } catch { /* task not found */ }
-    if (statusWinswRaw() !== "nonexistent") {
-      try {
-        uninstallWinswService();
-        removed = true;
-      } catch (err) {
-        console.warn(`⚠️  Failed to remove native service: ${err instanceof Error ? err.message : String(err)}. Check 'sc.exe query ${WINSW_SERVICE_ID}'.`);
-      }
+    const scheduler = (hooks?.probeWindowsTask ?? probeWindowsSchedulerTask)();
+    if (scheduler.status === "unknown") {
+      throw new Error(`Could not determine Task Scheduler state: ${scheduler.detail}`);
     }
-    if (removed) { removeServiceInstallState(); return true; }
-  } else if (process.platform === "linux" && existsSync(unitPath())) {
+    if (scheduler.status === "present") {
+      (hooks?.uninstallWindowsTask ?? uninstallWindows)();
+      removed = true;
+    }
+    if ((hooks?.nativeStatus ?? statusWinswRaw)() !== "nonexistent") {
+      (hooks?.uninstallNative ?? uninstallWinswService)();
+      removed = true;
+    }
+    if (removed) { (hooks?.removeInstallState ?? removeServiceInstallState)(); return true; }
+  } else if (platform === "linux" && existsSync(unitPath())) {
     try { uninstallSystemd(); removeServiceInstallState(); return true; } catch {
       try { unlinkSync(unitPath()); removeServiceInstallState(); return true; } catch { return false; }
     }
@@ -2777,7 +3356,19 @@ export async function serviceCommand(...args: (string | undefined)[]): Promise<v
       // restart-loops on EADDRINUSE, and the old standalone process makes the install
       // verification report a false success.
       try {
-        await installServiceSafely(backend, ops.install);
+        if (process.platform === "win32" && backend === "scheduler") {
+          const scheduler = probeWindowsSchedulerTask(TASK);
+          if (scheduler.status === "unknown") {
+            throw new Error(`Task Scheduler state could not be verified before install: ${scheduler.detail}`);
+          }
+          if (scheduler.status === "absent") {
+            await installFreshWindowsSchedulerSafely();
+          } else {
+            await installServiceSafely(backend, ops.install);
+          }
+        } else {
+          await installServiceSafely(backend, ops.install);
+        }
       } catch (error) {
         console.error(`❌ Service install cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
         process.exitCode = 1;

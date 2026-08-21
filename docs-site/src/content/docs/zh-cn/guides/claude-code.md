@@ -20,7 +20,7 @@ ocx claude
 | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:<port>` |
 | `ANTHROPIC_AUTH_TOKEN` | 仅在代理要求 API 密钥时设置——否则不会设置，因此你的 claude.ai 登录（订阅 + 连接器）会保持有效 |
 | `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` | `1`（原生 `/model` 选择器发现） |
-| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | 自动上下文压缩阈值（默认 `350000`）；仅在启用自动上下文时注入 |
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | 自动上下文压缩阈值（默认 `829800`）；仅在启用自动上下文时注入 |
 | `ANTHROPIC_MODEL` | `claudeCode.model`（可选） |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `claudeCode.tierModels.haiku ?? claudeCode.smallFastModel`（可选，也包括旧版 `ANTHROPIC_SMALL_FAST_MODEL`） |
 | `ANTHROPIC_DEFAULT_{OPUS,SONNET,FABLE}_MODEL` | `claudeCode.tierModels.*`（可选） |
@@ -37,7 +37,9 @@ shell 不受影响，必须重新打开。
 
 `ocx stop` 和代理关闭操作会**取消设置已注入的键**（不会恢复之前的值——只会移除 opencodex
 注入的键）。代理还会写入 `~/.opencodex/claude-env.sh`；`ocx start` 会安装一个 `.zshrc`
-source hook，以自动加载该文件。
+source hook，以自动加载该文件，但仅限 `PATH` 中存在可执行的 Claude Code CLI。Claude Code
+不存在或系统环境集成未启用时，启动过程和 `ocx ensure` 会移除 OpenCodex 自己写入的 hook。
+Claude Desktop 使用独立 profile，不会触发 shell hook 安装。
 
 可以在配置中设置 `claudeCode.systemEnv: false`，或使用 GUI 开关来禁用。此功能仅适用于
 macOS；在其他平台上，请使用 `ocx claude`。
@@ -49,13 +51,15 @@ macOS；在其他平台上，请使用 `ocx claude`。
 **原样**转发到 `api.anthropic.com`——beta、思考签名、提示缓存和计费身份都保持完全原生，
 而已路由模型仍可在同一会话中通过选择器别名使用。
 
-**请求头处理：**转发前会移除逐跳请求头以及 `host`、`content-length`、`accept-encoding`、
-`x-opencodex-api-key` 和 `origin`。其他所有请求头（包括 `anthropic-beta` 和
-`anthropic-version`）都会透传。
+**请求头处理：**转发前始终会移除逐跳请求头以及 `host`、`content-length`、
+`accept-encoding`、`x-opencodex-api-key` 和 `origin`。在非回环绑定上，原生透传还要求通过
+`x-opencodex-api-key` 提供有效的代理准入凭据；此时 `Authorization` 和 `x-api-key` 只属于
+Anthropic。若任一提供方请求头包含代理准入密钥，该密钥会被移除，而另一请求头中的真实提供方
+凭据会保留。含逗号拼接的歧义凭据请求头不会被转发。
 
-只有同时满足以下**四个**条件时才会触发透传：`nativePassthrough` 不为 `false`；模型以
-`claude` 或 `anthropic` 开头；bearer 或 `x-api-key` 以 `sk-ant-` 开头；并且别名/模型映射
-解析后返回的模型保持不变。这也意味着使用 `ocx claude` 时不再出现
+只有同时满足以下所有条件时才会触发透传：`nativePassthrough` 不为 `false`；模型以
+`claude` 或 `anthropic` 开头；bearer 令牌或 `x-api-key` 以 `sk-ant-` 开头；并且别名/模型映射
+解析后返回的模型保持不变；并且在非回环绑定上，专用代理准入请求头有效。这也意味着使用 `ocx claude` 时不再出现
 “claude.ai connectors are disabled”警告。
 
 可以设置 `claudeCode.nativePassthrough: false` 来禁用；也可以通过
@@ -115,7 +119,7 @@ v1 别名按字面解码（历史上 model ID 中包含的两字符序列 `~s` /
 
 1. 实际窗口大于 200k **且**至少达到自动压缩阈值的模型，其选择器条目和环境变量槽位会带有
    `[1m]` 标记。
-2. 系统会注入 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`（默认 `350000`，范围 `100000`–`1000000`），
+2. 系统会注入 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`（默认 `829800`，范围 `100000`–`1000000`），
    使对话在该位置自动进行摘要。
 
 配置有三种状态：
@@ -128,7 +132,7 @@ v1 别名按字面解码（历史上 model ID 中包含的两字符序列 `~s` /
 工作——聊天会在触发摘要之前报错。
 
 低于 1M 的原生 Anthropic 模型绝不会被自动标记。你自行导出的值始终优先（代理会使用**你的**
-值来判断哪些模型可以安全标记）。手动编辑配置时填入的无效值会回退到 350k。
+值来判断哪些模型可以安全标记）。手动编辑配置时填入的无效值会回退到 829,800。
 
 ### 有效模型环境变量
 
@@ -245,7 +249,7 @@ Claude Code 的 `/effort` 设置会完整保留并传递给适配器：
 | --- | --- |
 | `thinking.type: "adaptive"` + `output_config.effort` | 直接传递强度（`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`\|`ultra`） |
 | `thinking.type: "enabled"` + `budget_tokens` | ≤4096→`low`，≤16384→`medium`，更高→`high` |
-| `thinking.type: "disabled"` | 完全省略推理参数 |
+| `thinking.type: "disabled"` | 显式发送 `reasoning: { effort: "none" }`，并省略 `summary` |
 
 解析后的值会显示在请求日志的 **Reasoning effort** 列中。
 
@@ -263,7 +267,7 @@ Claude Code 的 `/effort` 设置会完整保留并传递给适配器：
 | 用户 `tool_result` | `function_call_output`（`is_error` → `[tool error]` 前缀） |
 | 重放 `thinking` / `redacted_thinking` | 丢弃 |
 | Function 工具 | `{type: "function"}`（`web_search*` → `{type: "web_search"}`） |
-| `tool_choice` | `auto`→`auto`，`none`→`none`，`any`→`required`，指定名称→`{type:"function",name}` |
+| `tool_choice` | `auto`→`auto`，`none`→`none`，`any`→`required`，指定函数→`{type:"function",name}`，托管 WebSearch/web_search→`{type:"web_search"}` |
 | `max_tokens` | `max_output_tokens` |
 | `stop_sequences` | `stop` |
 

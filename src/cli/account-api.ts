@@ -48,6 +48,8 @@ export interface AccountDeps {
   loadConfigImpl?: () => OcxConfig;
   stdinImpl?: AccountStdin;
   stdinTimeoutMs?: number;
+  /** Internal test seam for the account-import POST; production is capped at ten minutes. */
+  importTimeoutMs?: number;
   /** Test/platform injection for the official Codex login in a restricted staging home. */
   spawnCodexLoginImpl?: (codexHome: string) => NativeMainLoginChild;
   /** Legacy test seam. Production always uses the spawned child handle above. */
@@ -143,6 +145,10 @@ export interface CodexQuotaDto {
   monthlyPercent?: number;
   weeklyResetAt?: number;
   monthlyResetAt?: number;
+  /** Sub-day burst window, when upstream declares one (#1791). */
+  shortPercent?: number;
+  shortResetAt?: number;
+  shortWindowSeconds?: number;
 }
 
 export interface ProviderQuotaWindowDto {
@@ -181,7 +187,7 @@ interface CodexAccountDto {
 function projectQuota(quota: CodexQuotaDto | null | undefined): CodexQuotaDto | null {
   if (!quota) return null;
   const projected: CodexQuotaDto = {};
-  for (const key of ["weeklyPercent", "monthlyPercent", "weeklyResetAt", "monthlyResetAt"] as const) {
+  for (const key of ["weeklyPercent", "monthlyPercent", "weeklyResetAt", "monthlyResetAt", "shortPercent", "shortResetAt", "shortWindowSeconds"] as const) {
     if (typeof quota[key] === "number" && Number.isFinite(quota[key])) projected[key] = quota[key];
   }
   return projected;

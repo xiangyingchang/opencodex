@@ -37,6 +37,8 @@ import {
 } from "./user-identity";
 import {
   markJournalInjectedState,
+  journaledInjectedOpenaiBaseUrl,
+  journaledInjectedCatalogPath,
   removeJournal,
   restoreJournalState,
   writeJournal,
@@ -46,9 +48,11 @@ import { withCatalogWriteSerialization } from "./catalog-write-serialization";
 import { restoreCodexCatalogWithPermit } from "./catalog/sync";
 import { syncCodexHistoryProvider, type CodexHistoryFailureReason } from "./history-provider";
 import {
+  describeHistoryJobFailure,
   deriveCodexHistoryOperation,
   resolveCodexHistoryJobTarget,
   runCodexHistoryJob,
+  type CodexHistoryJobOutcome,
 } from "./history-job";
 import {
   OCX_SECTION_MARKER,
@@ -58,6 +62,7 @@ import {
   providerTableStart,
   providerTableString,
   rootTomlString,
+  stripJournaledOpenaiBaseUrl,
   tomlStringPattern,
 } from "./injected-marker";
 import {
@@ -153,6 +158,12 @@ export interface InjectCodexOptions {
    * caller that is willing to wait can raise it.
    */
   lockTimeoutMs?: number;
+  /**
+   * Validate the same config transformations and write-coordination eligibility without
+   * changing the journal, config, profile, catalog, cache, or history. Sync uses this before
+   * provider discovery so a deterministic config refusal cannot degrade an existing catalog.
+   */
+  validateOnly?: boolean;
 }
 
 function configuredManagedSubagentDefaults(
@@ -242,9 +253,13 @@ export function buildProviderTableBlock(
     "requires_openai_auth = true",
   ];
   if (includeApiAuthHeader) {
-    lines.push(
-      'env_http_headers = { "x-opencodex-api-key" = "OPENCODEX_API_AUTH_TOKEN" }',
-    );
+    // codex-cli 0.146+ contract (#2073): env_key sends Authorization: Bearer $VAR and
+    // hard-errors on a missing/empty variable instead of silently omitting auth. It
+    // coexists with requires_openai_auth (env_key wins wire auth; the flag keeps the
+    // login/account UX), and the server substitutes stored main auth for our admission
+    // bearer (#1686), so the modern form is strictly better than the legacy
+    // env_http_headers table this line used to emit.
+    lines.push('env_key = "OPENCODEX_API_AUTH_TOKEN"');
   }
   if (supportsWebsockets) lines.push("supports_websockets = true");
   return lines.join("\n") + "\n";
@@ -467,7 +482,7 @@ function stripRootRoutedModel(content: string): string {
     .filter((line, i) => {
       const isRoot = firstTable === -1 || i < firstTable;
       if (!isRoot) return true;
-      const m = line.match(/^\s*model\s*=\s*("(?:\\.|[^"])*"|'[^']*')\s*$/);
+      const m = line.match(/^\s*model\s*=\s*("(?:\\.|[^"\\])*"|'[^']*')\s*$/);
       if (!m) return true;
       const model = parseTomlString(m[1]);
       return !model?.includes("/");
@@ -503,7 +518,7 @@ function setRootModelCatalogPath(content: string, catalogPath: string): string {
   const rootEnd = firstTable === -1 ? lines.length : firstTable;
   for (let i = 0; i < rootEnd; i++) {
     const m = lines[i].match(
-      /^\s*model_catalog_json\s*=\s*("(?:\\.|[^"])*"|'[^']*')\s*$/,
+      /^\s*model_catalog_json\s*=\s*("(?:\\.|[^"\\])*"|'[^']*')\s*$/,
     );
     if (!m) continue;
     const existing = parseTomlString(m[1]);
@@ -598,7 +613,7 @@ function stripOpencodexCatalogPath(content: string): string {
     .split("\n")
     .filter((line) => {
       const m = line.match(
-        /^\s*model_catalog_json\s*=\s*("(?:\\.|[^"])*"|'[^']*')\s*$/,
+        /^\s*model_catalog_json\s*=\s*("(?:\\.|[^"\\])*"|'[^']*')\s*$/,
       );
       return !m || !isOpencodexCatalogPath(parseTomlString(m[1]));
     })
@@ -677,7 +692,7 @@ export async function injectCodexConfig(
   if (activeProvider) {
     // A launcher may have journaled before the provider manager took ownership. Never let shutdown
     // replay that stale snapshot over externally managed config.
-    removeJournal();
+    if (!options.validateOnly) removeJournal();
     const nativeSubagentDefaultsWarning = configuredManagedSubagentDefaults(
       config,
     )
@@ -743,7 +758,7 @@ export async function injectCodexConfig(
   // Design B form FIRST: removeOcxSection also keys on the marker line, so a root-level
   // marker + openai_base_url pair must be gone before it scans or it would swallow root keys.
   content = stripInjectedOpenaiBaseUrl(content);
-  if (content.includes("[model_providers.opencodex]")) {
+  if (hasOcxProviderTable(content)) {
     content = removeOcxSection(content);
   }
   content = removeProfileSection(content);
@@ -884,6 +899,13 @@ export async function injectCodexConfig(
     return {
       success: false,
       message: `Codex configuration was not written: ${eligibility.reason}.`,
+    };
+  }
+
+  if (options.validateOnly) {
+    return {
+      success: true,
+      message: "Codex config injection preflight passed; no files were changed.",
     };
   }
 
@@ -1043,11 +1065,7 @@ export async function injectCodexConfig(
     config?.syncResumeHistory === false
       ? `  Codex resume history: left unchanged (syncResumeHistory=false).\n`
       : history.failed
-        ? legacyMode
-          ? `  ⚠️ Codex resume history sync SKIPPED: the history DB is locked (Codex app/IDE open?). Close it and rerun 'ocx start'.\n`
-          : // Honest in every caller context: the daemon retries in the background while it runs,
-            // and this inject path re-runs the migration on every future start/sync anyway.
-            `  ⚠️ Codex resume history migration deferred: the history DB is locked (Codex app/IDE open?). It is retried automatically (while the proxy runs and on every 'ocx start'); to force it now, close the Codex app and run 'ocx sync'.\n`
+        ? formatApplyHistoryFailure(historyOutcome, legacyMode)
         : legacyMode
           ? `  Codex resume history: ${history.rows} thread(s) made visible for opencodex; originals backed up for restore.\n`
           : migratedRows > 0
@@ -1090,6 +1108,30 @@ export async function injectCodexConfig(
   };
 }
 
+/**
+ * Sub-table headers like `[model_providers.opencodex.env_http_headers]` appear when a Codex app
+ * config rewrite re-serializes the provider's inline `env_http_headers` table. They define the
+ * same `model_providers.opencodex` provider, so cleanup must remove them too — otherwise the
+ * provider survives with no `name` and Codex rejects the whole config
+ * ("provider name must not be empty"). The dot terminator keeps a user's
+ * `[model_providers.opencodex_backup]`-style tables out of scope.
+ */
+function isOcxProviderHeaderLine(trimmedLine: string): boolean {
+  // Root form matched by regex, not equality: TOML v1.0 allows a trailing comment
+  // (`[model_providers.opencodex] # comment`), and an exact compare would miss that form.
+  // The sub-table prefix check already tolerates trailing comments by construction.
+  return (
+    /^\[model_providers\.opencodex\]\s*(?:#.*)?$/.test(trimmedLine) ||
+    trimmedLine.startsWith("[model_providers.opencodex.")
+  );
+}
+
+function hasOcxProviderTable(content: string): boolean {
+  return content
+    .split("\n")
+    .some((line) => isOcxProviderHeaderLine(line.trim()));
+}
+
 function removeOcxSection(content: string): string {
   const lines = content.split("\n");
   const filtered: string[] = [];
@@ -1097,18 +1139,16 @@ function removeOcxSection(content: string): string {
   for (const line of lines) {
     if (
       line.includes(OCX_SECTION_MARKER) ||
-      line.trim() === "[model_providers.opencodex]"
+      isOcxProviderHeaderLine(line.trim())
     ) {
       inOcxSection = true;
       continue;
     }
     if (inOcxSection) {
-      // End the injected section at the next table header that ISN'T our own — exact match so a
-      // user's "[model_providers.opencodex_backup]" (or similar) is preserved, not swallowed.
-      if (
-        /^\s*\[/.test(line) &&
-        line.trim() !== "[model_providers.opencodex]"
-      ) {
+      // End the injected section at the next table header that ISN'T our own. Exact match on the
+      // provider name (plus our own sub-tables) so a user's
+      // "[model_providers.opencodex_backup]" (or similar) is preserved, not swallowed.
+      if (/^\s*\[/.test(line) && !isOcxProviderHeaderLine(line.trim())) {
         inOcxSection = false;
         filtered.push(line);
       }
@@ -1136,13 +1176,19 @@ interface StripOpencodexConfigResult {
  */
 function stripOpencodexConfigResult(
   content: string,
+  journaledBaseUrl: string | null = null,
 ): StripOpencodexConfigResult {
   let out = content;
   const hadRootOcxProvider =
     readRootTomlString(out, "model_provider") === "opencodex";
-  const hadInjectedBaseUrl = hasInjectedOpenaiBaseUrl(out);
+  // #1798: marker adjacency is FORMATTING evidence, and a Codex app rewrite keeps values
+  // while dropping comments. Fall back to VALUE evidence -- the exact URL we recorded
+  // writing -- so an app-rewritten config is still recognized as ours.
+  const hadInjectedBaseUrl = hasInjectedOpenaiBaseUrl(out)
+    || (journaledBaseUrl !== null && rootTomlString(out, "openai_base_url") === journaledBaseUrl);
   out = stripInjectedOpenaiBaseUrl(out); // before removeOcxSection — it keys on the marker line too
-  if (out.includes("[model_providers.opencodex]")) {
+  out = stripJournaledOpenaiBaseUrl(out, journaledBaseUrl);
+  if (hasOcxProviderTable(out)) {
     out = removeOcxSection(out);
   }
   out = removeProfileSection(out);
@@ -1192,7 +1238,7 @@ export function stripOpencodexConfig(content: string): string {
 
 function hasOpencodexRouting(content: string): boolean {
   return (
-    content.includes("[model_providers.opencodex]") ||
+    hasOcxProviderTable(content) ||
     /^\s*model_provider\s*=\s*"opencodex"/m.test(content) ||
     hasInjectedOpenaiBaseUrl(content)
   );
@@ -1214,7 +1260,7 @@ function removeCodexConfigUnlocked(
   // The unchanged fast path compares in LF space so an untouched file is never rewritten.
   const eol = dominantEol(rawContent);
   const content = applyEol(rawContent, "\n");
-  const splitState = classifyCodexSplitState(content);
+const splitState = classifyCodexSplitState(content);
   if (splitState.state === "legacy-local" && !splitState.owned) {
     return {
       success: false,
@@ -1223,10 +1269,14 @@ function removeCodexConfigUnlocked(
         "No files were changed; inspect config.toml and recover from the saved journal if appropriate.",
     };
   }
-  const had = hasOpencodexRouting(content);
+  // Read the recorded injection once: the strip below consumes it, and so does the
+  // ownership verdict, which must agree with what was actually removed.
+  const journaledBaseUrl = journaledInjectedOpenaiBaseUrl();
+  const had = hasOpencodexRouting(content)
+    || (journaledBaseUrl !== null && rootTomlString(content, "openai_base_url") === journaledBaseUrl);
   const stripped = splitState.state === "split"
     ? stripBridgeOwnedSplitConfigResult(content)
-    : stripOpencodexConfigResult(content);
+    : stripOpencodexConfigResult(content, journaledBaseUrl);
   if (had || stripped.content !== content) {
     atomicWriteFile(CODEX_CONFIG_PATH, applyEol(stripped.content, eol));
   }
@@ -1291,7 +1341,7 @@ export interface CodexNativeRestoreResult {
   };
 }
 
-function failedHistoryRestore(reason?: CodexHistoryFailureReason): CodexRestoreHistoryResult {
+function failedHistoryRestore(reason?: CodexHistoryFailureReason, detail?: string): CodexRestoreHistoryResult {
   return {
     state: "failed",
     changed: false,
@@ -1301,8 +1351,34 @@ function failedHistoryRestore(reason?: CodexHistoryFailureReason): CodexRestoreH
     ejectedRows: 0,
     message: reason === "permission"
       ? "Codex resume history could NOT be restored because permission was denied."
-      : "Codex resume history could NOT be restored — the Codex app appears to be holding the history database.",
+      : reason === "busy"
+        ? "Codex resume history could NOT be restored — the Codex app appears to be holding the history database."
+        : detail
+          ? `Codex resume history could NOT be restored: ${detail}`
+          : "Codex resume history could NOT be restored; the reason was not recorded. Run 'ocx doctor'.",
   };
+}
+
+/**
+ * Restore failure wording for a Worker outcome.
+ *
+ * Only a genuine busy result blames the Codex app. An unsafe-path refusal, an
+ * unavailable coordinator database, a permission denial, or a dead/timed-out
+ * worker is a different problem; the old collapse made every one of those read
+ * as "the Codex app is holding the database" (issue #1191). `busy` and
+ * `permission` keep the restore-specific sentence built by
+ * `failedHistoryRestore`; every other reason reuses the single formatter so
+ * the two modules cannot drift apart.
+ */
+export function failedHistoryRestoreFromOutcome(
+  outcome: Extract<CodexHistoryJobOutcome, { kind: "blocked" | "failed" }>,
+): CodexRestoreHistoryResult {
+  if (outcome.kind === "blocked" && outcome.reason === "busy") return failedHistoryRestore("busy");
+  if (outcome.kind === "failed" && outcome.historyFailureReason === "busy") return failedHistoryRestore("busy");
+  if (outcome.kind === "failed" && outcome.historyFailureReason === "permission") {
+    return failedHistoryRestore("permission");
+  }
+  return failedHistoryRestore(undefined, describeHistoryJobFailure(outcome, "restore"));
 }
 
 function externalProviderRestoreResult(activeProvider: string): CodexNativeRestoreResult {
@@ -1466,6 +1542,88 @@ function restoreLockOutcome(
   return restoreLockFailure(`Codex configuration was not restored: ${result.message}`);
 }
 
+function restoreCodexConfigInline(): CodexRestoreConfigResult {
+  try {
+    const journalWasPresent = existsSync(JOURNAL_PATH);
+    const journal = restoreJournalState();
+    if (journal.complete) {
+      return {
+        state: "ok",
+        changed: journal.configRestored || journal.profileRestored || journal.profileChanged,
+        action: "journal-restored",
+        message: "Codex config restored from opencodex journal.",
+      };
+    }
+    if (journalWasPresent) {
+      if (journal.configRestored) {
+        return {
+          state: "failed",
+          changed: true,
+          action: "failed",
+          message: "Codex journal restore was incomplete; the config was restored but the profile or journal could not be finalized.",
+        };
+      }
+      const fallback = removeCodexConfigUnlocked({
+        preserveProfile: journal.profileRestored || journal.profileChanged,
+      });
+      return {
+        state: "failed",
+        changed: true,
+        action: "failed",
+        message: fallback.success
+          ? `${fallback.message} Codex journal restore was incomplete; the journal was not finalized.`
+          : fallback.message,
+      };
+    }
+    const fallback = removeCodexConfigUnlocked();
+    return {
+      state: fallback.success ? "ok" : "failed",
+      changed: fallback.success && fallback.message.startsWith("Removed"),
+      action: fallback.success ? "owned-fields-stripped" : "failed",
+      message: fallback.message,
+    };
+  } catch (error) {
+    return { state: "failed", changed: false, action: "failed", message: String(error) };
+  }
+}
+
+/** The catalog half, always inside its own K acquisition. */
+/**
+ * The catalog half, always inside its own K acquisition.
+ *
+ * `journaledCatalogPath` must be captured by the CALLER, before the config half runs: a
+ * successful journal restore deletes the journal, and a config restore can remove
+ * `model_catalog_json`. Reading it here would be too late in both cases (#1798).
+ */
+function restoreCodexCatalogArtifact(
+  revalidateDesiredState: boolean,
+  journaledCatalogPath: string | null,
+): CodexRestoreCatalogResult {
+  const owningCodexHome = getCodexHome();
+  try {
+    const restored = withCatalogWriteSerialization(owningCodexHome, permit =>
+      revalidateDesiredState && shouldSyncCodexOnStart(loadConfig())
+        ? null
+        : restoreCodexCatalogWithPermit(permit, owningCodexHome, journaledCatalogPath));
+    return restored.kind === "completed" && restored.value !== null
+      ? { state: "ok", changed: restored.value.removed > 0, ...restored.value, message: "Codex catalog restored." }
+      : restored.kind === "completed"
+        ? {
+            state: "skipped", changed: false, removed: 0, kept: 0, path: null,
+            message: "Codex integration was re-enabled; native catalog restoration was skipped.",
+          }
+        : {
+            state: "failed", changed: false, removed: 0, kept: 0, path: DEFAULT_CATALOG_PATH,
+            message: `Codex catalog could not be restored: ${restored.reason}.`,
+          };
+  } catch (error) {
+    return {
+      state: "failed", changed: false, removed: 0, kept: 0, path: DEFAULT_CATALOG_PATH,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 function restoreConfigLocked(
   acquire: "async" | "sync",
   options: {
@@ -1476,6 +1634,7 @@ function restoreConfigLocked(
   } = {},
 ): Promise<RestoreConfigLockedResult> | RestoreConfigLockedResult {
   const admitted = restoreAdmissionWitness();
+  const journaledCatalogPath = options.restoreCatalog ? journaledInjectedCatalogPath() : null;
   const restoreSurface = readRestoreSurface();
   const ownedRouting = restoreSurface.config !== null
     && classifyCodexSplitState(restoreSurface.config).owned;
@@ -1612,7 +1771,7 @@ function restoreConfigLocked(
         // config lock between routing restore and catalog cleanup. K contention throws
         // before the lock commits, so the pre-image compensation restores the config.
         const restoredCatalog = withCatalogWriteSerialization(ctx.canonicalCodexHome, permit =>
-          restoreCodexCatalogWithPermit(permit, ctx.canonicalCodexHome));
+          restoreCodexCatalogWithPermit(permit, ctx.canonicalCodexHome, journaledCatalogPath));
         if (restoredCatalog.kind !== "completed") {
           throw new CodexCatalogRestoreError(
             `Codex catalog restore could not be completed (${restoredCatalog.reason}).`,
@@ -1682,6 +1841,10 @@ function restoreConfigLocked(
     });
 }
 
+function resolveSkippedRestoreTransition(receipt: RestoreConfigLockedResult["receipt"]): void {
+  if (receipt) resolveCodexHistoryTransition(receipt, { kind: "skipped" });
+}
+
 function restoreConfigArtifact(result: RestoreConfigLockedResult): CodexRestoreConfigResult {
   if (result.configArtifact) return result.configArtifact;
   return {
@@ -1707,27 +1870,23 @@ function restoreCatalogArtifact(
       }
     : result.catalogFailure
       ? {
-        state: "failed",
-        changed: false,
-        removed: 0,
-        kept: 0,
-        path: DEFAULT_CATALOG_PATH,
-        message: result.catalogFailure,
-      }
-    : {
-        state: requested && result.success ? "failed" : "skipped",
-        changed: false,
-        removed: 0,
-        kept: 0,
-        path: requested && result.success ? DEFAULT_CATALOG_PATH : null,
-        message: requested
-          ? "Codex catalog restoration was not coordinated."
-          : "Native catalog restoration was not requested.",
-      };
-}
-
-function resolveSkippedRestoreTransition(receipt: RestoreConfigLockedResult["receipt"]): void {
-  if (receipt) resolveCodexHistoryTransition(receipt, { kind: "skipped" });
+          state: "failed",
+          changed: false,
+          removed: 0,
+          kept: 0,
+          path: DEFAULT_CATALOG_PATH,
+          message: result.catalogFailure,
+        }
+      : {
+          state: requested && result.success ? "failed" : "skipped",
+          changed: false,
+          removed: 0,
+          kept: 0,
+          path: requested && result.success ? DEFAULT_CATALOG_PATH : null,
+          message: requested
+            ? "Codex catalog restoration was not coordinated."
+            : "Native catalog restoration was not requested.",
+        };
 }
 
 export function removeCodexConfig(
@@ -1769,38 +1928,102 @@ export async function restoreNativeCodexAsync(
     if (ownership.ownership === "foreign") return foreignOwnershipRestoreRefusal(ownership.reason);
   }
 
-  const locked = await restoreConfigLocked("async", {
-    restoreCatalog: true,
-    revalidateDesiredState: options.revalidateDesiredState,
-  }) as RestoreConfigLockedResult;
-  if (locked.skippedReason === "desired_enabled") return desiredEnabledRestoreSkip();
-  const config = restoreConfigArtifact(locked);
-  const catalog = restoreCatalogArtifact(locked, true);
-  if (!locked.success && !locked.receipt) {
-    return {
-      success: false,
-      message: locked.message,
-      ...(locked.externalProvider ? { externalProvider: locked.externalProvider } : {}),
-      artifacts: {
-        config,
-        catalog,
-        history: {
-          state: "skipped",
-          changed: false,
-          rows: 0,
-          files: 0,
-          ejectedRows: 0,
-          message: "Codex resume history restoration was skipped because native restore did not complete.",
-        },
+const eligibility = codexWriteCoordinationEligibility({
+    coordinatorPath: () =>
+      resolveCodexCoordinatorDatabasePath(resolveEffectiveUserIdentity(), getCodexHome()),
+    residue: () => classifyNativeRoutedResidue(),
+    integrationRecord: () => readIntegrationRecord(),
+  });
+
+  // Captured before the config half: a successful journal restore DELETES the journal, and
+  // restoring the config can drop `model_catalog_json`. Either one would hide the routed
+  // catalog we actually wrote (#1798).
+  const journaledCatalogPath = journaledInjectedCatalogPath();
+  let config: CodexRestoreConfigResult;
+  let transitionReceipt: { nativeGeneration: number; currentTxId: string } | undefined;
+
+  if (eligibility.kind === "coordinated") {
+    // The restore has no candidate bytes to witness; freshness comes from the
+    // filesystem reads and the desired-state re-read performed under the lock.
+    const witness = { authoritySnapshotId: "codex-native-restore" };
+    const coordinated = await withCodexWriteLock(
+      {
+        timeoutMs: DEFAULT_INJECT_LOCK_TIMEOUT_MS,
+        admitted: witness,
+        readAdmissionUnderLock: () => witness,
       },
-    };
+      (ctx) => {
+        if (options.revalidateDesiredState && shouldSyncCodexOnStart(loadConfig())) {
+          throw new CodexWriteLockSkipped("desired_enabled");
+        }
+        const published = ctx.coordinator.beginTransition(
+          {
+            nativeGeneration: ctx.expectation.nativeBefore,
+            currentTxId: ctx.currentTxId,
+          },
+          {
+            txId: ctx.expectation.txId,
+            direction: "remove",
+            authoritySnapshotId: ctx.admission.authoritySnapshotId,
+            nextRetryAt: new Date().toISOString(),
+          },
+        );
+        if (published.kind !== "updated") {
+          throw new CodexWriteConflictError(
+            `The Codex transition could not be published: ${published.kind}.`,
+          );
+        }
+        const preImages = captureCodexPreImages();
+        let restored: CodexRestoreConfigResult;
+        try {
+          restored = restoreCodexConfigInline();
+        } catch (error) {
+          const compensated = restoreCodexPreImages(preImages);
+          if (!compensated.complete) throw new CodexPartialWriteError(compensated.unrestored);
+          throw error;
+        }
+        return {
+          config: restored,
+          receipt: {
+            nativeGeneration: ctx.expectation.nativeAfter,
+            currentTxId: ctx.expectation.txId,
+          },
+        };
+      },
+    );
+    if (coordinated.status === "skipped") return desiredEnabledRestoreSkip();
+    if (coordinated.status !== "acquired") {
+      config = {
+        state: "failed",
+        changed: false,
+        action: "failed",
+        message: coordinated.status === "busy"
+          ? `Another process is writing Codex configuration right now (waited ${coordinated.waitedMs}ms). Retry shortly.`
+          : `Codex configuration was not restored: ${coordinated.message}`,
+      };
+    } else {
+      config = coordinated.value.config;
+      transitionReceipt = coordinated.value.receipt;
+    }
+  } else {
+    // Legacy-uncoordinated (or unresolvable) homes keep the unserialized path
+    // they have always had; restore is the escape hatch and must not strand
+    // them. The plain re-read still honors an intervening re-enable.
+    if (options.revalidateDesiredState && shouldSyncCodexOnStart(loadConfig())) {
+      return desiredEnabledRestoreSkip();
+    }
+    config = restoreCodexConfigInline();
   }
 
+  const catalog = restoreCodexCatalogArtifact(options.revalidateDesiredState === true, journaledCatalogPath);
   const outcome = await runCodexHistoryJob({
     ...resolveCodexHistoryJobTarget(),
     ...(options.revalidateDesiredState ? { expectedDesiredEnabled: false } : {}),
     operation: deriveCodexHistoryOperation({ direction: "restore", resumeHistory: true, legacyMode: false }),
   });
+  if (transitionReceipt) {
+    resolveCodexHistoryTransition(transitionReceipt, outcome);
+  }
   const history: CodexRestoreHistoryResult = outcome.kind === "converged"
     ? {
         state: "ok", changed: outcome.rows > 0, rows: outcome.rows, files: outcome.files, ejectedRows: 0,
@@ -1817,12 +2040,9 @@ export async function restoreNativeCodexAsync(
               ? "Codex integration was disabled; history restoration was skipped."
               : "Codex integration was enabled; history restoration was skipped.",
           }
-      : outcome.kind === "blocked" && outcome.reason === "busy"
-        ? failedHistoryRestore("busy")
-        : outcome.kind === "failed"
-          ? failedHistoryRestore(outcome.historyFailureReason)
-          : failedHistoryRestore();
-  if (locked.receipt) resolveCodexHistoryTransition(locked.receipt, outcome);
+      : outcome.kind === "blocked" || outcome.kind === "failed"
+        ? failedHistoryRestoreFromOutcome(outcome)
+        : failedHistoryRestore();
   const base = catalog.removed > 0
     ? `${config.message} Catalog restored to ${catalog.kept} native model(s) (dropped ${catalog.removed} proxy-routed).`
     : config.message;
@@ -1832,7 +2052,6 @@ export async function restoreNativeCodexAsync(
   return {
     success,
     message: `${base}${history.state === "failed" ? ` ⚠️ ${history.message}` : ""}`,
-    ...(locked.externalProvider ? { externalProvider: locked.externalProvider } : {}),
     artifacts: { config, catalog, history },
   };
 }
@@ -1926,4 +2145,26 @@ export function restoreNativeCodex(options: { skipHistory?: boolean; revalidateD
 
 export function getCodexConfigPath(): string {
   return CODEX_CONFIG_PATH;
+}
+
+/**
+ * Frame one failed apply history job honestly.
+ *
+ * A genuine lock keeps the established deferred/SKIPPED wording; any other
+ * reason names itself instead of blaming the Codex app/IDE.
+ */
+export function formatApplyHistoryFailure(outcome: CodexHistoryJobOutcome, legacyMode: boolean): string {
+  // A busy database is a deferral no matter which half observed it: the lock
+  // contended (blocked/busy), or the worker acquired the lock and then found
+  // SQLite busy (failed with a busy history reason). Only those keep the
+  // deferred headline; every other failure is a real "NOT changed".
+  const busy =
+    (outcome.kind === "blocked" && outcome.reason === "busy") ||
+    (outcome.kind === "failed" && outcome.historyFailureReason === "busy");
+  const headline = legacyMode
+    ? "Codex resume history sync SKIPPED"
+    : busy
+      ? "Codex resume history migration deferred"
+      : "Codex resume history NOT changed";
+  return `  ⚠️ ${headline}: ${describeHistoryJobFailure(outcome, "apply", legacyMode)}\n`;
 }

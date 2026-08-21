@@ -21,7 +21,7 @@ ocx claude
 | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:<port>` |
 | `ANTHROPIC_AUTH_TOKEN` | Только когда прокси требует API-ключ — иначе переменная НЕ устанавливается, поэтому ваш вход в claude.ai (подписка + коннекторы) остаётся активным |
 | `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` | `1` (обнаружение моделей в нативном селекторе `/model`) |
-| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Порог автосжатия контекста (по умолчанию `350000`); внедряется только при включённом автоконтексте |
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Порог автосжатия контекста (по умолчанию `829800`); внедряется только при включённом автоконтексте |
 | `ANTHROPIC_MODEL` | `claudeCode.model` (необязательно) |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `claudeCode.tierModels.haiku ?? claudeCode.smallFastModel` (необязательно; поддерживается и устаревшая `ANTHROPIC_SMALL_FAST_MODEL`) |
 | `ANTHROPIC_DEFAULT_{OPUS,SONNET,FABLE}_MODEL` | `claudeCode.tierModels.*` (необязательно) |
@@ -39,7 +39,10 @@ ocx claude
 
 `ocx stop` и остановка прокси **снимают внедрённые ключи** (прежние значения не восстанавливаются —
 удаляются только ключи, внедрённые opencodex). Прокси также записывает `~/.opencodex/claude-env.sh`;
-`ocx start` устанавливает source-хук в `.zshrc`, который загружает этот файл автоматически.
+`ocx start` устанавливает source-хук в `.zshrc` только когда исполняемый Claude Code CLI найден в
+`PATH`. При запуске и выполнении `ocx ensure` хук, принадлежащий OpenCodex, удаляется, если файл Claude
+Code CLI не найден в `PATH`, не имеет права на выполнение или системная интеграция окружения выключена.
+Claude Desktop использует отдельный профиль и не вызывает установку shell-хука.
 
 Отключить можно параметром `claudeCode.systemEnv: false` в конфигурации или переключателем в GUI.
 Функция доступна только на macOS; на других платформах используйте `ocx claude`.
@@ -54,12 +57,17 @@ ocx claude
 работать в той же сессии через алиасы селектора.
 
 **Обработка заголовков:** hop-by-hop-заголовки, а также `host`, `content-length`,
-`accept-encoding`, `x-opencodex-api-key` и `origin` удаляются перед пересылкой. Все остальные
-заголовки (включая `anthropic-beta` и `anthropic-version`) проходят без изменений.
+`accept-encoding`, `x-opencodex-api-key` и `origin` всегда удаляются перед пересылкой. На
+non-loopback bind нативный passthrough также требует валидный proxy credential именно в
+`x-opencodex-api-key`; после этого `Authorization` и `x-api-key` принадлежат только Anthropic.
+Proxy admission secret в любом provider-заголовке удаляется, а настоящий provider credential в
+другом заголовке сохраняется. Неоднозначные credential-заголовки, объединённые запятыми, не
+пересылаются.
 
-Проброс срабатывает, когда выполнены **все четыре** условия: `nativePassthrough` не равен `false`;
-имя модели начинается с `claude` или `anthropic`; bearer или `x-api-key` начинается с `sk-ant-`;
-и разрешение алиасов и карты моделей возвращает ту же модель без изменений. Это также означает,
+Проброс срабатывает, когда выполнены **все** условия: `nativePassthrough` не равен `false`;
+имя модели начинается с `claude` или `anthropic`; bearer-токен или `x-api-key` начинается с `sk-ant-`;
+разрешение алиасов и карты моделей возвращает ту же модель без изменений; а на non-loopback bind
+валиден dedicated proxy admission-header. Это также означает,
 что предупреждение «claude.ai connectors are disabled» с `ocx claude` больше не появляется.
 
 Отключается параметром `claudeCode.nativePassthrough: false`; другой адрес задаётся через
@@ -118,7 +126,7 @@ Anthropic сохраняют канонические id в обоих инте�
 
 1. Модели, чьё реальное окно больше 200k **и** не меньше порога автосжатия, получают маркер
    `[1m]` в строках селектора и слотах окружения.
-2. Внедряется `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (по умолчанию `350000`, диапазон
+2. Внедряется `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (по умолчанию `829800`, диапазон
    `100000`–`1000000`), чтобы в этой точке диалог автоматически резюмировался.
 
 Три состояния конфигурации:
@@ -134,7 +142,7 @@ Anthropic сохраняют канонические id в обоих инте�
 Нативные модели Anthropic с окном меньше 1M никогда не помечаются автоматически. Экспортированные
 вами значения всегда имеют приоритет (прокси использует ВАШЕ значение, чтобы решить, какие модели
 можно безопасно пометить). Некорректные значения, внесённые в конфигурацию вручную, откатываются
-к 350k.
+к 829,800.
 
 ### Эффективное окружение моделей
 
@@ -266,7 +274,7 @@ Claude Code — это лишь учётные данные для доступ�
 | --- | --- |
 | `thinking.type: "adaptive"` + `output_config.effort` | Уровень передаётся напрямую (`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`\|`ultra`) |
 | `thinking.type: "enabled"` + `budget_tokens` | ≤4096→`low`, ≤16384→`medium`, выше→`high` |
-| `thinking.type: "disabled"` | Параметры рассуждений полностью опускаются |
+| `thinking.type: "disabled"` | Явно передаётся `reasoning: { effort: "none" }`, а `summary` опускается |
 
 Итоговое значение отображается в столбце **Reasoning effort** журнала запросов.
 
@@ -284,7 +292,7 @@ Claude Code — это лишь учётные данные для доступ�
 | `tool_result` пользователя | `function_call_output` (`is_error` → префикс `[tool error]`) |
 | Повтор `thinking` / `redacted_thinking` | Отбрасывается |
 | Function-инструменты | `{type: "function"}` (`web_search*` → `{type: "web_search"}`) |
-| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, именованный→`{type:"function",name}` |
+| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, именованная функция→`{type:"function",name}`, размещённый WebSearch/web_search→`{type:"web_search"}` |
 | `max_tokens` | `max_output_tokens` |
 | `stop_sequences` | `stop` |
 

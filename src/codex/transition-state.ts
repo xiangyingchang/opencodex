@@ -34,6 +34,7 @@ import {
   CodexUserIdentityRefusal,
   resolveCodexCoordinatorDatabasePath,
   resolveEffectiveUserIdentity,
+  samePathIdentity,
 } from "./user-identity";
 
 const COORDINATOR_SCHEMA_VERSION = 1;
@@ -277,8 +278,6 @@ function assertInitialStateCanBeCreated(
     );
   }
   const residue = classifyNativeRoutedResidue();
-  // Restore may explicitly authorize an indeterminate surface only after it has
-  // found journal or external-provider evidence. Injection never sets that flag.
   if (allowLegacyResidue && residue.kind === "residue") return;
   if (allowIndeterminateProfile && isUnmarkedProfileResidue(residue)) return;
   if (allowIndeterminateResidue && residue.kind === "indeterminate") return;
@@ -292,9 +291,9 @@ function assertInitialStateCanBeCreated(
 function initialize(
   database: Database,
   databaseWasAbsent: boolean,
-  allowLegacyResidue: boolean,
-  allowIndeterminateResidue: boolean,
-  allowIndeterminateProfile: boolean,
+  allowLegacyResidue = false,
+  allowIndeterminateResidue = false,
+  allowIndeterminateProfile = false,
 ): void {
   const version = database.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version;
   if (version !== 0 && version !== COORDINATOR_SCHEMA_VERSION) {
@@ -313,11 +312,7 @@ function initialize(
     );
   }
   if (!existing) {
-    assertInitialStateCanBeCreated(
-      allowLegacyResidue,
-      allowIndeterminateResidue,
-      allowIndeterminateProfile,
-    );
+    assertInitialStateCanBeCreated(allowLegacyResidue, allowIndeterminateResidue, allowIndeterminateProfile);
     database.query(INITIALIZE_TRANSITION_ROW).run(new Date().toISOString());
   }
   if (version === 0) database.exec(`PRAGMA user_version = ${COORDINATOR_SCHEMA_VERSION}`);
@@ -379,6 +374,7 @@ export function openCodexCoordinatorTransaction(
   let lastResult: TransitionStateUpdate | undefined;
   let initialIdentity: string | undefined;
   let databaseWasAbsent = false;
+  let databaseWasEmpty = false;
 
   try {
     try {
@@ -386,6 +382,12 @@ export function openCodexCoordinatorTransaction(
       if (before.isSymbolicLink() || !before.isFile()) {
         throw new CodexUserIdentityRefusal("The coordinator database path is not a real file.");
       }
+      // sqlite3_open_v2(..., SQLITE_OPEN_CREATE) makes the pathname visible
+      // before the first schema write. A racing process can therefore observe a
+      // real but zero-byte file that carries no coordinator authority yet. Treat
+      // that exact state like ENOENT; any non-empty unversioned database remains
+      // legacy-ambiguous below.
+      databaseWasEmpty = before.size === 0;
       if (process.platform !== "win32") {
         const uid = process.getuid?.();
         // Ownership is decided here; MODE is not.
@@ -444,7 +446,7 @@ export function openCodexCoordinatorTransaction(
     transactionOpen = true;
     initialize(
       database,
-      databaseWasAbsent,
+      databaseWasAbsent || databaseWasEmpty,
       options.allowLegacyResidue === true,
       options.allowIndeterminateResidue === true,
       options.allowIndeterminateProfile === true,
@@ -466,7 +468,7 @@ export function openCodexCoordinatorTransaction(
     const entry = lstatSync(finalDatabasePath);
     if (entry.isSymbolicLink() || !entry.isFile()
       || `${entry.dev}:${entry.ino}` !== initialIdentity
-      || realpathSync.native(finalDatabasePath) !== finalDatabasePath) {
+      || !samePathIdentity(realpathSync.native(finalDatabasePath), finalDatabasePath)) {
       throw new CodexUserIdentityRefusal("The coordinator database path was substituted.");
     }
   };

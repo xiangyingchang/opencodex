@@ -22,6 +22,11 @@ import {
 } from "../src/server/lifecycle";
 import type { OcxConfig } from "../src/types";
 import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
+import { ownedServiceHomeInspection } from "./helpers/owned-service-home-inspection";
+
+import { watchdogMs } from "./helpers/ci-watchdog";
+/** These cases sandbox CODEX_HOME/OPENCODEX_HOME, so the installed service is not their evidence. */
+const inspectNativeCodexOwnership = ownedServiceHomeInspection("native-profile drain server test");
 
 const originalFetch = globalThis.fetch;
 const previousOpencodexHome = process.env.OPENCODEX_HOME;
@@ -92,7 +97,7 @@ describe("native main profile scoped server admission", () => {
       autoSwitchThreshold: 0,
     } as OcxConfig);
     const waitForFrame = (ws: WebSocket, needle: string) => new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`websocket timeout waiting for ${needle}`)), 2_000);
+      const timer = setTimeout(() => reject(new Error(`websocket timeout waiting for ${needle}`)), watchdogMs(2_000));
       const onMessage = (event: MessageEvent) => {
         const text = typeof event.data === "string" ? event.data : "";
         if (!text.includes(needle)) return;
@@ -104,7 +109,7 @@ describe("native main profile scoped server admission", () => {
     });
 
     saveMode("direct");
-    let server: ReturnType<typeof startServer> | undefined = startServer(0);
+    let server: ReturnType<typeof startServer> | undefined = startServer(0, { inspectNativeCodexOwnership });
     const drain = acquireNativeMainProfileDrain("test-switch");
     expect(drain).not.toBeNull();
     try {
@@ -132,7 +137,7 @@ describe("native main profile scoped server admission", () => {
 
       saveMode("pool");
       updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, 1, 1);
-      server = startServer(0);
+      server = startServer(0, { inspectNativeCodexOwnership });
       await waitForNativeMainStartupGate();
       const mainHttp = await fetch(new URL("/v1/responses", server.url), {
         method: "POST",
@@ -179,6 +184,10 @@ describe("native main profile scoped server admission", () => {
         close() { upstreamCloses += 1; },
       },
     });
+    const waitUntil = async (condition: () => boolean): Promise<void> => {
+      const deadline = Date.now() + 2_000;
+      while (!condition() && Date.now() < deadline) await Bun.sleep(10);
+    };
     const liveProvider = (codexAccountMode: "direct" | "pool") => ({
       adapter: "openai-responses" as const,
       baseUrl: "https://chatgpt.com/backend-api/codex",
@@ -209,7 +218,7 @@ describe("native main profile scoped server admission", () => {
       url.protocol = "ws:";
       const ws = new WebSocket(url, { headers } as unknown as string[]);
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("sideband echo timeout")), 5_000);
+        const timer = setTimeout(() => reject(new Error("sideband echo timeout")), watchdogMs(5_000));
         ws.addEventListener("open", () => ws.send("ping"), { once: true });
         ws.addEventListener("message", event => {
           if (String(event.data) !== "echo:ping") return;
@@ -232,8 +241,7 @@ describe("native main profile scoped server admission", () => {
       }, { once: true }));
       ws.close();
       await closed;
-      const deadline = Date.now() + 2_000;
-      while (getNativeMainProfileRequestCount() > 0 && Date.now() < deadline) await Bun.sleep(10);
+      await waitUntil(() => getNativeMainProfileRequestCount() === 0);
       return requestCountAtDownstreamClose;
     };
     const handshakeStatus = (server: ReturnType<typeof startServer>, path: string) => new Promise<number>((resolve, reject) => {
@@ -271,7 +279,7 @@ describe("native main profile scoped server admission", () => {
     try {
       saveMode("pool", MAIN_CODEX_ACCOUNT_ID);
       updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, 1, 1);
-      server = startServer(0);
+      server = startServer(0, { inspectNativeCodexOwnership });
       await waitForNativeMainStartupGate();
       client = await connectEcho(server, "/v1/live/main-pre-fence");
       expect(getNativeMainProfileRequestCount()).toBe(1);
@@ -281,14 +289,15 @@ describe("native main profile scoped server admission", () => {
         {} as OcxConfig,
         { manager, drainTimeoutMs: 0 },
       );
-       expect(blocked?.status).toBe(409);
-       expect(switches).toBe(0);
-       // The proxy must still own native-main at the downstream close boundary,
-       // then release only after the mock authenticated upstream closes.
-       expect(await closeSocket(client)).toBe(1);
-       client = undefined;
-       expect(upstreamCloses).toBe(1);
-       expect(getNativeMainProfileRequestCount()).toBe(0);
+      expect(blocked?.status).toBe(409);
+      expect(switches).toBe(0);
+      // The proxy must still own native-main at the downstream close boundary,
+      // then release only after the mock authenticated upstream closes.
+      expect(await closeSocket(client)).toBe(1);
+      client = undefined;
+      await waitUntil(() => upstreamCloses >= 1);
+      expect(upstreamCloses).toBe(1);
+      expect(getNativeMainProfileRequestCount()).toBe(0);
       const afterClose = await handleNativeProfileAPI(
         switchRequest(),
         new URL("http://localhost/api/native-main-profiles/switch"),
@@ -307,7 +316,7 @@ describe("native main profile scoped server admission", () => {
       server = undefined;
 
       saveMode("direct", MAIN_CODEX_ACCOUNT_ID);
-      server = startServer(0);
+      server = startServer(0, { inspectNativeCodexOwnership });
       const directDrain = acquireNativeMainProfileDrain("direct-sideband");
       const directToken = fakeChatGptJwt({ chatgpt_account_id: "direct-account" });
       client = await connectEcho(server, "/v1/live/direct", {
@@ -329,7 +338,7 @@ describe("native main profile scoped server admission", () => {
       });
       updateAccountQuota("pool-a", 1, 1);
       saveMode("pool", "pool-a");
-      server = startServer(0);
+      server = startServer(0, { inspectNativeCodexOwnership });
       const poolDrain = acquireNativeMainProfileDrain("pool-sideband");
       client = await connectEcho(server, "/v1/realtime/calls/pool");
       expect(getNativeMainProfileRequestCount()).toBe(0);
@@ -395,6 +404,7 @@ describe("native main profile scoped server admission", () => {
       },
     } as unknown as NativeProfileManager;
     const server = startServer(0, {
+      inspectNativeCodexOwnership,
       liveSidebandWebSocketFactory: () => {
         upstream = new UncooperativeUpstream();
         queueMicrotask(() => upstream?.open());
@@ -408,7 +418,7 @@ describe("native main profile scoped server admission", () => {
 
     try {
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("sideband websocket open timeout")), 2_000);
+        const timer = setTimeout(() => reject(new Error("sideband websocket open timeout")), watchdogMs(2_000));
         client.addEventListener("open", () => {
           clearTimeout(timer);
           resolve();

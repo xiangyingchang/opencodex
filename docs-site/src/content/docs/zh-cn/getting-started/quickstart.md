@@ -13,7 +13,7 @@ ocx init
 
 `ocx init` 会引导你完成：
 
-1. **选择 provider** — 从内置 registry 的 76 个预设中选择一个，或选择 `custom` 手动输入 base URL 和 adapter。
+1. **选择 provider** — 从内置 registry 的 79 个预设中选择一个，或选择 `custom` 手动输入 base URL 和 adapter。
 2. **API key** — 粘贴一个 key，或引用一个环境变量，例如 `${ANTHROPIC_API_KEY}`。
 3. **默认模型** — 对于 key、本地和 custom provider，接受预设值或输入模型 id。
 4. **代理端口** — 默认为 `10100`。
@@ -23,7 +23,7 @@ ocx init
 结果会保存到 `$OPENCODEX_HOME/config.json`（默认 `~/.opencodex/config.json`）。
 
 :::note[GPT-5.6 灰度发布条目]
-当前稳定版会为 ChatGPT 透传、OpenAI API key、OpenRouter，以及实验性的 Cursor adapter 预置 GPT-5.6 Sol/Terra/Luna。只有当上游账号具备访问权限时它们才可用。OpenAI API key 和 OpenRouter 预设声明的可用上下文窗口为 372,000 token；Cursor 则保留自己的 adapter 元数据。
+当前稳定版会为 ChatGPT 透传、OpenAI API key、OpenRouter，以及实验性的 Cursor adapter 预置 GPT-5.6 Sol/Terra/Luna。只有当上游账号具备访问权限时它们才可用。OpenAI API key 和 OpenRouter 预设声明的可用上下文窗口为 922,000 token；Cursor 则保留自己的 adapter 元数据。
 :::
 
 ## 2. 启动代理

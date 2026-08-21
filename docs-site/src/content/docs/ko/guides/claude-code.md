@@ -20,7 +20,7 @@ ocx claude
 | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:<port>` |
 | `ANTHROPIC_AUTH_TOKEN` | 프록시에 API 키가 필요할 때만 설정해요. 그 외에는 설정하지 않으므로 claude.ai 로그인(구독 + 커넥터)이 유지돼요 |
 | `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` | `1` (기본 `/model` 선택기의 모델 검색) |
-| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | 자동 컨텍스트 압축 임곗값(기본값 `350000`). 자동 컨텍스트가 켜져 있을 때만 주입해요 |
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | 자동 컨텍스트 압축 임곗값(기본값 `829800`). 자동 컨텍스트가 켜져 있을 때만 주입해요 |
 | `ANTHROPIC_MODEL` | `claudeCode.model` (선택 사항) |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `claudeCode.tierModels.haiku ?? claudeCode.smallFastModel` (선택 사항, 기존 `ANTHROPIC_SMALL_FAST_MODEL`도 지원) |
 | `ANTHROPIC_DEFAULT_{OPUS,SONNET,FABLE}_MODEL` | `claudeCode.tierModels.*` (선택 사항) |
@@ -62,7 +62,9 @@ macOS의 자동 연결(`claudeCode.systemEnv`)도 같은 방식으로 판단하�
 
 `ocx stop`과 프록시 종료는 **주입된 키를 해제해요**. 이전 값을 복원하지는 않고 opencodex가
 주입한 키만 제거해요. 프록시는 `~/.opencodex/claude-env.sh`도 작성하고, `ocx start`는 이 파일을
-자동으로 불러오는 `.zshrc` source hook을 설치해요.
+자동으로 불러오는 `.zshrc` source hook을 실행 가능한 Claude Code CLI가 `PATH`에 있을 때만 설치해요.
+Claude Code가 없거나 시스템 환경 연동이 비활성화되어 있으면 시작 과정과 `ocx ensure`가 OpenCodex가 추가한
+hook을 제거해요. Claude Desktop은 별도 profile을 사용하며 shell hook 설치를 유발하지 않아요.
 
 설정에서 `claudeCode.systemEnv: false`로 지정하거나 GUI 토글로 끌 수 있어요. 이 기능은 macOS
 전용이며, 다른 플랫폼에서는 `ocx claude`를 사용하세요.
@@ -75,12 +77,16 @@ macOS의 자동 연결(`claudeCode.systemEnv`)도 같은 방식으로 판단하�
 네이티브 상태로 유지되고, 같은 세션에서 선택기 별칭을 써서 라우팅 모델도 계속 사용할 수 있어요.
 
 **헤더 처리:** hop-by-hop 헤더와 `host`, `content-length`, `accept-encoding`,
-`x-opencodex-api-key`, `origin`은 전달 전에 제거해요. 그 밖의 헤더(`anthropic-beta`,
-`anthropic-version` 포함)는 그대로 전달해요.
+`x-opencodex-api-key`, `origin`은 항상 전달 전에 제거해요. 비루프백 바인드의 네이티브 패스스루는
+유효한 프록시 자격 증명을 `x-opencodex-api-key`로도 요구하고, 이때 `Authorization`과
+`x-api-key`는 Anthropic 전용이에요. 두 provider 헤더 중 프록시 admission secret이 있으면
+제거하고, 다른 헤더의 실제 provider 자격 증명은 유지해요. 쉼표로 결합된 모호한 자격 증명
+헤더는 전달하지 않아요.
 
-다음 네 조건을 **모두** 충족하면 패스스루가 작동해요. `nativePassthrough`가 `false`가 아니고,
-모델 이름이 `claude` 또는 `anthropic`으로 시작하며, bearer 또는 `x-api-key`가 `sk-ant-`로
-시작하고, 별칭/모델 맵 해석 결과가 변경되지 않은 같은 모델이어야 해요. 그래서 `ocx claude`를
+다음 조건을 **모두** 충족하면 패스스루가 작동해요. `nativePassthrough`가 `false`가 아니고,
+모델 이름이 `claude` 또는 `anthropic`으로 시작하며, bearer 토큰 또는 `x-api-key`가 `sk-ant-`로
+시작하고, 별칭/모델 맵 해석 결과가 변경되지 않은 같은 모델이며, 비루프백 바인드에서는 전용
+프록시 admission 헤더도 유효해야 해요. 그래서 `ocx claude`를
 사용할 때 "claude.ai connectors are disabled" 경고도 더 이상 나타나지 않아요.
 
 `claudeCode.nativePassthrough: false`로 끌 수 있고, `claudeCode.anthropicBaseUrl`로 다른 주소를
@@ -146,7 +152,7 @@ Claude Code는 알 수 없는 모델의 컨텍스트를 200k 토큰으로 계산
 
 1. 실제 컨텍스트 창이 200k보다 크고 자동 압축 임곗값 이상인 모델의 선택기 행과 환경 슬롯에
    `[1m]` 표식이 붙어요.
-2. `CLAUDE_CODE_AUTO_COMPACT_WINDOW`(기본값 `350000`, 범위 `100000`–`1000000`)를 주입해 해당
+2. `CLAUDE_CODE_AUTO_COMPACT_WINDOW`(기본값 `829800`, 범위 `100000`–`1000000`)를 주입해 해당
    지점에서 대화를 자동으로 요약해요.
 
 설정 상태는 세 가지예요.
@@ -160,7 +166,7 @@ Claude 페이지에서 압축 값을 조절할 수 있어요. **경고:** 모델
 
 1M 미만인 네이티브 Anthropic 모델에는 자동으로 표식을 붙이지 않아요. 직접 내보낸 값이 항상
 우선하며, 프록시는 **사용자가 지정한** 값을 기준으로 어떤 모델에 안전하게 표식을 붙일지 결정해요.
-직접 편집한 설정값이 잘못되면 350k로 돌아가요.
+직접 편집한 설정값이 잘못되면 829,800로 돌아가요.
 
 ### 실제 모델 환경
 
@@ -287,7 +293,7 @@ Claude Code의 `/effort` 설정은 어댑터에서도 유지돼요.
 | --- | --- |
 | `thinking.type: "adaptive"` + `output_config.effort` | Effort를 그대로 전달해요(`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`\|`ultra`) |
 | `thinking.type: "enabled"` + `budget_tokens` | ≤4096→`low`, ≤16384→`medium`, 그보다 크면→`high` |
-| `thinking.type: "disabled"` | 추론 매개변수를 모두 생략해요 |
+| `thinking.type: "disabled"` | `reasoning: { effort: "none" }`을 명시하고 `summary`는 생략해요 |
 
 해석된 값은 요청 로그의 **Reasoning effort** 열에 표시돼요.
 
@@ -305,7 +311,7 @@ Claude Code의 `/effort` 설정은 어댑터에서도 유지돼요.
 | 사용자 `tool_result` | `function_call_output`(`is_error` → `[tool error]` 접두사) |
 | `thinking` / `redacted_thinking` 재생 | 버려요 |
 | Function 도구 | `{type: "function"}`(`web_search*` → `{type: "web_search"}`) |
-| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, 이름 지정→`{type:"function",name}` |
+| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, 이름 지정 함수→`{type:"function",name}`, 호스팅 WebSearch/web_search→`{type:"web_search"}` |
 | `max_tokens` | `max_output_tokens` |
 | `stop_sequences` | `stop` |
 

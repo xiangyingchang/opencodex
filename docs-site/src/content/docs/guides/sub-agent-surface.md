@@ -20,6 +20,11 @@ Choose the mode for **new sessions**. Existing sessions keep the surface they st
 | **base** (default) | Upstream model pins: GPT-5.6 Sol/Terra use v2, Luna uses v1, and unpinned models follow Codex's `multi_agent_v2` feature flag. | Most users. It follows Codex's intended surface for each model without forcing one globally. |
 | **v2** | Flat `spawn_agent`, `send_message`, `followup_task`, `interrupt_agent`, and agent-list tools, with concurrent sessions. | Users who want the newer concurrent workflow and understand model inheritance and the encrypted-task limitation below. |
 
+On **v2**, an optional **Keep ChatGPT on v1** switch (`keepNativeChatGptOnV1`) leaves Sol/Terra
+on the v1 surface so they can still spawn Grok or Claude. ChatGPT-native parents encrypt v2
+`NEW_TASK` bodies; routed models cannot read them. Routed parents stay on v2, where child tasks
+are plaintext. This is a switch *inside* v2, not a fourth catalog mode.
+
 :::tip[Not sure?]
 Start with **base**. Choose **v1** when cross-provider delegation must work predictably. Force **v2**
 only when you specifically want its newer session model across every catalog entry.
@@ -31,7 +36,7 @@ The selected mode controls the `multi_agent_version` field in every catalog entr
 
 - **v1** stamps `multi_agent_version = "v1"` on every model.
 - **base** restores upstream pins. Unpinned entries follow the native `multi_agent_v2` feature flag.
-- **v2** stamps `multi_agent_version = "v2"` on every model.
+- **v2** stamps `multi_agent_version = "v2"` on every model, except when **Keep ChatGPT on v1** is enabled: ChatGPT-native rows stay `"v1"` and routed or combo rows stay `"v2"`.
 
 opencodex applies this as the final pass to both the live `/v1/models` catalog and the catalog synced
 to disk. That is why a mode change affects newly created App, CLI, and TUI sessions consistently.
@@ -50,6 +55,13 @@ The dashboard's **Sub-agent delegation** controls three related settings:
 
 `multiAgentGuidanceEnabled` defaults to on and is the master switch for opencodex-authored guidance
 on both surfaces. Turning it off suppresses both the v2 designation block and v1 proactive text.
+
+For array-form stateless Responses requests, opencodex places generated guidance after leading
+system and developer metadata, including developer `additional_tools`, and before conversational
+input. Stateful `previous_response_id` continuations reuse tagged guidance only when it matches the latest
+tagged item in their trusted replay prefix. Other generated guidance is reused when an exact generated
+developer item exists in that prefix. When guidance changes, leading tool protocol stays first and
+the replacement is inserted before current conversational input.
 
 These are instructions to the main agent, not a proxy-side spawn router. On v2, a full-history fork
 inherits the parent model and rejects model or effort overrides. Guidance therefore tells Codex to
@@ -86,8 +98,16 @@ write. External provider managers and user-owned root routing also remain author
 For a spawned worker, opencodex builds this priority order:
 
 1. The requested primary model.
-2. The role's `model_fallback` list from its `$CODEX_HOME/agents/*.toml` definition.
+2. A per-model chain from `subagentModelFallbackByModel` in opencodex config, keyed by
+   the requested primary model.
 3. The global `subagentModelFallback` list in opencodex config.
+
+Per-role fallback chains belong in opencodex config, not in
+`$CODEX_HOME/agents/*.toml`. Codex 0.146+ strictly deserializes agent role files and
+rejects `model_fallback` as an unknown field, which skips the entire role definition
+(#1190). opencodex can still read a legacy `model_fallback` line from the TOML for
+backwards compatibility, but `ocx doctor` warns about it and Codex itself will ignore
+the affected role.
 
 Duplicate model ids are removed while preserving the first occurrence. During selection, opencodex
 skips candidates that are disabled, unroutable, backed by a disabled provider, marked unhealthy,
@@ -115,6 +135,22 @@ opencodex fails safely instead of forwarding an empty or unreadable task:
 Recovery options are to select a native ChatGPT child, add a native ChatGPT target to the combo, use
 v1 for heterogeneous-provider delegation, or resend the task as plaintext v2 `agent_message`
 content when you control the caller.
+
+An experimental, disabled-by-default `agentTaskRecovery` option can recover this specific native-
+to-routed shape through a raw Responses passthrough to the fixed ChatGPT `/responses` endpoint using
+the incoming credential shape used by the canonical `openai` provider with `authMode: "forward"`.
+Recovery is available only while the proxy is bound to loopback. It never substitutes API-key
+authentication, another provider credential, or another Codex account. Only `authorization`, matching
+`chatgpt-account-id`, `originator`, and optional `openai-beta`/`user-agent` metadata are forwarded;
+`content-type` and `accept` are generated locally, and no other caller headers cross the boundary.
+It consumes quota, adds latency, briefly retains recovered plaintext in a bounded in-memory cache,
+and depends on undocumented ChatGPT backend behavior. Because a model returns the recovered text,
+byte-for-byte fidelity is not guaranteed. It rejects generic/API-key proxy callers and preserves
+`unreadable_encrypted_agent_task` on any failure. See
+[Agent configuration: Encrypted v2 task recovery](/reference/configuration/agents/#encrypted-v2-task-recovery)
+for the full trust boundary and configuration.
+Combo routing remains unchanged and continues to consider only canonical native ChatGPT targets for
+encrypted tasks.
 
 ## Changing the mode
 
@@ -195,6 +231,44 @@ to v1. A `"v2"`, `null`, or absent surface value is eligible; a real `"v1"` pin 
 
 No. Start a new Codex session after changing the mode. If a long-running App host still shows stale
 catalog state, run `ocx sync` and restart that Codex surface.
+
+### What happens when opencodex cannot trust the catalog?
+
+opencodex compares the on-disk model catalog against the start time of every Codex app-server owned
+by the current user, producing one of four states:
+
+| State | Meaning | v2 guidance |
+|---|---|---|
+| `fresh` | Every app-server started after the catalog was written | Full guidance: preferred model, roster, fallbacks |
+| `not_running` | No app-server detected | Full guidance |
+| `stale` | At least one app-server predates the catalog | **No opencodex-authored model guidance** |
+| `unknown` | The comparison could not be made | **No opencodex-authored model guidance** |
+
+For `stale` and `unknown`, opencodex withholds its own disk-derived claims — preferred model, roster,
+fallback and custom guidance — because the running Codex may not be able to spawn what the disk
+catalog advertises.
+
+It does **not** instruct the model to stop setting `model` or `reasoning_effort`. That observation is
+global across every app-server for the user, while an inbound request carries no sender identity, so
+a stale process cannot be attributed to the request in front of us. Prohibiting overrides on that
+basis would block options the active `spawn_agent` tool legitimately advertises, for a session that
+may well be fresh. The active tool schema stays authoritative.
+
+`unknown` is not a synonym for `stale`. It means the comparison itself failed — an unreadable catalog
+timestamp, an unreadable process start time, or a failed process enumeration — and it is reported
+separately by `ocx doctor`. `stale` clears only after every detected Codex app-server starts after
+the final catalog write; it does not necessarily clear `unknown`.
+
+On Windows, this advisory check uses asynchronous PowerShell/CIM discovery on the v2 request path.
+Concurrent cold checks share one in-flight discovery. Observed states are cached for five seconds;
+an `unknown` failure is cached for only 250 milliseconds so a transient CIM error retries quickly. A
+slow or failing CIM query can delay or suppress only OpenCodex-authored model guidance; it does not
+block the Bun event loop, `/healthz`, or unrelated proxy traffic. Explicit CLI/service lifecycle
+operations retain the synchronous, fail-closed process collector because they may signal processes.
+
+Only a real change counts. A sync whose result is byte-identical to the catalog already on disk
+leaves the file untouched, so restarting the proxy or re-syncing an unchanged model set does not
+make a running Codex look stale.
 
 ### Reasoning effort
 

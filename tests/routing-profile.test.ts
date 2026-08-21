@@ -327,11 +327,67 @@ describe("routing profiles (RI-04)", () => {
     ]);
     expect(result.selectedIndex).toBe(0);
     // RI-06/07/08: unknown health/quota/cost under the default "penalize"
-    // policy folds penalized floors into the score.
+    // policy folds penalized floors into the score. #1837: an unmeasured
+    // candidate takes the NEUTRAL latency score, so both tie and declaration
+    // order still decides -- which is correct when nothing distinguishes them.
     expect(result.trace.candidates[0]!.score).toMatchObject({
-      total: 0.685,
-      components: { configuredPriority: 1, health: 0.3, quota: 0.3, cost: 0.3 },
+      components: { configuredPriority: 1, health: 0.3, quota: 0.3, cost: 0.3, latency: 0.5 },
     });
+  });
+
+  test("dry-run evaluator: optimize.latency actually prefers the faster candidate (#1837)", () => {
+    // The knob was normalized into the weight sum but never spent, so whatever was
+    // allocated to latency silently became configuredPriority -- i.e. declaration order.
+    // A latency-weighted profile must be able to pick a LATER-declared faster candidate.
+    const config = baseConfig({
+      routingProfiles: { fastest: {
+        candidates: [{ provider: "a", model: "m1" }, { provider: "b", model: "m2" }],
+        optimize: { latency: 1, health: 0, cost: 0, quota: 0 },
+      } },
+    });
+    const result = evaluatePolicyProfile(config, "fastest", {}, [
+      { provider: "a", model: "m1", health: { sampleCount: 10, successRate: 1, recentLatencyMs: 50_000 } },
+      { provider: "b", model: "m2", health: { sampleCount: 10, successRate: 1, recentLatencyMs: 1_000 } },
+    ]);
+
+    expect(result.selectedIndex).toBe(1);
+    expect(result.trace.candidates[1]!.score!.components.latency)
+      .toBeGreaterThan(result.trace.candidates[0]!.score!.components.latency!);
+  });
+
+  test("dry-run evaluator: an unmeasured candidate is not punished below a slow one (#1837)", () => {
+    // Scoring an unknown p50 as 0 would make selection depend on which candidate happened
+    // to be exercised first, reintroducing the order-dependence by another name.
+    const config = baseConfig({
+      routingProfiles: { fastest: {
+        candidates: [{ provider: "a", model: "m1" }, { provider: "b", model: "m2" }],
+        optimize: { latency: 1, health: 0, cost: 0, quota: 0 },
+      } },
+    });
+    const result = evaluatePolicyProfile(config, "fastest", {}, [
+      { provider: "a", model: "m1", health: { sampleCount: 10, successRate: 1, recentLatencyMs: 55_000 } },
+      { provider: "b", model: "m2" },
+    ]);
+
+    expect(result.trace.candidates[1]!.score!.components.latency)
+      .toBeGreaterThan(result.trace.candidates[0]!.score!.components.latency!);
+  });
+
+  test("dry-run evaluator: latency:0 leaves declaration-order behavior unchanged (#1837)", () => {
+    // Existing profiles that never set the knob must not change behavior.
+    const config = baseConfig({
+      routingProfiles: { ordered: {
+        candidates: [{ provider: "a", model: "m1" }, { provider: "b", model: "m2" }],
+        optimize: { latency: 0, health: 0, cost: 0, quota: 1 },
+      } },
+    });
+    const result = evaluatePolicyProfile(config, "ordered", {}, [
+      { provider: "a", model: "m1", health: { sampleCount: 10, successRate: 1, recentLatencyMs: 50_000 } },
+      { provider: "b", model: "m2", health: { sampleCount: 10, successRate: 1, recentLatencyMs: 1_000 } },
+    ]);
+
+    expect(result.selectedIndex).toBe(0);
+    expect(result.trace.candidates[0]!.score!.components.latency).toBeUndefined();
   });
 
   test("API lists profiles and dry-runs deterministically", async () => {
@@ -475,5 +531,80 @@ describe("routing profiles (RI-04)", () => {
     // quota (30% weekly / 20% monthly => 0.7 headroom) instead of unknown.
     expect(body.candidates?.[0]?.quota?.known).toBe(true);
     expect(body.candidates?.[0]?.quota?.headroom).toBeCloseTo(0.7, 2);
+  });
+
+  test("API dry-run leaves an unbound Codex candidate quota unknown despite an active pool account", async () => {
+    updateAccountQuota("pool-a", 30, 1_800_000_000_000, 20, 1_900_000_000_000);
+    const config = baseConfig({
+      providers: {
+        openai: { adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex" },
+      },
+      codexAccounts: [{ id: "pool-a", email: "pool-a@example.test", isMain: false }],
+      activeCodexAccountId: "pool-a",
+      routingProfiles: {
+        only: { candidates: [{ provider: "openai", model: "gpt-5.6" }] },
+      },
+    });
+    const req = new ManagementRequest("http://localhost/api/routing-profiles/dry-run", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      // No candidates[] override: the candidate is unbound, so the dry-run must
+      // not reach for the process-global active pool account. Policy evaluation
+      // runs before Pool/Direct identity and thread affinity resolve, so an
+      // account attached here can differ from the one that executes.
+      body: JSON.stringify({ profile: "only", evidence: {} }),
+    });
+    const response = await handleManagementAPI(req, new URL(req.url), config, { refreshCodexCatalog: async () => {} });
+    expect(response).not.toBeNull();
+    expect(response!.status).toBe(200);
+    const body = await response!.json() as {
+      candidates?: Array<{ accountRef?: string; quota?: { known?: boolean; headroom?: number } }>;
+    };
+    expect(body.candidates?.[0]?.accountRef).toBeUndefined();
+    expect(body.candidates?.[0]?.quota?.known).toBe(false);
+    expect(body.candidates?.[0]?.quota?.headroom).toBeUndefined();
+  });
+
+  test("API dry-run leaves an unbound Anthropic candidate quota unknown despite an active account", async () => {
+    const { saveCredential, getAccountSet } = await import("../src/oauth/store");
+    const { setCachedProviderAccountQuotaForTests } = await import("../src/providers/quota");
+    await saveCredential("anthropic", {
+      access: "access-a",
+      refresh: "refresh-a",
+      expires: Date.now() + 3_600_000,
+      accountId: "uuid-a",
+      email: "a@example.test",
+    });
+    const activeId = getAccountSet("anthropic")!.activeAccountId;
+    setCachedProviderAccountQuotaForTests("anthropic", activeId, {
+      fiveHourPercent: 40,
+      updatedAt: Date.now(),
+    });
+    const config = baseConfig({
+      providers: {
+        anthropic: {
+          adapter: "anthropic",
+          baseUrl: "https://api.anthropic.com",
+          authMode: "oauth",
+          models: ["claude-sonnet-5"],
+        },
+      },
+      routingProfiles: {
+        only: { candidates: [{ provider: "anthropic", model: "claude-sonnet-5" }] },
+      },
+    });
+    const req = new ManagementRequest("http://localhost/api/routing-profiles/dry-run", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ profile: "only", evidence: {} }),
+    });
+    const response = await handleManagementAPI(req, new URL(req.url), config, { refreshCodexCatalog: async () => {} });
+    expect(response).not.toBeNull();
+    expect(response!.status).toBe(200);
+    const body = await response!.json() as {
+      candidates?: Array<{ accountRef?: string; quota?: { known?: boolean; headroom?: number } }>;
+    };
+    expect(body.candidates?.[0]?.accountRef).toBeUndefined();
+    expect(body.candidates?.[0]?.quota?.known).toBe(false);
   });
 });

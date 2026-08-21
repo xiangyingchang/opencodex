@@ -164,7 +164,8 @@ sent to. A preset therefore needs primary-source evidence, not a working code pa
 that add or promote a provider must supply all of the following in the description:
 
 - **The documented OpenAI-compatible endpoints.** Link the vendor's own API reference for the chat
-  endpoint and, when the entry sets `liveModels: true`, for authenticated `GET /v1/models`. A
+  endpoint and, when the entry sets `liveModels: true`, for its authenticated model-discovery
+  endpoint (typically `GET /v1/models`). A
   passing fixture test is not a substitute: it proves our code shape, not the upstream contract.
 - **Terms of service and the operating legal entity.** An empty or placeholder legal page does not
   establish who runs the endpoint or under what terms user traffic is handled.
@@ -190,8 +191,9 @@ preset it cannot stand behind. Promote the row to the registry once the evidence
 ## Adding an adapter
 
 Implement `ProviderAdapter` (see [Adapters](/reference/adapters/)) in `src/adapters/`,
-register its name in `src/server/adapter-resolve.ts`, and bridge its output to internal
-`AdapterEvent`s. Reuse `image.ts` for image handling and follow `openai-chat.ts` for ordinary
+register its factory in `src/adapters/registry.ts`, and bridge its output to internal
+`AdapterEvent`s. `src/server/adapter-resolve.ts` selects the effective protocol before delegating
+to the registry. Reuse `image.ts` for image handling and follow `openai-chat.ts` for ordinary
 streaming/tool calls; use `fetchResponse` only when the adapter owns transport retries, or `runTurn`
 for a genuinely bidirectional transport such as Cursor. Add focused tests under `tests/` and export
 the factory from `src/index.ts` when it belongs to the public package API.

@@ -21,9 +21,10 @@
  */
 import { homedir } from "node:os";
 import { existsSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { shouldInjectApiAuthHeader } from "../codex/inject";
 import { FORMAT_MEDIA_TYPE, serializeDocument, type ConfigFormat } from "../integrations/serialize";
+import { providerCodexAccountMode } from "../providers/registry";
 import { probeHostname } from "../server/proxy-liveness";
 import type { OcxConfig } from "../types";
 
@@ -168,6 +169,49 @@ export function opencodeGlobalConfigPath(
 ): string {
   const xdg = env.XDG_CONFIG_HOME && env.XDG_CONFIG_HOME.length > 0 ? env.XDG_CONFIG_HOME : join(home, ".config");
   return join(xdg, "opencode", "opencode.json");
+}
+
+const OMP_PROFILE_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const OMP_WINDOWS_RESERVED_PROFILE_RE = /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?$/i;
+
+function ompProfileName(env: OpencodeLaunchEnv): string | undefined {
+  // OMP_PROFILE wins by presence, even when explicitly empty; PI_PROFILE is
+  // only the legacy fallback when the canonical variable is undefined.
+  const raw = env.OMP_PROFILE !== undefined ? env.OMP_PROFILE : env.PI_PROFILE;
+  const profile = raw?.trim();
+  if (!profile || profile === "default") return undefined;
+  if (
+    profile === "."
+    || profile === ".."
+    || profile.endsWith(".")
+    || !OMP_PROFILE_NAME_RE.test(profile)
+    || OMP_WINDOWS_RESERVED_PROFILE_RE.test(profile)
+  ) {
+    throw new ClientPathError(`Invalid OMP profile "${raw}"`);
+  }
+  return profile;
+}
+
+/** Resolve the global Oh My Pi agent directory using OMP's own env precedence. */
+export function ompAgentDir(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  const profile = ompProfileName(env);
+  if (!profile) {
+    const override = env.PI_CODING_AGENT_DIR?.trim();
+    if (override) return absoluteClientPath(override, home, "PI_CODING_AGENT_DIR");
+  }
+  // OMP treats PI_CONFIG_DIR as a directory name relative to the user's home,
+  // even when the value starts with `/` or `~`. Mirror that path.join contract
+  // exactly instead of assigning those values different filesystem semantics.
+  const root = join(home, env.PI_CONFIG_DIR || ".omp");
+  return profile ? join(root, "profiles", profile, "agent") : join(root, "agent");
+}
+
+/** OMP's canonical custom-provider catalog. */
+export function ompModelsConfigPath(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  const agentDir = ompAgentDir(env, home);
+  const yamlFallback = join(agentDir, "models.yaml");
+  const canonical = join(agentDir, "models.yml");
+  return !existsSync(canonical) && existsSync(yamlFallback) ? yamlFallback : canonical;
 }
 
 /** Compose the OpenAI-compatible proxy base URL from a live probe result. */
@@ -333,6 +377,61 @@ export function gajaeConfigPath(env: OpencodeLaunchEnv = process.env, home: stri
   return join(gajaeHomeDir(env, home), "agent", "models.yml");
 }
 
+/** DSH_HOME uses the raw nonblank value; trimming it would name a different path. */
+export function dshHomeDir(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  const raw = env.DSH_HOME;
+  if (raw === undefined || raw.trim().length === 0) return join(home, ".dsh");
+  if (raw === "~") return home;
+  if (raw.startsWith("~/") || raw.startsWith("~\\")) return join(home, raw.slice(2));
+  if (!isAbsolute(raw)) {
+    throw new ClientPathError(
+      `DSH_HOME must be an absolute path or start with ~; "${raw}" depends on the working directory, `
+      + "so opencodex and DSH would disagree about which settings file it names.",
+    );
+  }
+  // DSH calls node:path.resolve after tilde expansion. Preserve the raw value
+  // for the decision above, then normalize the absolute spelling the same way
+  // so both processes bind ownership and locks to one path string.
+  return resolve(raw);
+}
+
+export function dshConfigPath(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  return join(dshHomeDir(env, home), "settings.yaml");
+}
+
+/**
+ * MiniMax Code stores runtime state under `MINIMAX_DATA_DIR`, then the legacy
+ * `MAVIS_DATA_DIR`, and finally `~/.minimax`. Relative overrides are refused
+ * because a background proxy and a foreground client can have different CWDs.
+ */
+export function mcodeHomeDir(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  const primary = env.MINIMAX_DATA_DIR?.trim();
+  if (primary) return absoluteClientPath(primary, home, "MINIMAX_DATA_DIR");
+  const legacy = env.MAVIS_DATA_DIR?.trim();
+  if (legacy) return absoluteClientPath(legacy, home, "MAVIS_DATA_DIR");
+  return join(home, ".minimax");
+}
+
+export function mcodeConfigPath(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  return join(mcodeHomeDir(env, home), "config.yaml");
+}
+
+/**
+ * ZCode (Z.ai's desktop client) keeps everything under `~/.zcode`; custom
+ * providers live in `v2/config.json`. `ZCODE_DATA_DIR` mirrors the other
+ * clients' override convention; relative overrides are refused for the same
+ * reason as MCode's.
+ */
+export function zcodeHomeDir(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  const override = env.ZCODE_DATA_DIR?.trim();
+  if (override) return absoluteClientPath(override, home, "ZCODE_DATA_DIR");
+  return join(home, ".zcode");
+}
+
+export function zcodeConfigPath(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  return join(zcodeHomeDir(env, home), "v2", "config.json");
+}
+
 /**
  * One proxy-routed model destined for a client config. Deliberately narrower than
  * `CatalogModel` so a serializer cannot reach for a field that does not survive the
@@ -348,6 +447,9 @@ export interface ExportModel {
   displayName?: string;
   contextWindow?: number;
   inputModalities?: string[];
+  /** Optional effort ladder exported only to clients that support it. */
+  reasoningEfforts?: string[];
+  defaultReasoningEffort?: string;
 }
 
 export interface ExportContext {
@@ -364,10 +466,14 @@ export interface ExportContext {
 export type ExportClientId =
   | "opencode"
   | "pi"
+  | "omp"
   | "hermes"
   | "openclaw"
   | "kimi"
-  | "gajae";
+  | "gajae"
+  | "dsh"
+  | "mcode"
+  | "zcode";
 
 export interface ExportClientSpec {
   id: ExportClientId;
@@ -399,14 +505,13 @@ export interface ExportClientSpec {
    */
   buildContribution: BuildContribution;
   /**
-   * True when this client can only reach a loopback bind.
+   * True when the generated integration deliberately supports loopback only.
    *
    * `/v1/chat/completions` rejects bearer credentials and requires the
    * dedicated `x-opencodex-api-key` header (AUTH_MATRIX in
-   * src/server/auth-cors.ts). A client whose schema has no place to put that
-   * header therefore cannot authenticate against a remote bind at all — so we
-   * say so rather than exporting a config that 401s. Same reasoning as the
-   * Grok managed block's non-loopback refusal.
+   * src/server/auth-cors.ts). If this exporter cannot safely emit that header,
+   * it refuses a remote bind rather than generating a config that 401s. Same
+   * reasoning as the Grok managed block's non-loopback refusal.
    */
   loopbackOnly: boolean;
 }
@@ -417,7 +522,8 @@ export interface ExportClientSpec {
  */
 function authoritativeContextWindow(contextWindow: number | undefined): number | undefined {
   if (typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0) {
-    return Math.floor(contextWindow);
+    const integer = Math.floor(contextWindow);
+    return integer > 0 ? integer : undefined;
   }
   return undefined;
 }
@@ -474,6 +580,18 @@ function inputModalitiesForClient(
     if (accepted.has(value) && !kept.includes(value)) kept.push(value);
   }
   return kept.length > 0 ? kept : null;
+}
+
+/** DSH rc.6 accepts text/image; unknown values degrade to text, while audio-only cannot be represented. */
+function dshInputModalities(modalities: readonly string[] | undefined): string[] | null {
+  const declared = modalities ?? [];
+  if (declared.length === 0) return ["text"];
+  const kept: string[] = [];
+  for (const value of declared) {
+    if ((value === "text" || value === "image") && !kept.includes(value)) kept.push(value);
+  }
+  if (kept.length > 0) return kept;
+  return declared.every(value => value === "audio") ? null : ["text"];
 }
 
 /**
@@ -581,6 +699,15 @@ export interface PiModelEntry {
   input: string[];
   contextWindow?: number;
   maxTokens?: number;
+  /** Advertised when the catalog row carries a non-empty effort ladder. */
+  reasoning?: true;
+  /**
+   * Constrains pi's own level scale (minimal..max) to the declared ladder: members map to
+   * themselves, everything else is hidden (`null`). Without it pi would offer levels the
+   * ladder does not contain — harmless for provider-config ladders (the proxy clamps those
+   * at the wire) but a real 400 risk for custom-row ladders, which are advertisement-only.
+   */
+  thinkingLevelMap?: Record<string, string | null>;
 }
 
 export interface PiProviderBlock {
@@ -592,6 +719,50 @@ export interface PiProviderBlock {
 
 export interface PiGeneratedConfig {
   providers: Record<string, PiProviderBlock>;
+}
+
+/**
+ * omp accepts a model-level API override. Keep the provider on Chat
+ * Completions so routed providers retain their established wire format, while
+ * native OpenAI models can use the lossless Responses surface.
+ */
+export interface OmpModelEntry extends PiModelEntry {
+  api?: "openai-responses";
+  /** omp requires this flag before it honors a thinking block. */
+  reasoning?: true;
+  thinking?: {
+    mode: "effort";
+    efforts: string[];
+    defaultLevel?: string;
+  };
+}
+
+export interface OmpProviderBlock {
+  baseUrl: string;
+  api: typeof PI_API_DIALECT;
+  apiKey: string;
+  models: OmpModelEntry[];
+}
+
+export interface OmpGeneratedConfig {
+  providers: Record<string, OmpProviderBlock>;
+}
+
+/**
+ * omp validates model entries strictly. These are its documented effort
+ * values; omit an unknown value rather than invalidating the whole provider.
+ */
+const OMP_EFFORT_VOCABULARY = new Set(["minimal", "low", "medium", "high", "xhigh", "max"]);
+
+function ompEfforts(model: ExportModel): string[] {
+  const efforts: string[] = [];
+  for (const effort of model.reasoningEfforts ?? []) {
+    const normalized = effort.trim().toLowerCase();
+    if (OMP_EFFORT_VOCABULARY.has(normalized) && !efforts.includes(normalized)) {
+      efforts.push(normalized);
+    }
+  }
+  return efforts;
 }
 
 /**
@@ -680,20 +851,100 @@ export interface GajaeGeneratedConfig {
   providers: Record<string, GajaeProviderBlock>;
 }
 
+export type DshReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export type DshWireReasoningEffort = DshReasoningEffort | "ultra";
+
+export interface DshModelEntry {
+  id: string;
+  name: string;
+  input: string[];
+  contextWindow?: number;
+  reasoningEfforts?: Partial<Record<DshReasoningEffort, DshWireReasoningEffort>>;
+}
+
+export interface DshProviderBlock {
+  displayName: "OpenCodex";
+  api: "openai-responses";
+  baseURL: string;
+  headers: { Authorization: "Bearer ocx_data_dsh" };
+  models: DshModelEntry[];
+}
+
+export interface DshGeneratedConfig {
+  "llm-pi-ai": {
+    providers: Record<string, DshProviderBlock>;
+  };
+}
+
+export interface McodeProviderBlock {
+  name: "OpenCodex";
+  kind: "custom";
+  enabled: true;
+  api: "anthropic-messages";
+  options: {
+    apiKey: string;
+    baseURL: string;
+    authMode: "api-key";
+  };
+  models: Record<string, Record<string, never>>;
+}
+
+export interface McodeGeneratedConfig {
+  custom_provider: Record<string, McodeProviderBlock>;
+}
+
+/**
+ * ZCode's `~/.zcode/v2/config.json` provider entry (observed schema, validated
+ * live against ZCode 3.7.7). `kind: "anthropic"` selects the Anthropic
+ * Messages protocol, which the proxy serves at `/v1/messages`. `apiKeyRequired`
+ * keeps ZCode's UI from prompting for a key it does not need on loopback; the
+ * serialized key is always the non-secret loopback placeholder.
+ */
+export interface ZcodeModelEntry {
+  name?: string;
+  limit?: { context: number; output?: number };
+  modalities: { input: string[]; output: string[] };
+}
+
+export interface ZcodeProviderBlock {
+  name: "OpenCodex";
+  kind: "anthropic";
+  enabled: true;
+  source: "custom";
+  options: {
+    apiKey: string;
+    baseURL: string;
+    apiKeyRequired: true;
+  };
+  models: Record<string, ZcodeModelEntry>;
+}
+
+export interface ZcodeGeneratedConfig {
+  provider: Record<string, ZcodeProviderBlock>;
+}
+
 /**
  * Pi's `~/.pi/agent/models.json` shape. `models` is an ARRAY (identity lives in `id`),
  * unlike OpenCode's keyed object.
  *
- * Two fields are deliberately absent. `cost` requires all four price fields and we have
- * no price data at all, so emitting zeros would assert every routed model is free.
- * `reasoning` is a boolean in Pi while our catalog carries an effort list — mapping one
- * to the other would be a guess.
+ * Two fields were deliberately absent once. `cost` still is: it requires all four price
+ * fields and we have no price data at all, so emitting zeros would assert every routed
+ * model is free. `reasoning` used to be omitted because Pi's boolean and the catalog's
+ * effort ladder did not obviously map — but a NON-EMPTY ladder is the catalog's own
+ * statement that the model accepts reasoning parameters (adapters honor `reasoning_effort`),
+ * and an empty or absent ladder is the statement that it does not. Emitting `reasoning:
+ * true` exactly for rows with a ladder is therefore not a guess; it is what makes Pi's
+ * effort control appear for routed models at all. The export also emits a `thinkingLevelMap`
+ * that hides every pi level outside the declared ladder, so pi never offers (and sends) an
+ * effort the ladder does not contain — custom-row ladders are catalog advertisement only
+ * and get no wire clamp, so this map is what keeps pi honest for those. Users who need a
+ * different mapping can still hand-tune `thinkingLevelMap` afterwards.
  *
  * Pi's input enum IS verified: its documented model configuration accepts only
  * `text` and `image`, and a validation failure yields an EMPTY model config
  * rather than dropping the offending entry — one bad value costs every routed
- * model. The rest of this contract (omitting `cost` and `reasoning`) is still
- * ours rather than a claim about Pi's acceptance.
+ * model. The rest of this contract (omitting `cost`) is still ours rather than
+ * a claim about Pi's acceptance.
  */
 function buildPiClientConfig(ctx: ExportContext): PiGeneratedConfig {
   const models: PiModelEntry[] = [];
@@ -710,10 +961,70 @@ function buildPiClientConfig(ctx: ExportContext): PiGeneratedConfig {
       name: exportModelLabel(model),
       input,
     };
+    if (Array.isArray(model.reasoningEfforts) && model.reasoningEfforts.length > 0) {
+      entry.reasoning = true;
+      const efforts = model.reasoningEfforts;
+      entry.thinkingLevelMap = {
+        // pi's off level maps to the declared `none` sentinel (the proxy omits the
+        // reasoning parameter for it); hidden when the ladder does not declare none.
+        off: efforts.includes("none") ? "none" : null,
+        minimal: efforts.includes("minimal") ? "minimal" : null,
+        low: efforts.includes("low") ? "low" : null,
+        medium: efforts.includes("medium") ? "medium" : null,
+        high: efforts.includes("high") ? "high" : null,
+        xhigh: efforts.includes("xhigh") ? "xhigh" : null,
+        max: efforts.includes("max") ? "max" : efforts.includes("ultra") ? "ultra" : null,
+      };
+    }
     const context = authoritativeContextWindow(model.contextWindow);
     if (context !== undefined) {
       entry.contextWindow = context;
       entry.maxTokens = outputBudgetFor(context);
+    }
+    models.push(entry);
+  }
+  return {
+    providers: {
+      [OPENCODE_PROVIDER_ID]: {
+        baseUrl: ctx.baseUrl,
+        api: PI_API_DIALECT,
+        apiKey: LOOPBACK_API_KEY_PLACEHOLDER,
+        models,
+      },
+    },
+  };
+}
+
+/**
+ * omp's models.yml is Pi-like, but it supports effort metadata and a per-model
+ * API dialect. Native OpenAI models use Responses; all routed models inherit
+ * the provider's existing Chat Completions dialect.
+ */
+function buildOmpClientConfig(ctx: ExportContext): OmpGeneratedConfig {
+  const models: OmpModelEntry[] = [];
+  for (const model of normalizeExportModels(ctx.models)) {
+    const input = inputModalitiesForClient("pi", model.inputModalities);
+    if (input === null) continue;
+    const entry: OmpModelEntry = {
+      id: model.namespaced,
+      name: exportModelLabel(model),
+      input,
+      ...(model.native && model.provider === "openai" ? { api: "openai-responses" } : {}),
+    };
+    const context = authoritativeContextWindow(model.contextWindow);
+    if (context !== undefined) {
+      entry.contextWindow = context;
+      entry.maxTokens = outputBudgetFor(context);
+    }
+    const efforts = ompEfforts(model);
+    if (efforts.length > 0) {
+      const defaultLevel = model.defaultReasoningEffort?.trim().toLowerCase();
+      entry.reasoning = true;
+      entry.thinking = {
+        mode: "effort",
+        efforts,
+        ...(defaultLevel && efforts.includes(defaultLevel) ? { defaultLevel } : {}),
+      };
     }
     models.push(entry);
   }
@@ -840,6 +1151,157 @@ function buildGajaeClientConfig(ctx: ExportContext): GajaeGeneratedConfig {
   };
 }
 
+const DSH_EFFORT_ORDER: readonly DshReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
+
+function dshReasoningEfforts(model: ExportModel): DshModelEntry["reasoningEfforts"] {
+  const offered = new Set<string>();
+  for (const raw of model.reasoningEfforts ?? []) {
+    const effort = raw.trim().toLowerCase();
+    if (effort === "ultra" || DSH_EFFORT_ORDER.includes(effort as DshReasoningEffort)) offered.add(effort);
+  }
+  if (offered.size === 0) return undefined;
+  const entries: Array<[DshReasoningEffort, DshWireReasoningEffort]> = [];
+  for (const effort of DSH_EFFORT_ORDER) {
+    if (effort !== "max") {
+      if (offered.has(effort)) entries.push([effort, effort]);
+      continue;
+    }
+    // DSH's key is the selectable level; the value is what it sends on the
+    // wire. Preserve OpenCodex's `ultra` spelling when that is the only
+    // highest effort, exactly like the rc.6 `max: ultra` contract.
+    if (offered.has("max")) entries.push(["max", "max"]);
+    else if (offered.has("ultra")) entries.push(["max", "ultra"]);
+  }
+  return Object.fromEntries(entries);
+}
+
+function isKnownSafeDshCombo(model: ExportModel, config: OcxConfig): boolean {
+  const combos = (config as { combos?: unknown }).combos;
+  if (typeof combos !== "object" || combos === null || Array.isArray(combos)) return false;
+  const combo = (combos as Record<string, unknown>)[model.id];
+  if (typeof combo !== "object" || combo === null || Array.isArray(combo)) return false;
+  const targets = (combo as { targets?: unknown }).targets;
+  if (!Array.isArray(targets) || targets.length === 0) return false;
+  return targets.every(target => {
+    if (typeof target !== "object" || target === null || Array.isArray(target)) return false;
+    const provider = (target as { provider?: unknown }).provider;
+    const modelId = (target as { model?: unknown }).model;
+    return typeof provider === "string"
+      && provider.length > 0
+      && provider === provider.trim()
+      && provider !== "openai"
+      && typeof modelId === "string"
+      && modelId.length > 0
+      && modelId === modelId.trim();
+  });
+}
+
+function buildDshClientConfig(ctx: ExportContext): DshGeneratedConfig {
+  const direct = providerCodexAccountMode("openai", ctx.config?.providers?.openai) === "direct";
+  const models: DshModelEntry[] = [];
+  for (const model of normalizeExportModels(ctx.models)) {
+    if (direct && (model.native === true || model.provider === "openai")) continue;
+    if (direct && model.provider === "combo" && (!ctx.config || !isKnownSafeDshCombo(model, ctx.config))) continue;
+    const input = dshInputModalities(model.inputModalities);
+    if (input === null) continue;
+    const contextWindow = authoritativeContextWindow(model.contextWindow);
+    const reasoningEfforts = dshReasoningEfforts(model);
+    models.push({
+      id: model.namespaced,
+      name: exportModelLabel(model),
+      input,
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
+      ...(reasoningEfforts ? { reasoningEfforts } : {}),
+    });
+  }
+  return {
+    "llm-pi-ai": {
+      providers: {
+        [OPENCODE_PROVIDER_ID]: {
+          displayName: "OpenCodex",
+          api: "openai-responses",
+          baseURL: ctx.baseUrl,
+          headers: { Authorization: "Bearer ocx_data_dsh" },
+          models,
+        },
+      },
+    },
+  };
+}
+
+/**
+ * MiniMax Code's `provider add` command persists custom providers under
+ * `custom_provider.<id>`. Do not emit `defaultModel`: connecting a client must
+ * not silently replace the user's current model selection.
+ */
+function buildMcodeClientConfig(ctx: ExportContext): McodeGeneratedConfig {
+  const models: Record<string, Record<string, never>> = {};
+  for (const model of normalizeExportModels(ctx.models)) models[model.namespaced] = {};
+  return {
+    custom_provider: {
+      [OPENCODE_PROVIDER_ID]: {
+        name: "OpenCodex",
+        kind: "custom",
+        enabled: true,
+        api: "anthropic-messages",
+        options: {
+          apiKey: LOOPBACK_API_KEY_PLACEHOLDER,
+          baseURL: ctx.baseUrl.replace(/\/v1\/?$/, ""),
+          authMode: "api-key",
+        },
+        models,
+      },
+    },
+  };
+}
+
+/**
+ * ZCode dials the Anthropic Messages surface, so `baseURL` is the proxy origin
+ * without the `/v1` suffix (ZCode appends `/v1/messages` itself — the same
+ * shape its builtin Z.ai providers use). Model ids are the proxy's canonical
+ * `provider/id` selectors, which `/v1/messages` resolves directly. Context
+ * limits follow the authoritative-window rule: a model without one ships
+ * without `limit` rather than guessing. Modalities are ZCode's observed
+ * `text`-floor vocabulary; image-capable rows advertise image input.
+ */
+function buildZcodeClientConfig(ctx: ExportContext): ZcodeGeneratedConfig {
+  const models: Record<string, ZcodeModelEntry> = {};
+  for (const model of normalizeExportModels(ctx.models)) {
+    const input = inputModalitiesForClient("pi", model.inputModalities);
+    if (input === null) continue;
+    const entry: ZcodeModelEntry = {
+      name: exportModelLabel(model),
+      modalities: { input, output: ["text"] },
+    };
+    // `limit.context` follows the authoritative-window rule. `output` is
+    // deliberately absent: ZCode's schema makes it optional and we have no
+    // authoritative output budget to assert (reviewer finding: an emitted
+    // stand-in would be a guessed capability, exactly what "no metadata is
+    // guessed" forbids).
+    const context = authoritativeContextWindow(model.contextWindow);
+    if (context !== undefined) {
+      entry.limit = { context };
+    }
+    models[model.namespaced] = entry;
+  }
+  return {
+    provider: {
+      [OPENCODE_PROVIDER_ID]: {
+        name: "OpenCodex",
+        kind: "anthropic",
+        enabled: true,
+        source: "custom",
+        options: {
+          apiKey: LOOPBACK_API_KEY_PLACEHOLDER,
+          baseURL: ctx.baseUrl.replace(/\/v1\/?$/, ""),
+          apiKeyRequired: true,
+        },
+        models,
+      },
+    },
+  };
+}
+
 /**
  * Per-client model counts, read back off the SERIALIZED document rather than
  * recomputed from the input rows: `modelsWithoutLimits` drives a GUI line about
@@ -853,6 +1315,11 @@ function summarizeOpencode(document: unknown): { modelCount: number; modelsWitho
 
 function summarizePi(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
   const models = (document as PiGeneratedConfig | undefined)?.providers?.[OPENCODE_PROVIDER_ID]?.models ?? [];
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined).length };
+}
+
+function summarizeOmp(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
+  const models = (document as OmpGeneratedConfig | undefined)?.providers?.[OPENCODE_PROVIDER_ID]?.models ?? [];
   return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined).length };
 }
 
@@ -879,6 +1346,22 @@ function summarizeGajae(document: unknown): { modelCount: number; modelsWithoutL
   return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined).length };
 }
 
+function summarizeDsh(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
+  const models = (document as DshGeneratedConfig | undefined)?.["llm-pi-ai"]?.providers?.[OPENCODE_PROVIDER_ID]?.models ?? [];
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined).length };
+}
+
+function summarizeMcode(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
+  const models = Object.values((document as McodeGeneratedConfig | undefined)?.custom_provider?.[OPENCODE_PROVIDER_ID]?.models ?? {});
+  // MCode's custom-provider schema does not expose per-model context limits.
+  return { modelCount: models.length, modelsWithoutLimits: 0 };
+}
+
+function summarizeZcode(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
+  const models = Object.values((document as ZcodeGeneratedConfig | undefined)?.provider?.[OPENCODE_PROVIDER_ID]?.models ?? {});
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => !model.limit).length };
+}
+
 /** One fragment at `path`, built from this client's own document. */
 function singleFragment(clientId: ExportClientId, path: readonly string[], value: unknown): ManagedContribution {
   return { clientId, fragments: [{ path, value }] };
@@ -892,6 +1375,11 @@ function buildOpencodeContribution(ctx: ExportContext): ManagedContribution {
 function buildPiContribution(ctx: ExportContext): ManagedContribution {
   const doc = buildPiClientConfig(ctx);
   return singleFragment("pi", ["providers", OPENCODE_PROVIDER_ID], doc.providers[OPENCODE_PROVIDER_ID]);
+}
+
+function buildOmpContribution(ctx: ExportContext): ManagedContribution {
+  const doc = buildOmpClientConfig(ctx);
+  return singleFragment("omp", ["providers", OPENCODE_PROVIDER_ID], doc.providers[OPENCODE_PROVIDER_ID]);
 }
 
 function buildHermesContribution(ctx: ExportContext): ManagedContribution {
@@ -925,6 +1413,21 @@ function buildGajaeContribution(ctx: ExportContext): ManagedContribution {
   return singleFragment("gajae", ["providers", OPENCODE_PROVIDER_ID], doc.providers[OPENCODE_PROVIDER_ID]);
 }
 
+function buildDshContribution(ctx: ExportContext): ManagedContribution {
+  const doc = buildDshClientConfig(ctx);
+  return singleFragment("dsh", ["llm-pi-ai", "providers", OPENCODE_PROVIDER_ID], doc["llm-pi-ai"].providers[OPENCODE_PROVIDER_ID]);
+}
+
+function buildMcodeContribution(ctx: ExportContext): ManagedContribution {
+  const doc = buildMcodeClientConfig(ctx);
+  return singleFragment("mcode", ["custom_provider", OPENCODE_PROVIDER_ID], doc.custom_provider[OPENCODE_PROVIDER_ID]);
+}
+
+function buildZcodeContribution(ctx: ExportContext): ManagedContribution {
+  const doc = buildZcodeClientConfig(ctx);
+  return singleFragment("zcode", ["provider", OPENCODE_PROVIDER_ID], doc.provider[OPENCODE_PROVIDER_ID]);
+}
+
 export const EXPORT_CLIENTS: Record<ExportClientId, ExportClientSpec> = {
   opencode: {
     id: "opencode",
@@ -951,6 +1454,20 @@ export const EXPORT_CLIENTS: Record<ExportClientId, ExportClientSpec> = {
     buildContribution: buildPiContribution,
     // No header field in Pi's provider block, so there is nowhere to put the
     // dedicated admission header a remote bind requires.
+    loopbackOnly: true,
+  },
+  omp: {
+    id: "omp",
+    filename: "omp-models.yaml",
+    destination: env => ompModelsConfigPath(env),
+    apiKeyEnv: "",
+    exportHint: "OMP reads a non-secret placeholder from models.yml; loopback needs no key.",
+    build: buildOmpClientConfig,
+    format: "yaml",
+    summarize: summarizeOmp,
+    buildContribution: buildOmpContribution,
+    // OMP supports provider-level headers, but remote credential wiring is
+    // intentionally deferred from this initial loopback-only integration.
     loopbackOnly: true,
   },
   hermes: {
@@ -1006,6 +1523,47 @@ export const EXPORT_CLIENTS: Record<ExportClientId, ExportClientSpec> = {
     summarize: summarizeGajae,
     buildContribution: buildGajaeContribution,
     // strict schema with no header field, so the dedicated header has nowhere to go
+    loopbackOnly: true,
+  },
+  dsh: {
+    id: "dsh",
+    filename: "settings.yaml",
+    destination: env => dshConfigPath(env),
+    apiKeyEnv: "",
+    exportHint: "DSH uses a non-secret loopback bearer placeholder in settings.yaml; loopback needs no key.",
+    build: buildDshClientConfig,
+    format: "yaml",
+    summarize: summarizeDsh,
+    buildContribution: buildDshContribution,
+    loopbackOnly: true,
+  },
+  mcode: {
+    id: "mcode",
+    filename: "mcode-config.yaml",
+    destination: env => mcodeConfigPath(env),
+    apiKeyEnv: "",
+    exportHint: "MiniMax Code reads a non-secret placeholder from config.yaml; loopback needs no key.",
+    build: buildMcodeClientConfig,
+    format: "yaml",
+    summarize: summarizeMcode,
+    buildContribution: buildMcodeContribution,
+    // MCode persists this credential and exposes no dedicated proxy-admission
+    // header field, so real keys are never serialized and remote binds refuse.
+    loopbackOnly: true,
+  },
+  zcode: {
+    id: "zcode",
+    filename: "config.json",
+    destination: env => zcodeConfigPath(env),
+    apiKeyEnv: "",
+    exportHint: "ZCode reads a non-secret placeholder from v2/config.json; loopback needs no key.",
+    build: buildZcodeClientConfig,
+    format: "json",
+    summarize: summarizeZcode,
+    buildContribution: buildZcodeContribution,
+    // ZCode persists the credential in its own file and has no dedicated
+    // proxy-admission header field, so real keys are never serialized and
+    // remote binds refuse — same reasoning as MCode.
     loopbackOnly: true,
   },
 };

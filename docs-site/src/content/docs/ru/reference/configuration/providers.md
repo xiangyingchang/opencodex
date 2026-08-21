@@ -14,10 +14,11 @@ description: Записи провайдеров, аутентификация, 
 | `openaiProviderTierVersion?` | `2` | set by migration | Отмечает, что единая projection OpenAI с учётом режима уже завершена. |
 | `disabledModels?` | `string[]` | — | Модели, скрытые из каталога Codex и `/v1/models`, но не заблокированные для прямых вызовов прокси. Routed-id удаляются из списков. Account-qualified native-id скрывает только строку этого селектора; bare native GPT-id скрывает bare-строку и строки всех селекторов аккаунтов для этой модели. Страница Models показывает только bare native- и routed-строки; чтобы скрыть одну selector-qualified строку, задайте это поле конфигурации напрямую. |
 | `providerContextCaps?` | `Record<string, number>` | `{}` | Context cap'ы, видимые Codex, по каждому провайдеру. Cap может только понижать известное context window. |
-| `contextCapValue?` | `number` | `350000` | Значение, используемое элементами управления context-cap в дашборде; его изменение обновляет все включённые записи `providerContextCaps`. |
+| `contextCapValue?` | `number` | `350000` | Значение по умолчанию для элементов управления context-cap в дашборде. При изменении значение применяется ко всем маршрутизируемым провайдерам — включая провайдеров без существующей записи `providerContextCaps` — только при включённом переключателе «применить ко всем маршрутизируемым провайдерам»; в противном случае каждый провайдер сохраняет собственный лимит. |
 | `codexAccounts?` | `CodexAccount[]` | `[]` | Метаданные аккаунтов пула ChatGPT/Codex, которыми управляет Codex Auth. Секреты живут отдельно в `codex-accounts.json`. |
 | `pausedCodexAccountIds?` | `string[]` | `[]` | Аккаунты, исключённые из выбора Pool до снятия паузы, включая основной аккаунт `__main__`, если он поставлен на паузу. |
-| `codexAccountNamespaces?` | `Record<string, string>` | — | Необязательное сопоставление произвольного публичного селектора модели с сохранённым аккаунтом Codex. Каждый селектор с существующей целью добавляет в model picker Codex отдельные строки `<selector>/<native-openai-model>`; каждая строка использует только этот аккаунт. Если активен хотя бы один селектор, bare native-строки скрываются в picker, но их id остаются маршрутизируемыми и перечисляются raw `/v1/models`, если они не отключены явно. |
+| `codexAccountNamespaces?` | `Record<string, string>` | — | Необязательное сопоставление произвольного публичного селектора модели с сохранённым аккаунтом Codex. Когда строки picker'а с указанием аккаунта включены, каждый селектор с существующей целью добавляет в model picker Codex отдельные строки `<selector>/<native-openai-model>`; каждая строка использует только этот аккаунт. Если активен хотя бы один селектор, bare native-строки скрываются в picker, но их id остаются маршрутизируемыми и перечисляются raw `/v1/models`, если они не отключены явно. |
+| `codexAccountPickerEnabled?` | `boolean` | выкл. при пустой map | Управляет созданием account-qualified строк picker'а Codex из подходящих сопоставлений `codexAccountNamespaces`. `true` разрешает показывать сопоставленные строки. Если поле не задано при непустой map, функция считается включённой для обратной совместимости; при пустой map она выключена. `false` скрывает созданные строки и возвращает bare native-строки в picker, не удаляя сопоставления и не отключая точную маршрутизацию `<selector>/<native-openai-model>`. |
 | `activeCodexAccountId?` | `string` | — | Вручную выбранный аккаунт Pool для следующего запроса. Выбор очищает thread affinity; in-flight-запросы сохраняют уже захваченные credential'ы. |
 | `codexAccountPriorities?` | `Record<string,number>` | — | Порядок выбора для каждого аккаунта пула Codex: id аккаунта → целое число от `-100` до `100`, **больше — используется раньше**, отсутствие означает `0`. Это граница порядка, а не пригодности: выбор сужает уже подходящие аккаунты до самого высокого уровня, у которого ещё есть запас квоты, а внутри этого уровня аккаунт выбирает `accountPoolStrategy`. Уровень пропускается, только когда все его аккаунты превысили `autoSwitchThreshold`, находятся в cooldown, под soft-avoid, на паузе или требуют повторной аутентификации; неизвестный usage никогда не исчерпывает уровень. Порядок не делает выбираемым непригодный аккаунт и не перепривязывает поток, у которого аккаунт уже есть. Основной аккаунт `__main__` участвует на равных — именно так логин Codex Desktop можно оставить на самый конец. Без записей поведение остаётся прежним. Некорректная map игнорируется с предупреждением в консоли (порядок отключается, восстановление config не запускается). Управляется через `ocx account priority` и страницу Codex Auth. |
 | `autoSwitchThreshold?` | `number` | `80` | Порог проактивного переключения по использованию. `quota` может повторно оценить следующий запрос как привязанной, так и непривязанной задачи; `fill-first` использует его только как точку исчерпания для непривязанных назначений; обычный `round-robin` его не использует. Оценка берёт самое горячее из окон 5 часов, недели и 30 дней. `0` отключает только переключение по использованию, но не назначение непривязанных задач и не восстановление после сбоев. |
@@ -39,6 +40,14 @@ description: Записи провайдеров, аутентификация, 
 raw id аккаунтов и email приватными, а селектор используйте как публичное имя. Поведение и приоритет
 явного выбора описаны в разделе [Конфигурация маршрутизации](/reference/configuration/routing/).
 
+Элемент управления на странице Codex Auth владеет map только тогда, когда в ней явно задано поле
+`codexAccountPickerEnabled`. При включении пустой управляемой map создаются privacy-safe селекторы;
+при последующем добавлении аккаунтов map расширяется даже тогда, когда строки picker'а скрыты, и
+существующие селекторы не переименовываются. Написанная вручную map без этого поля остаётся ручной и
+никогда не расширяется автоматически. При удалении аккаунта его сопоставление сохраняется: exact
+route fail closed, пока аккаунт отсутствует, а повторное добавление того же id восстанавливает
+прежний публичный селектор вместо создания нового.
+
 ## Зарезервированные провайдеры OpenAI
 
 `openai` и `openai-apikey` — это фиксированные зарезервированные id. `openai.codexAccountMode`
@@ -46,7 +55,7 @@ raw id аккаунтов и email приватными, а селектор и�
 использует только текущий login вызывающей стороны / основной login. Уровень API использует только
 свой настроенный API-key или key-pool. Используйте bare-model либо `openai-apikey/<model>`;
 cross-route credential fallback не существует. Строки API GPT-5.6 несут метаданные контекста
-1,050,000 / max input 922,000, а виртуальные Pro-id переписываются в базовую wire-модель с
+922,000 / max input 922,000, а виртуальные Pro-id переписываются в базовую wire-модель с
 `reasoning.mode: "pro"`.
 
 `openaiProviderTierVersion: 2` отмечает текущую single-provider projection. Перед миграцией
@@ -60,6 +69,7 @@ cross-route credential fallback не существует. Строки API GPT-
 | --- | --- | --- |
 | `adapter` | `string` | Один из `openai-chat`, `openai-responses`, `anthropic`, `google`, `kiro`, `cursor`, `azure-openai` (или alias `azure`). |
 | `baseUrl` | `string` | Базовый URL API upstream'а. Большинство built-in fixed-endpoint'ов игнорируют несовпадение; collision-safe key-preset'ы сохраняют старый custom destination с тем же именем. |
+| `requestPacing?` | `{ enabled, requestsPerMinute?, minIntervalMs?, models? }` | Опциональное клиентское выравнивание начала исходящих запросов, отдельное от учёта использования, биллинга и индикаторов rate limit апстрима. Лимит провайдера действует на все модели, а `models` сопоставляется с точными ID моделей апстрима и может только увеличить задержку. Ожидание очереди не расходует таймаут заголовков ответа. Поддерживаются HTTP, Responses WebSocket и явные вызовы адаптеров `fetchResponse`/`runTurn`. |
 | `responsesPath?` | `string` | Relative resource path для key-auth запросов `openai-responses`. Должен начинаться с `/` и не может содержать scheme, query или fragment. |
 | `supportsServiceTier?` | `boolean` | Три состояния поддержки `service_tier`. `true`: fast mode может подставлять поле, значения вызывающего сохраняются. `false`: поле удаляется и никогда не подставляется (апстрим, для которого задокументировано отсутствие поддержки, не должен его получать). Не задано: провайдер не классифицирован — значения вызывающего сохраняются без изменений, fast mode не подставляет. Registry классифицирует canonical OpenAI (`true`), DeepSeek и Volcengine Ark (`false`); задавайте явно только для custom gateway'ев, реально поддерживающих tier'ы. |
 | `preserveResponsesReasoningContent?` | `boolean` | Сохранять plaintext reasoning content в replay'нутых Responses reasoning item'ах вместо очистки (очистка — правило ChatGPT backend'а). Включайте для upstream'ов, чей контракт принимает reasoning replay, например DeepSeek. Proxy-minted `ocxr1` envelope'ы удаляются всегда. |
@@ -77,6 +87,7 @@ cross-route credential fallback не существует. Строки API GPT-
 | `modelMaxInputTokens?` | `Record<string, number>` | Положительные лимиты max input по моделям, используемые для подсказок auto-compaction в каталоге. |
 | `defaultMaxOutputTokens?` | `number` | Provider-wide fallback для `openai-chat`, когда клиент не передал `max_output_tokens`. |
 | `modelMaxOutputTokens?` | `Record<string, number>` | Положительные fallback-budget'ы `openai-chat` по моделям; exact/pattern-match имеет приоритет над provider-default. |
+| `modelCosts?` | `Record<string, Cost4>` | Отображаемые цены по моделям (USD за 1M токенов), ключ — точный upstream id модели этого провайдера (не идентификатор провайдера и не маршрутизируемая метка `provider/model`), значение — четыре поля: `input`, `output`, `cacheRead`, `cacheWrite` (пример: `{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`). Любой id допустим — кастомный провайдер может указывать на любой OpenAI-совместимый endpoint через адаптер `openai-chat`, а локальные и внутренние провайдеры работают даже без строки во встроенных каталогах. Пользовательские цены имеют приоритет над встроенными каталогами в оценках `~$` в Logs и Usage; исторические записи пересчитываются по текущему оверлею, поэтому изменение цены может сдвинуть прошлые суммы (порядок: пользователь → каталог jawcode → expected-price overlay → вендорская цена модели); полностью нулевая запись переходит к следующему источнику. Каждая ставка должна быть неотрицательным конечным числом не более 1 000 000 (USD за 1M токенов); строки вне диапазона отклоняются на управляющей границе и отбрасываются при загрузке. Только оценка для отображения: оверлеи не влияют на маршрутизацию, выбор аккаунта, квоты или биллинг. |
 | `headers?` | `Record<string, string>` | Дополнительные upstream-header'ы. Заголовки авторизации, cookie, API-key-header'ы, встроенные переводы строк и невалидные имена отклоняются. |
 | `openRouterRouting?` | `OpenRouterProviderRouting` | Предпочтения по умолчанию для OpenRouter (`order`, `only`, `allowFallbacks`); валидно только для канонического OpenRouter с `openai-chat`. |
 | `modelOpenRouterRouting?` | `Record<string, OpenRouterProviderRouting>` | Exact override по model id, которые полностью заменяют provider-wide preference для OpenRouter. |
@@ -96,12 +107,14 @@ cross-route credential fallback не существует. Строки API GPT-
 | `noTemperatureModels?` | `string[]` | Модели, отвергающие переданный вызывающей стороной `temperature`. |
 | `noTopPModels?` | `string[]` | Модели, отвергающие переданный вызывающей стороной `top_p`. |
 | `noPenaltyModels?` | `string[]` | Модели, отвергающие penalty presence/frequency. |
+| `noStructuredOutputModels?` | `string[]` | Точные идентификаторы моделей, чей endpoint `openai-chat` отклоняет `response_format`. Поле опускается только при точном совпадении запрошенной модели; для остальных моделей `openai-chat` преобразование structured output остаётся включённым. |
 | `parallelToolCalls?` | `boolean` | Переключатель parallel tool call'ов. Для OpenAI Chat по умолчанию включено; не-chat adapter'ы рекламируют это только при явном `true`. |
 | `responsesItemIdRepair?` | `{ message?: string[]; reasoning?: string[]; repairMissingTerminalIds?: boolean; repairInvalidIds?: boolean }` | По умолчанию выключенная downstream SSE-repair для exact placeholder-id, отсутствующих terminal-id и (с `repairInvalidIds`) message/reasoning id без канонического префикса `msg_`/`rs_`. Function-call id никогда не переписываются. Встроенный DeepSeek включает последние два по умолчанию. |
 | `responsesSnapshotRepair?` | `boolean` | По умолчанию выключенная клиентская repair для неполных lifecycle snapshot'ов Responses в SSE и JSON. Добавляет отсутствующие status, output и tool metadata, не меняя raw inspection и persistence. |
 | `retryOn429?` | `{ enabled?: boolean; attempts?: number; intervalMs?: number; maxIntervalMs?: number; respectRetryAfter?: boolean }` | Только для провайдеров с API-ключом (`authMode: "key"`). Опциональный повтор при 429 на том же таргете: если `retryOn429` отсутствует, функция выключена; наличие объекта включает её, если только `enabled: false`. При 429: ожидание (`Retry-After` апстрима или фиксированный интервал) и повтор идентичного запроса на том же ключе до любого фейловера ключей — покрывает основной цикл восстановления текстовых ходов, passthrough-канал Responses, мост изображений/видео, sidecar web-search и терминальные продолжения. Повтор допустим только для HTTP 429, полученных до начала потока; пользовательские транспорты `runTurn` не входят в цикл HTTP-повторов. `attempts` — это число повторов на том же ключе после первого 429 (всего отправок = `attempts` + 1) и единый бюджет на запрос, общий для основного цикла восстановления, терминального продолжения и повторов моста. Исчерпание `attempts` лишь останавливает дальнейшие повторы на том же ключе; далее применяется обычный фейловер ключей или финальная обработка ошибки в зависимости от доступных таргетов — на passthrough-канале с ключевой аутентификацией фейловера нет, поэтому исчерпанный 429 возвращается как есть. Codex сам никогда не повторяет 429, поэтому это единственная защита для провайдеров с одним ключом. По умолчанию: `enabled: true`, `attempts: 3`, `intervalMs: 5000`, `maxIntervalMs: 60000` (любое ожидание ограничено `maxIntervalMs`, который сам ограничен 600000), `respectRetryAfter: true`. |
 | `autoToolChoiceOnlyModels?` | `string[]` | Модели, у которых `tool_choice` принимает только `auto` или `none`; forced choice понижается. |
 | `preserveReasoningContentModels?` | `string[]` | Модели, которым нужен предыдущий assistant `reasoning_content` в chat history. |
+| `requiresReasoningPlaceholderModels?` | `string[]` | Модели, чей upstream отклоняет tool_call-продолжение без `reasoning_content` (DeepSeek thinking mode); при промахе replay-кэша подставляется минимальный placeholder. По умолчанию наследует `preserveReasoningContentModels`; `[]` отключает явно. |
 | `thinkingToggleModels?` | `string[]` | Chat-модели, использующие `thinking.enabled` вместо effort-ladder. |
 | `thinkingBudgetModels?` | `string[]` | Chat-модели, использующие целочисленный `thinking_budget`; effort отображается в долю бюджета. |
 | `noVisionModels?` | `string[]` | Text-only-модели, идущие через vision sidecar; при сопоставлении tolerируется тег Ollama вида `:size`. |
@@ -370,9 +383,9 @@ malformed-результаты откатываются к stale/configured fall
 дальнейших изменений allowlist'а.
 
 Preview fallback-записи GPT-5.6 используют тот же механизм. Preset OpenAI API-key заранее засевает
-base- и Pro-id с context `1050000` и max input `922000`; OpenRouter заранее засевает
-`openai/gpt-5.6-sol`, `openai/gpt-5.6-terra` и `openai/gpt-5.6-luna` с context `1050000`.
-Pool/Direct рекламирует `372000`; синхронизированный каталог показывает `max`, сохраняя при этом
+base- и Pro-id с context `922000` и max input `922000`; OpenRouter заранее засевает
+`openai/gpt-5.6-sol`, `openai/gpt-5.6-terra` и `openai/gpt-5.6-luna` с context `922000`.
+Pool/Direct рекламирует `922000`; синхронизированный каталог показывает `max`, сохраняя при этом
 отдельную ступень `xhigh`.
 
 ```json

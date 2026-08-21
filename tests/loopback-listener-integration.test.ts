@@ -22,6 +22,7 @@ import {
   setEphemeralPortAllocatorForTests,
 } from "../src/server/ports";
 import type { OcxConfig } from "../src/types";
+import { SERVER_BUDGET_MS } from "./helpers/test-budget";
 
 const previousApiToken = process.env.OPENCODEX_API_AUTH_TOKEN;
 const previousHome = process.env.OPENCODEX_HOME;
@@ -148,7 +149,10 @@ describe("unauthenticated loopback listener", () => {
     } finally {
       await server.stop(true);
     }
-  });
+    // A real proxy plus a real listener, and the refusal is only proven by letting the
+    // connection attempt reach its own 2s socket timeout. Together those exceed Bun's
+    // 5s default on a loaded Windows box, where the test measured 5.04s.
+  }, SERVER_BUDGET_MS);
 
   test("serves only the four allowlisted routes, using each route's real method", async () => {
     const loopbackPort = await freePort();
@@ -186,6 +190,35 @@ describe("unauthenticated loopback listener", () => {
       // And an allowlisted route is genuinely reachable, so the rejections above are not
       // passing merely because nothing works on this listener.
       expect((await fetch(`${base}/v1/models`)).status).toBe(200);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("admits standalone realtime voice WebSocket upgrades, HTTP stays rejected", async () => {
+    const loopbackPort = await freePort();
+    saveConfig(baseConfig(loopbackPort));
+    const server = startServer(0);
+    const base = `http://127.0.0.1:${loopbackPort}`;
+    const upgradeHeaders = {
+      connection: "upgrade",
+      upgrade: "websocket",
+      "sec-websocket-version": "13",
+      "sec-websocket-key": Buffer.from("0123456789abcdef").toString("base64"),
+    };
+    try {
+      // A directly-spawned `codex app-server` drives desktop voice through the injected
+      // listener (codex-rs thread/realtime/start, standalone WebSocket transport). The
+      // allowlist must not 404 these upgrades; what comes back instead is the relay's own
+      // auth answer (no upstream credential is configured here), which still proves the
+      // request got past the allowlist.
+      for (const path of ["/v1/realtime?model=m", "/v1/live?model=m"]) {
+        const res = await fetch(`${base}${path}`, { headers: upgradeHeaders });
+        expect({ path, status: res.status }).not.toEqual({ path, status: 404 });
+      }
+      // Plain HTTP on the same paths remains outside the allowlist.
+      expect((await fetch(`${base}/v1/realtime?model=m`)).status).toBe(404);
+      expect((await fetch(`${base}/v1/live?model=m`)).status).toBe(404);
     } finally {
       await server.stop(true);
     }
@@ -283,8 +316,114 @@ describe("unauthenticated loopback listener", () => {
     // unauthenticated traffic after shutdown reported success.
     for (const port of [publicPort, loopbackPort]) {
       const probe = Bun.serve({ port, hostname: "127.0.0.1", fetch: () => new Response("ok") });
-      probe.stop(true);
+      await probe.stop(true);
     }
+  });
+
+  test("stopping the server clears the background intervals it started", async () => {
+    saveConfig(baseConfig(null));
+    const nativeSetInterval = globalThis.setInterval;
+    const nativeClearInterval = globalThis.clearInterval;
+    const started = new Set<ReturnType<typeof setInterval>>();
+    const cleared = new Set<ReturnType<typeof setInterval>>();
+
+    Object.defineProperty(globalThis, "setInterval", {
+      configurable: true,
+      value: ((...args: Parameters<typeof setInterval>) => {
+        const timer = nativeSetInterval(...args);
+        started.add(timer);
+        return timer;
+      }) as typeof setInterval,
+      writable: true,
+    });
+    Object.defineProperty(globalThis, "clearInterval", {
+      configurable: true,
+      value: ((timer: ReturnType<typeof setInterval>) => {
+        cleared.add(timer);
+        nativeClearInterval(timer);
+      }) as typeof clearInterval,
+      writable: true,
+    });
+
+    let allCleared = false;
+    try {
+      const server = startServer(0);
+      // Memory watchdog and state-store sweeper always replace their singleton;
+      // the storage scheduler may already be the leaked instance from a prior test.
+      expect(started.size).toBeGreaterThanOrEqual(2);
+      await server.stop(true);
+      allCleared = [...started].every(timer => cleared.has(timer));
+    } finally {
+      for (const timer of started) nativeClearInterval(timer);
+      Object.defineProperty(globalThis, "setInterval", {
+        configurable: true,
+        value: nativeSetInterval,
+        writable: true,
+      });
+      Object.defineProperty(globalThis, "clearInterval", {
+        configurable: true,
+        value: nativeClearInterval,
+        writable: true,
+      });
+    }
+    expect(allCleared).toBe(true);
+  });
+
+  test("stopping an older server does not clear a newer server's background intervals", async () => {
+    saveConfig(baseConfig(null));
+    const nativeSetInterval = globalThis.setInterval;
+    const nativeClearInterval = globalThis.clearInterval;
+    const started: Array<ReturnType<typeof setInterval>> = [];
+    const cleared = new Set<ReturnType<typeof setInterval>>();
+
+    Object.defineProperty(globalThis, "setInterval", {
+      configurable: true,
+      value: ((...args: Parameters<typeof setInterval>) => {
+        const timer = nativeSetInterval(...args);
+        started.push(timer);
+        return timer;
+      }) as typeof setInterval,
+      writable: true,
+    });
+    Object.defineProperty(globalThis, "clearInterval", {
+      configurable: true,
+      value: ((timer: ReturnType<typeof setInterval>) => {
+        cleared.add(timer);
+        nativeClearInterval(timer);
+      }) as typeof clearInterval,
+      writable: true,
+    });
+
+    let newerTimersSurvivedOlderStop = false;
+    let newerTimersClearedOnOwnStop = false;
+    try {
+      const older = startServer(0);
+      const sharedTimers = [...started];
+      expect(sharedTimers.length).toBeGreaterThanOrEqual(3);
+      const newer = startServer(0);
+      // Singleton loops are process-scoped: the second live server acquires the
+      // same lease instead of replacing the watchdog and sweeper intervals.
+      expect(started).toEqual(sharedTimers);
+
+      await older.stop(true);
+      newerTimersSurvivedOlderStop = sharedTimers.every(timer => !cleared.has(timer));
+      await newer.stop(true);
+      newerTimersClearedOnOwnStop = sharedTimers.every(timer => cleared.has(timer));
+    } finally {
+      for (const timer of started) nativeClearInterval(timer);
+      Object.defineProperty(globalThis, "setInterval", {
+        configurable: true,
+        value: nativeSetInterval,
+        writable: true,
+      });
+      Object.defineProperty(globalThis, "clearInterval", {
+        configurable: true,
+        value: nativeClearInterval,
+        writable: true,
+      });
+    }
+    expect(newerTimersSurvivedOlderStop).toBe(true);
+    expect(newerTimersClearedOnOwnStop).toBe(true);
   });
 
   test("a loopback bind failure rolls back the public listener rather than stranding it", async () => {
@@ -310,9 +449,9 @@ describe("unauthenticated loopback listener", () => {
         fetch: () => new Response("ok"),
       });
       expect(rebound.port).toBe(publicPort);
-      rebound.stop(true);
+      await rebound.stop(true);
     } finally {
-      squatter.stop(true);
+      await squatter.stop(true);
     }
   });
 
@@ -476,6 +615,7 @@ describe("Codex injection targets the loopback listener", () => {
       expect(written).toContain("http://127.0.0.1:10200/v1");
       expect(written).not.toContain("http://127.0.0.1:10100/v1");
       expect(written).not.toContain("env_http_headers");
+      expect(written).not.toContain("env_key");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

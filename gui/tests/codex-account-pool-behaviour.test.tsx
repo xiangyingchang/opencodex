@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import { act } from "react";
 import type { Root } from "react-dom/client";
+import { clearClientResourceStoresForTests } from "../src/client-resource";
 import { useCodexAccountPool, type CodexAccountPoolController } from "../src/hooks/useCodexAccountPool";
 
 /**
@@ -21,6 +22,7 @@ let root: Root | null = null;
 let calls: string[] = [];
 let originalFetch: typeof globalThis.fetch;
 let accounts: unknown[] = [];
+let usageAccounts: unknown[] = [];
 let threshold = 80;
 let nextAccountsResponseGate: Promise<void> | null = null;
 let pauseResponseActiveId: string | null = null;
@@ -35,6 +37,7 @@ let activePinned = false;
 let activePinnedAccountId: string | null = null;
 let omitPinnedAccountId = false;
 let activeGetId: string | null = null;
+let deleteCatalogRefreshPending = false;
 
 beforeEach(() => {
   previous = Object.fromEntries(globals.map((k) => [k, Reflect.get(globalThis, k)])) as typeof previous;
@@ -62,12 +65,17 @@ beforeEach(() => {
   activePinnedAccountId = null;
   omitPinnedAccountId = false;
   activeGetId = null;
+  deleteCatalogRefreshPending = false;
   accounts = [{ id: "a1", email: "account-one", isMain: true, paused: false, priority: 0, hasCredential: true, quota: null }];
+  usageAccounts = [];
   Object.defineProperty(globalThis, "fetch", {
     configurable: true,
     value: async (url: string, init?: RequestInit) => {
       const path = String(url).split("/api/")[1] ?? String(url);
       calls.push(`${init?.method ?? "GET"} ${path}`);
+      if (path.startsWith("usage?")) {
+        return { ok: true, json: async () => ({ accounts: usageAccounts }) } as unknown as Response;
+      }
       if (path === "codex-auth/accounts/priority") {
         const gate = nextPriorityResponseGate;
         nextPriorityResponseGate = null;
@@ -113,6 +121,16 @@ beforeEach(() => {
             pausedAccountIds: bulkPausedAccountIds,
             pausedCount: bulkPausedAccountIds.length,
             activeCodexAccountId: bulkResponseActiveId,
+          }),
+        } as unknown as Response;
+      }
+      if (path.startsWith("codex-auth/accounts") && init?.method === "DELETE") {
+        return {
+          ok: true,
+          json: async () => ({
+            ok: true,
+            catalogRefreshPending: deleteCatalogRefreshPending,
+            privateDetail: "private-delete-detail",
           }),
         } as unknown as Response;
       }
@@ -165,6 +183,7 @@ afterEach(async () => {
     root = null;
   }
   await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+  clearClientResourceStoresForTests();
   for (const key of globals) {
     Object.defineProperty(globalThis, key, { configurable: true, value: previous[key] });
   }
@@ -199,9 +218,53 @@ test("the controller loads once on mount", async () => {
   expect(seen.current!.loadState).toBe("ready");
 });
 
+test("the controller joins 30-day usage to accounts by the displayed log label", async () => {
+  accounts = [
+    { id: "main", email: "main", isMain: true, paused: false, priority: 0, hasCredential: true, quota: null },
+    { id: "pool", email: "pool", logLabel: "pabc123", isMain: false, paused: false, priority: 0, hasCredential: true, quota: null },
+  ];
+  usageAccounts = [
+    { accountLogLabel: "main", totalTokens: 11, estimatedCostUsd: 0.01, usageCoverageRatio: 1 },
+    { accountLogLabel: "pabc123", totalTokens: 22, estimatedCostUsd: 0.02, usageCoverageRatio: 0.5 },
+    { accountLogLabel: "legacy-ambiguous", totalTokens: 999, estimatedCostUsd: 9, usageCoverageRatio: 1 },
+  ];
+
+  const seen = await mountController();
+  expect(seen.current!.accounts.map(account => ({
+    label: account.logLabel,
+    tokens: account.usage30d?.totalTokens,
+  }))).toEqual([
+    { label: "main", tokens: 11 },
+    { label: "pabc123", tokens: 22 },
+  ]);
+});
+
+test("account reloads do not refetch the independently polled usage summary", async () => {
+  const seen = await mountController();
+  expect(calls.filter(call => call.startsWith("GET usage?")).length).toBe(1);
+
+  await act(async () => { await seen.current!.load(); });
+
+  expect(calls.filter(call => call.startsWith("GET usage?")).length).toBe(1);
+  expect(calls.filter(call => call.includes("codex-auth/accounts")).length).toBe(2);
+});
+
 test("an inert controller issues no requests at all", async () => {
   await mountController(false);
   expect(calls.length).toBe(0);
+});
+
+test("account removal returns only the public catalog completion flag", async () => {
+  deleteCatalogRefreshPending = true;
+  const seen = await mountController();
+
+  await act(async () => {
+    expect(await seen.current!.removeAccount("a1")).toEqual({
+      ok: true,
+      catalogRefreshPending: true,
+    });
+  });
+  expect(calls).toContain("DELETE codex-auth/accounts?id=a1");
 });
 
 test("pausing an account writes the persisted endpoint and updates shared state", async () => {

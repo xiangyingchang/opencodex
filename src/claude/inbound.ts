@@ -10,9 +10,11 @@
  *  - top_k is accepted and silently dropped (no Responses equivalent, CCR parity).
  */
 import type { OcxClaudeCodeConfig } from "../types";
+import { isAnthropicOutputSchema } from "../adapters/anthropic-output-schema";
 import { resolveAlias } from "./alias";
 import { stripOneMillionMarker } from "./context-windows";
 import { resolveDesktop3pAlias } from "./desktop-3p";
+import { isClaudeWebSearchToolName } from "./outbound";
 import { createHash } from "node:crypto";
 
 export class AnthropicRequestError extends Error {}
@@ -23,7 +25,37 @@ function isRec(v: unknown): v is Rec {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
-/** Alias first, then modelMap: exact id, then date-suffix-stripped (`-\d{8}$`), else passthrough. */
+function isClaudeClassifierModel(model: string): boolean {
+  const stripped = model.replace(/-\d{8}$/, "");
+  return /^claude-opus-[45]/.test(stripped);
+}
+
+/**
+ * Explicitly configured classifier route for Claude Code Auto Mode safety checks (#1697).
+ *
+ * Only OPERATOR-DECLARED targets are used: `classifierModel`, then the ordered
+ * `classifierFallbacks`. Both are qualified `provider/model` strings the operator chose, so
+ * routing them crosses no boundary the operator did not ask for.
+ *
+ * Deliberately NOT here: inferring a provider from `claudeCode.model`. That value is the
+ * injected/default config slot, not the provider the live session actually selected, so it goes
+ * stale the moment the user changes the model picker -- and acting on it would silently move a
+ * classifier turn onto a provider with its own privacy and billing consequences. Live session
+ * affinity needs the request/session state this function does not have; it is tracked as
+ * follow-up work rather than approximated from static config.
+ */
+function configuredClassifierRoute(cc?: OcxClaudeCodeConfig): string | undefined {
+  const explicit = typeof cc?.classifierModel === "string" ? cc.classifierModel.trim() : "";
+  if (explicit.length > 0) return explicit;
+  if (Array.isArray(cc?.classifierFallbacks)) {
+    for (const candidate of cc.classifierFallbacks) {
+      if (typeof candidate === "string" && candidate.trim().length > 0) return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+/** Alias first, then modelMap: exact id, then date-suffix-stripped (`-\d{8}$`), then classifier affinity/config, else passthrough. */
 export function resolveInboundModel(model: string, cc?: OcxClaudeCodeConfig): string {
   // Defensive: Desktop/CLI strip the [1m] context-variant marker client-side, but a
   // leaking build must not break alias decode (devlog 138 — the 1M signal is the
@@ -45,6 +77,14 @@ export function resolveInboundModel(model: string, cc?: OcxClaudeCodeConfig): st
   const stripped = model.replace(/-\d{8}$/, "");
   const dateless = map[stripped];
   if (typeof dateless === "string" && dateless.length > 0) return dateless;
+
+  // Claude Code Auto Mode classifier routing (#1697). Bare classifier checks such as
+  // `claude-opus-5` carry no provider, so without this they fall through to defaultProvider --
+  // which may not speak Anthropic at all. Only an operator-declared target is used.
+  if (isClaudeClassifierModel(model)) {
+    const configured = configuredClassifierRoute(cc);
+    if (configured) return configured;
+  }
   return model;
 }
 
@@ -66,6 +106,17 @@ export function effortFromOutputConfig(outputConfig: unknown): string | undefine
   if (!isRec(outputConfig)) return undefined;
   const effort = outputConfig.effort;
   return typeof effort === "string" && OUTPUT_CONFIG_EFFORTS.has(effort) ? effort : undefined;
+}
+
+function formatFromOutputConfig(outputConfig: unknown): Rec | undefined {
+  if (!isRec(outputConfig) || !isRec(outputConfig.format)) return undefined;
+  const format = outputConfig.format;
+  if (
+    format.type !== "json_schema"
+    || !isRec(format.schema)
+    || !isAnthropicOutputSchema(format.schema)
+  ) return undefined;
+  return { type: "json_schema", name: "response", schema: format.schema };
 }
 
 function systemToInstructions(system: unknown): string | undefined {
@@ -375,7 +426,12 @@ function toolChoiceToResponses(choice: unknown, body: Rec): void {
       if (typeof choice.name !== "string" || choice.name.length === 0) {
         throw new AnthropicRequestError("tool_choice.tool requires a name");
       }
-      body.tool_choice = { type: "function", name: choice.name };
+      // Anthropic represents hosted WebSearch as a named tool choice, while
+      // Responses requires the choice type to match the hosted declaration.
+      // Preserve forced-tool intent rather than weakening it to `auto`.
+      body.tool_choice = isClaudeWebSearchToolName(choice.name)
+        ? { type: "web_search" }
+        : { type: "function", name: choice.name };
       break;
     default: break;
   }
@@ -461,6 +517,8 @@ export function anthropicToResponsesTranslation(raw: unknown, cc?: OcxClaudeCode
   if (Array.isArray(raw.stop_sequences) && raw.stop_sequences.length > 0) {
     body.stop = raw.stop_sequences.filter((s): s is string => typeof s === "string");
   }
+  const outputConfigFormat = formatFromOutputConfig(raw.output_config);
+  if (outputConfigFormat) body.text = { format: outputConfigFormat };
   let cacheKeySource: ClaudeCacheKeySource = null;
   if (isRec(raw.metadata) && typeof raw.metadata.user_id === "string") {
     body.user = raw.metadata.user_id;
@@ -502,8 +560,9 @@ export function anthropicToResponsesTranslation(raw: unknown, cc?: OcxClaudeCode
     // An explicit "disabled" is an instruction, not an absence. Dropping it made this
     // indistinguishable from a request that never mentioned thinking — and for models that
     // think by default, omission means thinking is ON, sharing the caller's max_tokens (#545).
-    // "none" is the parser's disable sentinel (parser.ts REASONING_EFFORTS).
-    body.reasoning = { effort: "none", summary: "none" };
+    // `none` is the effort disable sentinel. It is not a valid OpenAI summary
+    // value, so do not attach the similarly named internal catalog sentinel.
+    body.reasoning = { effort: "none" };
   } else if (isRec(thinking) || outputConfigEffort !== undefined) {
     const reasoning: Rec = { summary: "auto" };
     if (outputConfigEffort !== undefined) {

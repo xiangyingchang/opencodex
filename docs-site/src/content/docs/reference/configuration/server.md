@@ -13,10 +13,11 @@ runs helper features around provider requests.
 | `port` | `number` | `10100` | Proxy listen port. |
 | `hostname?` | `string` | `"127.0.0.1"` | Bind address. Non-loopback binds require `OPENCODEX_API_AUTH_TOKEN`. |
 | `proxy?` | `string` | — | Outbound HTTP(S) proxy URL or `${ENV_VAR}`. Applied to `HTTP_PROXY` / `HTTPS_PROXY` only when those variables are unset; loopback remains in `NO_PROXY`. |
+| `emptyCompletionRetry?` | `boolean` | `false` | Opt in to one identical Responses retry when a completion has no text or tool call. The retry may be billable. `OCX_EMPTY_COMPLETION_RETRY=0` disables it without changing config; combo and routed-compaction turns remain excluded. |
 | `stallTimeoutSec?` | `number` | `300` | Seconds without upstream data before `response.incomplete`. Minimum 1. |
 | `connectTimeoutMs?` | `number` | `200000` | Per-attempt DNS/TCP/TLS/final-header deadline; it ends before body generation. |
 | `shutdownTimeoutMs?` | `number` | `5000` | Graceful drain deadline before active turns are aborted. |
-| `websockets?` | `boolean` | `false` | Advertise `supports_websockets` for the Responses WebSocket path. False keeps HTTP/SSE. |
+| `websockets?` | `boolean` | `false` | Advertise and admit the client-facing Responses WebSocket path. False keeps clients on HTTP/SSE; it does not disable an eligible canonical ChatGPT upstream WS optimization. |
 | `corsAllowOrigins?` | `string[]` | `[]` | Additional exact origins allowed by CORS. Loopback origins are always allowed. Authority-based browser extension origins such as `chrome-extension://<extension-id>` are supported; `*` is not a wildcard. Firefox and Safari regenerate the extension UUID (per install / per browser launch), so update the entry when the origin changes. |
 | `apiKeys?` | `OcxApiKey[]` | `[]` | Generated `ocx_…` credentials accepted by management and data-plane auth on non-loopback binds. Dashboard-managed. |
 | `storageCleanupPolicy?` | `StorageCleanupPolicy` | disabled | Opt-in archived-session cleanup policy. Never enabled implicitly. |
@@ -54,11 +55,17 @@ x-opencodex-api-key: your-secret-token
 | `/v1/responses` | not accepted | **required** | not accepted |
 | `/v1/chat/completions` | not accepted | **required** | not accepted |
 | `/v1/messages` | accepted | accepted | accepted |
+| `/v1/messages/count_tokens` | accepted | accepted | accepted |
 | `/v1/models` | accepted | accepted | accepted |
 
 Responses and Chat Completions reserve `Authorization` for possible Codex Direct passthrough, so only
 the dedicated admission header is accepted there. Dashboard-generated `apiKeys` may replace the
 environment token after startup; candidates are compared in constant time.
+
+Messages and `count_tokens` keep accepting all three admission forms for routed-client compatibility. Native
+Anthropic passthrough is stricter on a non-loopback bind: proxy admission must use
+`x-opencodex-api-key`, while `Authorization` and `x-api-key` are reserved for Anthropic credentials.
+Any proxy admission secret placed in those provider headers is removed before forwarding.
 
 :::caution[LAN exposure]
 A `0.0.0.0` bind exposes the proxy and configured provider access to the LAN. Use it only on trusted
@@ -122,6 +129,12 @@ port too:
 ssh -L 20100:localhost:10100 -L 1455:localhost:1455 you@remote
 ```
 
+If a registered callback port is already in use and the login surface offers manual input, OpenCodex
+keeps the registered redirect URI and still returns the provider authorization URL. Complete the
+provider login, then paste the final redirect URL from the browser address bar or the authorization
+code into OpenCodex. The pending flow preserves state and PKCE validation. Callers without manual
+input still fail closed.
+
 :::caution[Forwarded loopback is unauthenticated]
 Plain `ssh -L` listens on your local loopback and is safe for the default unauthenticated bind. Do not
 use `ssh -g -L`, broad container publishing, or forwarding modes that expose the client side on
@@ -139,7 +152,7 @@ with `POST /api/storage/cleanup-policy/run`.
 
 ## Claude Code (`claudeCode`)
 
-These settings govern `/v1/messages`, the `ocx claude` launcher, and the Claude dashboard page.
+These settings govern `/v1/messages`, `/v1/messages/count_tokens`, the `ocx claude` launcher, and the Claude dashboard page.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -147,6 +160,8 @@ These settings govern `/v1/messages`, the `ocx claude` launcher, and the Claude 
 | `claudeCode.bodyMaxBytes?` | `number` | `67108864` | Cumulative native-passthrough body cap for streamed and buffered responses. Exactly `0` disables. |
 | `claudeCode.authMode?` | `"proxy" \| "subscription"` | auto | How launch handles `ANTHROPIC_AUTH_TOKEN`. Auto detects auth each launch; an explicit value is never overridden. |
 | `claudeCode.authModeMigratedAt?` | `string` | unset | Internal one-time upgrade marker. Do not set manually. |
+| `claudeCode.classifierModel?` | `string` | unset | Explicit target for Claude Code Auto Mode classifier turns, as a qualified `provider/model` (for example `RelayA/claude-opus-5`). Auto Mode sends bare safety checks such as `claude-opus-5` with no provider, so without this they fall through to `defaultProvider` — which may not speak Anthropic at all. Nothing is inferred automatically: only a target you declare here is used. |
+| `claudeCode.classifierFallbacks?` | `string[]` | unset | Ordered classifier targets used when `classifierModel` is not set. Same qualified `provider/model` form; the first usable entry wins. An explicit `modelMap` entry for the classifier model still outranks both. |
 | `claudeCode.subagentEffort?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | inherit | Effort written to generated `~/.claude/agents/ocx-*.md`; separate from Codex guidance and proxy caps. Restart through `ocx claude` to regenerate. |
 
 Auto auth selects subscription when stored Claude auth is found, proxy when none is found, and
@@ -215,7 +230,7 @@ an inactivity guard, not a total generation deadline.
 | `backend?` | `"openai" \| "anthropic"` | auto | Same explicit-first, Anthropic-credential-aware selection as web search. |
 | `model?` | `string` | backend-dependent | `gpt-5.4-mini` for OpenAI or `claude-sonnet-5` for Anthropic. |
 | `maxDescriptionsPerTurn?` | `number` | `8` | New description cache misses admitted per main turn. `0` disables calls; invalid values use default. |
-| `timeoutMs?` | `number` | `45000` | Sidecar fetch timeout. |
+| `timeoutMs?` | `number` | `45000` | Sidecar fetch timeout. Integer 1–2147483647. |
 
 Vision activates only for images sent to a model in its provider's `noVisionModels`. OpenAI has the
 same login/forward requirements as search; explicitly selected Anthropic fails closed without a usable

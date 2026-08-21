@@ -49,17 +49,19 @@ describe("enforce-pr-target workflow", () => {
     assert.match(workflow, /synchronize/);
   });
 
-  it("re-runs on issue_comment so a maintainer GUI waiver takes effect", () => {
-    // The GUI-screenshot gate is waived by a maintainer issue comment
-    // ("not touching gui"). `pull_request_target` types do not include issue
-    // comments, so without this trigger the waiver sits unread until a PR
-    // edit or push re-runs the gate.
-    assert.match(workflow, /^  issue_comment:/m);
-    assert.match(workflow, /- created/);
-    assert.match(workflow, /- edited/);
-    // The script resolves the PR number from the issue payload, which is what
-    // an issue_comment event delivers instead of a pull_request object.
-    assert.match(workflow, /context\.payload\.issue\?\.number/);
+  it("uses label events for GUI waivers, hygiene sponsorship, and a trusted CodeRabbit status signal", () => {
+    assert.doesNotMatch(workflow, /^  issue_comment:/m);
+    assert.match(workflow, /- labeled/);
+    assert.match(workflow, /- unlabeled/);
+    assert.match(workflow, /^  status:/m);
+    assert.match(workflow, /github\.event\.context == 'CodeRabbit'/);
+    assert.match(workflow, /github\.event\.state == 'success'/);
+    assert.match(workflow, /github\.event\.label\.name == 'gui-screenshot-waived'/);
+    assert.match(workflow, /github\.event\.label\.name == 'intake: hygiene-blocked'/);
+    assert.match(workflow, /github\.event\.label\.name == 'maintainer-sponsored'/);
+    assert.match(workflow, /listPullRequestsAssociatedWithCommit/);
+    assert.match(workflow, /candidate\.head\?\.sha === statusSha/);
+    assert.match(workflow, /candidates\.length !== 1/);
   });
 
   it("does not add review events that would break the trusted-base model", () => {
@@ -110,6 +112,26 @@ describe("enforce-pr-target workflow", () => {
     assert.match(workflow, /reviewReadyDesired/);
   });
 
+  it("does not embed a literal CodeRabbit review command in the ready notice", () => {
+    // A literal "@coderabbitai review" inside the gate comment is executed by
+    // CodeRabbit as a review command even when rendered as inline code. Its
+    // success status then wakes this workflow again, which rewrites the same
+    // comment, which CodeRabbit reads as a new command -- a self-sustaining
+    // loop that only stops on CodeRabbit's per-hour rate limit. The ready
+    // notice must describe the label without issuing a command (PR #1630).
+    assert.doesNotMatch(workflow, /coderabbitai review/);
+  });
+
+  it("does not rewrite the gate comment when the rebuilt body is unchanged", () => {
+    // The ready-path rebuild is deterministic: on a CodeRabbit status wake the
+    // gate recomputes the same READY body and would call updateComment on it.
+    // That no-op edit is still a mutation event to review bots and restarts the
+    // loop above, so the upsert must skip the write when body equals the posted
+    // comment body (PR #1630).
+    assert.match(workflow, /if \(gateComment\?\.body === body\)/);
+    assert.match(workflow, /let body = buildGateCommentBody/);
+  });
+
   it("keeps CodeRabbit auto-review unfiltered so maintainer PRs are not starved", () => {
     // A positive `labels:` filter under `reviews.auto_review` in
     // `.coderabbit.yaml` would restrict ALL automatic reviews to PRs carrying
@@ -141,15 +163,87 @@ describe("enforce-pr-target workflow", () => {
       .split("- name: Checkout trusted PR-quality scripts")[1]
       .split(/\n {6}- name:/)[0];
     assert.match(checkoutStep, /actions\/checkout@[0-9a-f]{40}/);
-    // `pull_request_target` pins the PR base SHA. Privileged `issue_comment`
-    // runs must source scripts from the repository default branch, matching
-    // the branch that supplied the workflow itself; unpromoted `dev` scripts
-    // must never execute under the write-capable token.
-    assert.match(
-      checkoutStep,
-      /ref:\s*\$\{\{\s*github\.event_name\s*==\s*'issue_comment'\s*&&\s*github\.event\.repository\.default_branch\s*\|\|\s*github\.event\.pull_request\.base\.sha\s*\}\}/,
+    // The trusted ref comes from a fixed set of integration branches, never
+    // from the PR's own base commit: a stacked child's base is another open
+    // PR's head, and `base.sha` would let that unpromoted commit choose the
+    // code that runs with this job's write-capable token.
+    //
+    // `status` has no pull_request payload and sources from the default branch
+    // that supplied the privileged workflow. A `main`-targeting PR sources
+    // from `main` so the workflow definition and the scripts match. Everything
+    // else resolves to `dev`.
+    //
+    // Exact equality, not fragment matching: separate checks for `status`,
+    // `main`, and `dev` would all pass with the operator grouping wrong or a
+    // surviving `base.sha` fallback.
+    const ref = checkoutStep.match(/^\s*ref:\s*(.+)$/m)?.[1];
+    assert.ok(ref, "trusted checkout must declare ref");
+    assert.equal(
+      ref.replace(/\s+/g, " ").trim(),
+      "${{ github.event_name == 'status' && github.event.repository.default_branch || (github.event.pull_request.base.ref == 'main' && 'main' || 'dev') }}",
     );
-    assert.doesNotMatch(checkoutStep, /\|\|\s*'dev'/);
+    assert.doesNotMatch(ref, /base\.sha|head\.(?:sha|ref)/);
+    // Pinning the checkout ref only gates one step. A later `run:` or
+    // `github-script` step interpolating a head ref would execute
+    // PR-controlled content with this workflow's write-capable token, so the
+    // whole file is gated. (`pr.head.sha` read back from the API is an
+    // identity for comparison, not an interpolated ref, and is unaffected.)
+    assert.doesNotMatch(
+      workflow,
+      /github\.event\.pull_request\.head\.(?:sha|ref|repo)/,
+      "no step in a pull_request_target workflow may interpolate a PR head ref",
+    );
+    // `refs/pull/<n>/head` reaches the same PR-controlled tree without ever
+    // naming `head`, so ban the merge-ref form too.
+    assert.doesNotMatch(
+      workflow,
+      /refs\/pull\//,
+      "no step may check out a refs/pull/* ref",
+    );
+    // Banning literal text is not enough: `format('refs/{0}/{1}/{2}', ...)`
+    // builds the same PR-controlled ref without ever spelling it. Every
+    // checkout in a pull_request_target workflow must therefore declare a ref
+    // drawn from the trusted allowlist, and no other step may name the PR
+    // number in a ref-shaped expression.
+    // An ALLOWLIST, not a denylist: every checkout in this workflow must use
+    // exactly the trusted expression. Banning known-bad shapes lost twice —
+    // first to `refs/pull/<n>/head`, then to `format('refs/{0}/...')` — and a
+    // `repository:` override pointing at the fork head is a third shape no
+    // denylist would have caught.
+    const checkouts = workflow.match(/uses:\s*actions\/checkout@[\s\S]*?(?=\n {6}- name:|$)/g) ?? [];
+    for (const step of checkouts) {
+      const stepRef = (step.match(/^\s*ref:\s*(.+)$/m)?.[1] ?? "").replace(/\s+/g, " ").trim();
+      assert.equal(stepRef, "${{ github.event_name == 'status' && github.event.repository.default_branch || (github.event.pull_request.base.ref == 'main' && 'main' || 'dev') }}", "every checkout must use the trusted ref");
+      assert.doesNotMatch(step, /repository:/, "a checkout must not retarget its repository");
+    }
+    // Checkout is not the only way to obtain PR-controlled code. A `run:` step
+    // can fetch it directly, and that is a realistic future edit rather than a
+    // synthetic one, so executable steps are gated on the acquisition verbs
+    // themselves.
+    // Stop enumerating command shapes. A denylist lost four times here
+    // (`refs/pull`, `format()`, `repository:`, `gh pr checkout`), and
+    // `git clone https://github.com/<fork>` would have been the fifth. The
+    // invariant is simpler than the attack surface: under
+    // `pull_request_target`, nothing executable may name the PR head or the
+    // fork repository at all.
+    // Comments may discuss the head ref; only executable content may not use
+    // it, so YAML comment lines are stripped before this check.
+    const executable = workflow
+      .split("\n")
+      .filter(line => !/^\s*#/.test(line) && !/^\s*\/\//.test(line.replace(/^\s*/, "")))
+      .join("\n");
+    assert.doesNotMatch(
+      executable.replace(/^\s*\/\/.*$/gm, ""),
+      /github\.head_ref|pull_request(?:\[['"]head['"]\]|\.head)\s*(?:\[|\.)?\s*['"]?repo/,
+      "no executable step may reference the PR head repository",
+    );
+    // Belt and braces for the acquisition verbs, which have no legitimate use
+    // in either gate: both only read PR metadata through the API.
+    assert.doesNotMatch(
+      workflow,
+      /gh\s+pr\s+checkout|git\s+(?:fetch|checkout|clone|switch)|refs\/pull/,
+      "no step may acquire pull-request code",
+    );
     // The readiness ping reads MAINTAINERS.md from the same trusted checkout.
     assert.match(checkoutStep, /sparse-checkout:\s*\|\s*\n\s*\.github\/scripts\n\s*MAINTAINERS\.md/);
     assert.match(checkoutStep, /persist-credentials:\s*false/);
@@ -181,6 +275,9 @@ describe("enforce-pr-target workflow", () => {
   it("loads pr-quality via require from the checked-out scripts", () => {
     assert.match(workflow, /pr-quality\.cjs/);
     assert.match(workflow, /collectPrQualityFailures/);
+    assert.match(workflow, /pr-hygiene\.cjs/);
+    assert.match(workflow, /collectDeterministicHygieneFailures/);
+    assert.match(workflow, /pulls\.listFiles/);
   });
 
   it("checks stacked bases via open PR heads before wrong_base enforcement", () => {
@@ -193,6 +290,9 @@ describe("enforce-pr-target workflow", () => {
     );
     assert.ok(qualityCall, "must call collectPrQualityFailures");
     assert.match(qualityCall[1], /stackedBase/);
+    assert.match(qualityCall[1], /changedFilePaths/);
+    assert.match(qualityCall[1], /filesTruncated/);
+    assert.match(workflow, /isChangedFileListTruncated/);
   });
 
   it("strips stale WRONG BRANCH prefix on failure when base is corrected", () => {

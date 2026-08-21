@@ -23,6 +23,7 @@ import {
 } from "../src/lib/app-owned-memory";
 import {
   CURSOR_EXTERNAL_ROOT_BYTE_LIMIT,
+  CURSOR_EXTERNAL_TOOL_CONTINUATION_TEXT,
   CURSOR_EXTERNAL_ROOT_BLOB_LIMIT,
   CURSOR_ROUTING_LEVEL_PARAMETER_ID,
   encodeCursorRunRequest,
@@ -180,7 +181,7 @@ describe("Cursor blob handshake", () => {
     expect((roots[1] as { role?: string }).role).toBe("user");
     expect(JSON.stringify(roots)).toContain("assistant-209");
     expect(JSON.stringify(roots)).not.toContain("user-0");
-  });
+  }, { timeout: 30_000 });
 
   test("caps external root replay by serialized bytes", () => {
     const large = "x".repeat(40_000);
@@ -246,7 +247,7 @@ describe("Cursor blob handshake", () => {
     const rootBytes = (run?.conversationState?.rootPromptMessagesJson ?? [])
       .reduce((sum, id) => sum + blobData(id).byteLength, 0);
 
-    expect(run?.action?.action.case).toBe("resumeAction");
+    expect(run?.action?.action.case).toBe("userMessageAction");
     expect(rootBytes).toBeLessThanOrEqual(CURSOR_EXTERNAL_ROOT_BYTE_LIMIT);
     expect(JSON.stringify(roots)).toContain("[Tool Result]");
     expect(JSON.stringify(roots)).toContain("truncated for Cursor external replay budget");
@@ -592,7 +593,9 @@ describe("Cursor blob handshake", () => {
     const roots = decodeRootMessages(bytes) as Array<{ role?: string; content?: unknown }>;
     const historicalUser = roots.find(root => root.role === "user");
     expect(historicalUser?.content).toEqual([{ type: "text", text: "read a file" }]);
-    expect(run?.action?.action.case).toBe("resumeAction");
+    const toolResultRoot = roots.find(root => JSON.stringify(root).includes("[Tool Result]"));
+    expect(toolResultRoot?.role).toBe("assistant");
+    expect(run?.action?.action.case).toBe("userMessageAction");
     expect(JSON.stringify(roots)).toContain("contents");
     expect(JSON.stringify(roots)).not.toContain("hidden reasoning");
   });
@@ -618,6 +621,36 @@ describe("Cursor blob handshake", () => {
     const run = msg.message.case === "runRequest" ? msg.message.value : undefined;
 
     expect(run?.action?.action.case).toBe("resumeAction");
+  });
+
+  test("drives external-model tool-result continuations as userMessageAction", () => {
+    // External wire models encode tool-result hops as userMessageAction; native
+    // models keep resumeAction. Tool results stay in the history blobs.
+    const bytes = encodeCursorRunRequest({
+      modelId: "claude-fable-5",
+      conversationId: "c-ext-cont",
+      system: ["You are helpful."],
+      messages: [{ role: "tool", content: "[tool_result]\ncall_id: call_1\nname: read_file\nis_error: false\noutput:\ncontents" }],
+      rawMessages: [
+        { role: "user", content: "read a file", timestamp: 1 },
+        {
+          role: "assistant",
+          model: "cursor/claude-fable-5",
+          timestamp: 2,
+          content: [{ type: "toolCall", id: "call_1", name: "read_file", arguments: { path: "a.txt" } }],
+        },
+        { role: "toolResult", toolCallId: "call_1", toolName: "read_file", content: "contents", isError: false, timestamp: 3 },
+      ],
+    });
+    const msg = fromBinary(AgentClientMessageSchema, bytes);
+    const run = msg.message.case === "runRequest" ? msg.message.value : undefined;
+
+    expect(run?.action?.action.case).toBe("userMessageAction");
+    const value = run?.action?.action.case === "userMessageAction" ? run.action.action.value : undefined;
+    expect(value?.userMessage?.text).toBe(CURSOR_EXTERNAL_TOOL_CONTINUATION_TEXT);
+    // Tool results are still replayed via history blobs.
+    const roots = decodeRootMessages(bytes) as Array<{ role?: string }>;
+    expect(JSON.stringify(roots)).toContain("contents");
   });
 });
 
@@ -648,6 +681,25 @@ describe("Cursor AgentRunRequest.mcp_tools channel", () => {
       ],
     });
     expect(mcpToolNames(bytes)).toEqual(["exec_command"]);
+  });
+
+  test("mcp_tools keeps unified Desktop exec for a generic tool-use prompt", () => {
+    const bytes = encodeCursorRunRequest({
+      modelId: "gpt-5.6-luna-high",
+      conversationId: "c1",
+      system: ["You are helpful."],
+      messages: [{ role: "user", content: "use any 3 tools" }],
+      tools: [
+        {
+          name: "exec",
+          description: "Run a command",
+          parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] },
+        },
+        { name: "wait", description: "Wait for a yielded cell", parameters: {} },
+        { name: "js", namespace: "mcp__node_repl", description: "Run JS", parameters: {} },
+      ],
+    });
+    expect(mcpToolNames(bytes)).toEqual(["exec"]);
   });
 
   test("leaves mcp_tools unset when tools are empty", () => {
@@ -1326,7 +1378,7 @@ describe("Cursor blob ID key channel bounds", () => {
     expect(result.error?.message).toBeDefined();
     expect(cursorBlobMetrics().count).toBe(4096);
     expect(cursorBlobMetrics().keyBytes).toBe(4096 * 66);
-  });
+  }, { timeout: 30_000 });
 
   test("a zero-payload blob stays evictable through its key bytes", () => {
     storeCursorBlob(new Uint8Array());

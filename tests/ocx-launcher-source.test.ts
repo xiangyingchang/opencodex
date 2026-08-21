@@ -36,11 +36,25 @@ describe("ocx.mjs npm launcher (source invariants)", () => {
     expect(runtimeSource).toContain('export const BUN_RUNTIME_SOURCE_ENV = "OCX_BUN_RUNTIME_SOURCE";');
   });
 
+  test("the long-running Bun child stays hidden under a headless Windows launcher (#1236)", () => {
+    const spawnStart = source.indexOf("const child = spawn(bun, [cliPath");
+    expect(spawnStart).toBeGreaterThanOrEqual(0);
+    const spawnCall = source.slice(spawnStart, source.indexOf("});", spawnStart));
+
+    // Scope this to the final Node-to-Bun launch. Other helper spawns already hide
+    // their windows, but they do not cover the child that owns the proxy lifetime.
+    expect(spawnCall).toContain('stdio: "inherit"');
+    expect(spawnCall).toContain("windowsHide: true");
+  });
+
   test("Windows npm spawns use the trusted absolute invocation without shell lookup", () => {
     expect(source).toContain("const latestInvocation = npmInvocation(");
     expect(source).toContain("const installInvocation = npmInvocation(");
     expect(source).toContain("spawnSync(latestInvocation.file, latestInvocation.args");
-    expect(source).toContain("spawnSync(installInvocation.file, installInvocation.args");
+    // #1942: the staged install spawns through the same hardened npmInvocation resolver
+    // inside the transactional runNpm callback.
+    expect(source).toContain("const invocation = npmInvocation(args);");
+    expect(source).toContain("spawnSync(invocation.file, invocation.args");
     expect(source).not.toContain("shell: true");
     expect(source).not.toContain('"npm.cmd"');
   });

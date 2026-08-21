@@ -45,66 +45,100 @@ function declaredBodyLength(req: Request): number | null {
   return Number.isFinite(length) && length >= 0 ? length : null;
 }
 
-export interface ReadBoundedJsonRequestBodyOptions {
-  readonly signal?: AbortSignal;
-  readonly fatalUtf8?: boolean;
+function cancelStreamWithoutWaiting(stream: ReadableStream<Uint8Array> | null, reason: unknown): void {
+  if (!stream || stream.locked) return;
+  try {
+    void stream.cancel(reason).catch(() => undefined);
+  } catch {
+    // A non-standard stream may throw synchronously from cancel().
+  }
 }
 
-async function readRawRequestBody(
-  req: Request,
+function cancelReaderWithoutWaiting(reader: ReadableStreamDefaultReader<Uint8Array>, reason: unknown): void {
+  // Request.clone() tees can leave cancel() pending until the other branch
+  // drains. Cancellation must never extend this reader's own admission bound.
+  try {
+    void reader.cancel(reason).catch(() => undefined);
+  } catch {
+    // A non-standard reader may throw synchronously from cancel().
+  }
+}
+
+async function readRequestBodyBytesCapped(
+  body: ReadableStream<Uint8Array> | null,
   maxBytes: number,
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
-  if (signal?.aborted) throw signal.reason;
-  if (!req.body) return new Uint8Array();
+  if (signal?.aborted) {
+    cancelStreamWithoutWaiting(body, signal.reason);
+    throw signal.reason;
+  }
+  if (!body) return new Uint8Array(0);
 
-  const reader = req.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  let cancelReason: unknown;
-  let rejectAbort: ((reason: unknown) => void) | undefined;
-  const aborted = signal
-    ? new Promise<never>((_resolve, reject) => { rejectAbort = reject; })
-    : undefined;
-  const onAbort = () => rejectAbort?.(signal?.reason);
+  const reader = body.getReader();
+  // Keep one geometric buffer instead of one object per transport chunk. A
+  // hostile peer can fragment a bounded payload into arbitrarily many chunks.
+  let retained = new Uint8Array(Math.min(maxBytes, 64 * 1024));
+  let retainedBytes = 0;
+  let aborted = false;
+  let abortReason: unknown;
+  let cancellationStarted = false;
+  const cancel = (reason: unknown): void => {
+    if (cancellationStarted) return;
+    cancellationStarted = true;
+    cancelReaderWithoutWaiting(reader, reason);
+  };
+  const onAbort = (): void => {
+    aborted = true;
+    abortReason = signal?.reason;
+    cancel(abortReason);
+  };
   signal?.addEventListener("abort", onAbort, { once: true });
-  if (aborted) void aborted.catch(() => undefined);
+  // Close the narrow race between the preflight check and listener install.
+  if (signal?.aborted) onAbort();
 
   try {
     while (true) {
-      const read = reader.read();
-      void read.catch(() => undefined);
-      const outcome = aborted ? await Promise.race([read, aborted]) : await read;
-      if (signal?.aborted) throw signal.reason;
-      const { done, value } = outcome;
-      if (done) break;
-      if (value.byteLength > maxBytes - total) {
-        throw new DecompressedBodyTooLargeError(maxBytes + 1, maxBytes);
+      if (aborted) throw abortReason;
+      const { value, done } = await reader.read();
+      // cancel() can resolve a pending read as EOF. Preserve the caller's
+      // original abort reason instead of misclassifying that as a clean body.
+      if (aborted) throw abortReason;
+      if (done) {
+        return retainedBytes === retained.byteLength
+          ? retained
+          : retained.slice(0, retainedBytes);
       }
-      if (value.byteLength > 0) {
-        chunks.push(value);
-        total += value.byteLength;
+      if (!value || value.byteLength === 0) continue;
+
+      if (value.byteLength > maxBytes - retainedBytes) {
+        const error = new DecompressedBodyTooLargeError(retainedBytes + value.byteLength, maxBytes);
+        cancel(error);
+        throw error;
       }
+
+      const required = retainedBytes + value.byteLength;
+      if (required > retained.byteLength) {
+        const grown = new Uint8Array(Math.min(maxBytes, Math.max(retained.byteLength * 2, required)));
+        grown.set(retained.subarray(0, retainedBytes));
+        retained = grown;
+      }
+      retained.set(value, retainedBytes);
+      retainedBytes = required;
     }
   } catch (error) {
-    cancelReason = error;
-    throw error;
+    const failure = aborted ? abortReason : error;
+    cancel(failure);
+    throw failure;
   } finally {
     signal?.removeEventListener("abort", onAbort);
-    if (cancelReason !== undefined || signal?.aborted) {
-      await reader.cancel(cancelReason ?? signal?.reason).catch(() => undefined);
-    } else {
+    try {
       reader.releaseLock();
+    } catch {
+      // A pending cancellation can retain the lock briefly; never await it.
     }
   }
 
-  const raw = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    raw.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return raw;
 }
 
 function inflateDeflateBody(compressed: Uint8Array<ArrayBuffer>, opts: { maxOutputLength: number }): Uint8Array {
@@ -147,38 +181,51 @@ export function decodeRequestBody(
   return assertBodySizeWithinLimit(decoded, maxBytes);
 }
 
-/** Parse a bounded JSON request body, transparently decoding compressed payloads. */
+/**
+ * Parse a bounded JSON request body, transparently decoding compressed payloads.
+ *
+ * `options.signal`, when provided, replaces `req.signal` rather than composing with
+ * it. Callers that need both (for example request disconnect plus a deadline) must
+ * merge them into one AbortSignal before calling.
+ */
 export async function readBoundedJsonRequestBody(
   req: Request,
   maxBytes: number,
   budget?: TranslatorBudget,
-  options: ReadBoundedJsonRequestBodyOptions = {},
+  options?: { emptyBodyFallback?: unknown; signal?: AbortSignal; fatalUtf8?: boolean },
+
 ): Promise<unknown> {
   const encoding = req.headers.get("content-encoding");
   const declaredLength = declaredBodyLength(req);
-  // Reject an honest oversized declaration before req.arrayBuffer() can allocate it.
-  // Missing, malformed, or dishonest declarations remain covered by decodeRequestBody's
-  // post-read cap below.
+  // Reject an honest oversized declaration before reading. Missing, malformed,
+  // and dishonest declarations remain bounded by the streaming reader below.
   if (declaredLength !== null && declaredLength > maxBytes) {
-    throw new DecompressedBodyTooLargeError(declaredLength, maxBytes);
+    const error = new DecompressedBodyTooLargeError(declaredLength, maxBytes);
+    cancelStreamWithoutWaiting(req.body, error);
+    throw error;
   }
   const releaseReservation = budget && declaredLength !== null && declaredLength > 0
     ? budget.observeAcceptedRequestCopy(declaredLength)
     : undefined;
   let raw: Uint8Array;
   try {
-    raw = await readRawRequestBody(req, maxBytes, options.signal);
+    raw = await readRequestBodyBytesCapped(req.body, maxBytes, options?.signal ?? req.signal);
+
   } finally {
     releaseReservation?.();
   }
+  assertBodySizeWithinLimit(raw, maxBytes);
   const releaseRaw = budget?.observeAcceptedRequestCopy(raw.byteLength);
   let releaseDecoded: (() => void) | undefined;
   let releaseText: (() => void) | undefined;
   try {
     const decoded = decodeRequestBody(raw, encoding, maxBytes);
     releaseDecoded = decoded === raw ? undefined : budget?.observeAcceptedRequestCopy(decoded.byteLength);
-    const text = new TextDecoder("utf-8", { fatal: options.fatalUtf8 === true }).decode(decoded);
+    const text = new TextDecoder("utf-8", { fatal: options?.fatalUtf8 === true }).decode(decoded);
     releaseText = budget?.observeAcceptedRequestCopy(new TextEncoder().encode(text).byteLength);
+    if (options && "emptyBodyFallback" in options && text.trim() === "") {
+      return options.emptyBodyFallback;
+    }
     const parsed = JSON.parse(text);
     budget?.observeAcceptedRequestCopy(new TextEncoder().encode(JSON.stringify(parsed)).byteLength);
     return parsed;

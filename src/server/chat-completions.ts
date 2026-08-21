@@ -2,11 +2,15 @@
  * OpenAI Chat Completions inbound (/v1/chat/completions) for GitHub Copilot App
  * and other OpenAI-compatible clients.
  *
- * Translate-and-replay: Chat Completions body -> /v1/responses via handleResponses,
- * then bridge the Responses output back to Chat Completions SSE/JSON.
+ * Ordinary openai-chat routes send directly on the Chat Completions wire. Routes
+ * that need Responses-only behavior keep the Chat -> Responses -> Chat bridge.
  */
 import { FORWARD_HEADERS } from "../adapters/openai-responses";
-import { ChatCompletionsRequestError, chatCompletionsToResponsesBody } from "../chat/inbound";
+import {
+  assertChatCompletionsRoutingBody,
+  ChatCompletionsRequestError,
+  chatCompletionsToResponsesBody,
+} from "../chat/inbound";
 import {
   chatCompletionsErrorResponse,
   collectChatCompletion,
@@ -25,7 +29,7 @@ import type { OcxConfig } from "../types";
 import { readJsonRequestBody } from "./request-decompress";
 import {
   addFinalRequestLog,
-  httpStatusForTerminalStatus,
+  httpStatusForRequestLogTerminal,
   recordFirstOutput,
   type RequestLogContext,
   type RequestLogEntry,
@@ -33,6 +37,7 @@ import {
 import { responseWithDeferredRequestLog } from "./relay";
 import { handleResponses } from "./responses";
 import type { AdmissionLease } from "../lib/admission";
+import type { DataPlaneAdmission } from "./auth-cors";
 import { tryClaimNativeMainProfileForTurn } from "../codex/native-main-admission";
 import {
   createTranslatorBudget,
@@ -40,6 +45,7 @@ import {
   isTranslatorBudgetExceededError,
   type TranslatorBudget,
 } from "../lib/translator-budget";
+import { handleNativeChatCompletions, isNativeChatRouteEligible } from "./chat-native";
 
 type Rec = Record<string, unknown>;
 
@@ -59,7 +65,7 @@ export async function handleChatCompletions(
   req: Request,
   config: OcxConfig,
   logCtx: RequestLogContext,
-  logIds?: { requestId: string; start: number; turnAdmissionLease?: AdmissionLease },
+  logIds?: { requestId: string; start: number; turnAdmissionLease?: AdmissionLease; admission?: DataPlaneAdmission },
 ): Promise<Response> {
   const translatorBudget = createTranslatorBudget();
   try {
@@ -78,14 +84,13 @@ async function handleChatCompletionsWithBudget(
   config: OcxConfig,
   logCtx: RequestLogContext,
   translatorBudget: TranslatorBudget,
-  logIds?: { requestId: string; start: number; turnAdmissionLease?: AdmissionLease },
+  logIds?: { requestId: string; start: number; turnAdmissionLease?: AdmissionLease; admission?: DataPlaneAdmission },
 ): Promise<Response> {
-  let chatBody: unknown;
-  let internalBody: Rec;
+  let chatBody: Rec;
   try {
-    chatBody = await readChatBody(req, translatorBudget);
-    internalBody = chatCompletionsToResponsesBody(chatBody);
-    translatorBudget.chargeRetained(new TextEncoder().encode(JSON.stringify(internalBody)).byteLength, { kind: "request_copies" });
+    const rawBody = await readChatBody(req, translatorBudget);
+    assertChatCompletionsRoutingBody(rawBody);
+    chatBody = rawBody;
   } catch (err) {
     const overflow = isTranslatorBudgetExceededError(err);
     const status = overflow ? 413 : err instanceof ChatCompletionsRequestError ? 400 : 500;
@@ -98,20 +103,17 @@ async function handleChatCompletionsWithBudget(
     );
   }
 
-  const requestedModel = (chatBody as Rec).model as string;
-  const stream = internalBody.stream === true;
+  const requestedModel = chatBody.model as string;
+  const stream = chatBody.stream === true;
   // Best-effort Grok attribution: the managed fence stamps this header on every model
   // it registers (extra_headers, sent verbatim by upstream Grok). Dashboard usage
   // bucketing only — never an auth or billing signal.
   if (req.headers.get("x-opencodex-grok") === "1") logCtx.surface = "grok";
-  // Routed adapters only support streamed turns; always stream internally and fold
-  // for non-streaming clients.
-  internalBody.stream = true;
-
-  let nativeRoute = false;
   let directRoute = false;
+  let settledRoute: ReturnType<typeof routeModel> | null = null;
+  let chatNativeRoute: ReturnType<typeof routeModel> | null = null;
   try {
-    const route = routeModel(config, internalBody.model as string, evidenceFromBody(internalBody));
+    const route = routeModel(config, requestedModel, evidenceFromBody(chatBody));
     // Settle the wire once so every branch below reads the adapter this model will
     // actually use, not the provider-wide default (#404).
     route.provider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, "chat");
@@ -120,31 +122,17 @@ async function handleChatCompletionsWithBudget(
     logCtx.requestedModel = requestedModel;
     logCtx.provider = route.providerName;
     logCtx.routeDecision = route.routeDecision;
+    settledRoute = route;
     if (route.provider.adapter === "openai-responses") {
-      nativeRoute = true;
       directRoute = route.codexAccountMode === "direct";
-      // ChatGPT backend rejects store:true and unsupported sampling knobs.
-      internalBody.store = false;
-      delete internalBody.max_output_tokens;
-      delete internalBody.temperature;
-      delete internalBody.top_p;
-      delete internalBody.stop;
-      delete internalBody.user;
-    } else if (internalBody.store === undefined) {
-      internalBody.store = false;
     }
     if (route.provider.adapter === "cursor" || route.provider.adapter === "kiro") {
-      const raw = chatBody as Rec;
       const parts: string[] = [];
-      if (raw.messages !== undefined) parts.push(JSON.stringify(raw.messages));
-      if (raw.tools !== undefined) parts.push(JSON.stringify(raw.tools));
+      if (chatBody.messages !== undefined) parts.push(JSON.stringify(chatBody.messages));
+      if (chatBody.tools !== undefined) parts.push(JSON.stringify(chatBody.tools));
       logCtx.usageLogInputTokens = Math.max(1, estimateTokens(parts.join("\n"), requestedModel));
     }
-    if (internalBody.reasoning !== undefined) {
-      const { supportedLadderFor } = await import("./effort-policy");
-      const ladder = supportedLadderFor({ provider: route.provider, modelId: route.modelId });
-      if (ladder !== undefined && ladder.length === 0) delete internalBody.reasoning;
-    }
+    if (isNativeChatRouteEligible(route, chatBody)) chatNativeRoute = route;
   } catch (err) {
     if (err instanceof NoEligiblePolicyCandidateError) {
       logCtx.routeDecision = err.trace;
@@ -153,7 +141,59 @@ async function handleChatCompletionsWithBudget(
     }
     /* unknown model: let handleResponses shape the 404 */
   }
-  void nativeRoute;
+
+  if (chatNativeRoute) {
+    return handleNativeChatCompletions({
+      req,
+      config,
+      logCtx,
+      ...(logIds ? { logIds } : {}),
+      route: chatNativeRoute,
+      chatBody,
+      requestedModel,
+      requestedStream: stream,
+      translatorBudget,
+    });
+  }
+
+  let internalBody: Rec;
+  try {
+    // Validate the full Chat boundary after routing. Native Chat keeps `chatBody` as
+    // its wire source; this Responses projection is used only by the fallback path.
+    internalBody = chatCompletionsToResponsesBody(chatBody);
+  } catch (err) {
+    const overflow = isTranslatorBudgetExceededError(err);
+    const status = overflow ? 413 : err instanceof ChatCompletionsRequestError ? 400 : 500;
+    if (logIds) addFinalRequestLog(logIds.requestId, logIds.start, logCtx, status, { closeReason: "non_stream" });
+    return chatCompletionsErrorResponse(
+      status,
+      overflow ? "request translation buffer exceeded the safe limit" : err instanceof Error ? err.message : String(err),
+      overflow ? "request_too_large" : undefined,
+      overflow ? "translation_buffer_limit" : undefined,
+    );
+  }
+
+  // Routed adapters only support streamed turns; always stream internally and fold
+  // for non-streaming clients. Native Chat uses the caller's original stream bit.
+  internalBody.stream = true;
+  if (settledRoute?.provider.adapter === "openai-responses") {
+    // ChatGPT backend rejects store:true and unsupported sampling knobs.
+    internalBody.store = false;
+    delete internalBody.max_output_tokens;
+    delete internalBody.temperature;
+    delete internalBody.top_p;
+    delete internalBody.stop;
+    delete internalBody.user;
+  } else if (internalBody.store === undefined) {
+    internalBody.store = false;
+  }
+  if (settledRoute && internalBody.reasoning !== undefined) {
+    const { stripEmptyLadderEffort, supportedLadderFor } = await import("./effort-policy");
+    const ladder = supportedLadderFor({ provider: settledRoute.provider, modelId: settledRoute.modelId });
+    const next = stripEmptyLadderEffort(internalBody.reasoning, ladder);
+    if (next === undefined) delete internalBody.reasoning;
+    else internalBody.reasoning = next;
+  }
 
   const headers = new Headers({ "content-type": "application/json" });
   for (const name of FORWARD_HEADERS) {
@@ -180,8 +220,24 @@ async function handleChatCompletionsWithBudget(
     }
   }
 
-  const internalBodyJson = JSON.stringify(internalBody);
-  translatorBudget.chargeRetained(new TextEncoder().encode(internalBodyJson).byteLength, { kind: "request_copies" });
+  let internalBodyJson: string;
+  try {
+    internalBodyJson = JSON.stringify(internalBody);
+    translatorBudget.chargeRetained(
+      new TextEncoder().encode(internalBodyJson).byteLength,
+      { kind: "request_copies" },
+    );
+  } catch (err) {
+    const overflow = isTranslatorBudgetExceededError(err);
+    const status = overflow ? 413 : 500;
+    if (logIds) addFinalRequestLog(logIds.requestId, logIds.start, logCtx, status, { closeReason: "non_stream" });
+    return chatCompletionsErrorResponse(
+      status,
+      overflow ? "request translation buffer exceeded the safe limit" : err instanceof Error ? err.message : String(err),
+      overflow ? "request_too_large" : undefined,
+      overflow ? "translation_buffer_limit" : undefined,
+    );
+  }
   const internalReq = new Request("http://localhost/v1/responses", {
     method: "POST",
     headers,
@@ -196,12 +252,15 @@ async function handleChatCompletionsWithBudget(
   };
   const upstream = await handleResponses(internalReq, config, logCtx, {
     ...(logIds?.turnAdmissionLease ? { turnAdmissionLease: logIds.turnAdmissionLease } : {}),
+    // #1686: the Chat surface translates its body and replays here, so the admission fact has
+    // to ride along or a bearer-admitted Chat caller would still be refused by Direct.
+    ...(logIds?.admission ? { admission: logIds.admission } : {}),
     abortSignal: req.signal,
     // Body is Responses-shaped by now, but the client spoke Chat Completions.
     inboundWire: "chat",
     translatorBudget,
     ...(logIds ? { onFirstOutput: () => recordFirstOutput(logCtx, logIds.start) } : {}),
-    onNativePassthroughTerminal: status => finalizeNativeLog(httpStatusForTerminalStatus(status), { terminalStatus: status, closeReason: "terminal" }),
+    onNativePassthroughTerminal: status => finalizeNativeLog(httpStatusForRequestLogTerminal(status, logCtx), { terminalStatus: status, closeReason: "terminal" }),
     onNativePassthroughCancel: () => finalizeNativeLog(499, { closeReason: "client_cancel" }),
   });
 

@@ -26,6 +26,7 @@ import {
   resolveTrustedWindowsSchtasksExe,
   resolveTrustedWindowsSystemDirectory,
 } from "./lib/windows-elevation";
+import { decodeWindowsTextBytes } from "./lib/windows-text";
 import { WINSW_SERVICE_ID } from "./lib/winsw";
 
 /** Short: this runs inside admission, and a slow answer is the same as none. */
@@ -119,6 +120,8 @@ export interface ProbeDeps {
   readonly configDir?: string;
   /** Test seam for WinSW SCM status. Production uses bounded trusted `sc.exe query`. */
   readonly winswStatus?: () => "started" | "stopped" | "nonexistent" | "unknown";
+  /** Test seam for redirected Windows legacy-codepage output. */
+  readonly windowsLocale?: string;
 }
 
 const LABEL = "com.opencodex.proxy";
@@ -174,6 +177,86 @@ function unitEnvValue(body: string, key: string): string | null {
     if (match) return match[1];
   }
   return null;
+}
+
+/**
+ * Did `systemctl --user` fail because the session bus could not be reached at all?
+ *
+ * These are the shapes reported on #2114 and #1939. The distinction that matters is
+ * "the question never left the machine" versus "systemd answered and said no" — only
+ * the former licenses reading the disk instead.
+ *
+ * **Locale caveat, stated rather than hidden:** systemd localizes these strings, so a
+ * non-English host will not match and keeps the old `unknown`. That is the safe
+ * direction — it fences rather than admits — but it does mean the fix does not reach
+ * every affected user. Forcing `LC_ALL=C` on the probe would remove the caveat and is
+ * the obvious follow-up; it is not done here because it changes every systemctl call
+ * this module makes, not just this branch.
+ */
+function busUnreachable(stderr: string): boolean {
+  const err = stderr.trim();
+  return err.includes("Failed to connect to bus")
+    || err.includes("Failed to connect to user scope bus")
+    || err.includes("Failed to get D-Bus connection")
+    || err.includes("DBUS_SESSION_BUS_ADDRESS")
+    || err.includes("System has not been booted with systemd");
+}
+
+/**
+ * Ownership from the unit file alone, for when the bus cannot answer (#2114).
+ *
+ * A unit file is proof of installation that does not require a running bus, and the homes
+ * it names are what ownership is actually decided on. What the disk cannot tell us is
+ * whether systemd has the unit LOADED, so this reports `registration: "absent"` — the
+ * honest reading of "no running manager has it" — rather than inventing a live state.
+ *
+ * A foreign home therefore still blocks, which is the whole reason this consults the disk
+ * instead of widening the exit code.
+ */
+function systemdUserUnitSearchPaths(home: string): string[] {
+  // systemd's user search path is not one directory. Checking only the canonical one and
+  // calling the rest absent is a fail-open: with the bus down a foreign unit in any other
+  // search dir is invisible, and "no answer" would be read as "no owner".
+  const xdgConfig = process.env.XDG_CONFIG_HOME?.trim();
+  const xdgData = process.env.XDG_DATA_HOME?.trim();
+  const dirs = [
+    xdgConfig ? join(xdgConfig, "systemd", "user") : join(home, ".config", "systemd", "user"),
+    join(home, ".config", "systemd", "user"),
+    xdgData ? join(xdgData, "systemd", "user") : join(home, ".local", "share", "systemd", "user"),
+    join(home, ".local", "share", "systemd", "user"),
+  ];
+  return [...new Set(dirs)].map(dir => join(dir, `${TASK}.service`));
+}
+
+function inspectSystemdOffline(home: string): ServiceManagerInstallation {
+  const candidates = systemdUserUnitSearchPaths(home);
+  const found = candidates.filter(path => artifactPresence(path) === "present");
+  if (candidates.some(path => artifactPresence(path) === "unreadable")) {
+    return unknown("the session bus is unreachable and a systemd unit could not be read");
+  }
+  if (found.length === 0) return { kind: "absent" };
+  if (found.length > 1) {
+    return unknown("the session bus is unreachable and more than one systemd unit file claims this proxy");
+  }
+  const definitionPath = found[0]!;
+  let body: string;
+  try {
+    body = readFileSync(definitionPath, "utf-8");
+  } catch (error) {
+    return unknown(`the session bus is unreachable and the systemd unit could not be read: ${String(error)}`);
+  }
+  return {
+    kind: "present",
+    claims: [{
+      backend: "systemd",
+      definitionPath,
+      homes: {
+        codexHome: unitEnvValue(body, "CODEX_HOME"),
+        opencodexHome: unitEnvValue(body, "OPENCODEX_HOME"),
+      },
+      registration: "absent",
+    }],
+  };
 }
 
 function inspectLaunchd(deps: Required<Pick<ProbeDeps, "run" | "uid" | "home">>): ServiceManagerInstallation {
@@ -261,12 +344,20 @@ function inspectSystemd(deps: Required<Pick<ProbeDeps, "run" | "home">>): Servic
     "--user", "show", TASK,
     "-p", "LoadState", "-p", "ActiveState", "-p", "FragmentPath", "-p", "NeedDaemonReload",
   ]);
-  if (shown.spawnFailed || shown.timedOut) {
-    return unknown(`systemctl could not be asked: ${shown.timedOut ? "timed out" : shown.stderr.trim()}`);
-  }
+  if (shown.spawnFailed) return { kind: "absent" };
+  if (shown.timedOut) return unknown("systemctl could not be asked: timed out");
   if (shown.status !== 0) {
     // A missing unit still exits ZERO and says not-found; a non-zero status means
     // the question never reached the bus.
+    //
+    // That is evidence about the BUS, not evidence that a foreign service owns this home
+    // (#2114). Calling it `unknown` fences native-main for the whole process, so a laptop
+    // with no session bus answers every native request with a 503 until `ocx restart`.
+    //
+    // Widening on the exit code alone would fail open, because with the bus down systemctl
+    // cannot see a foreign unit either. So ask the disk, which needs no bus, and fall back
+    // to `unknown` for every other non-zero exit.
+    if (busUnreachable(shown.stderr)) return inspectSystemdOffline(deps.home);
     return unknown(`systemctl show exited ${String(shown.status)}: ${shown.stderr.trim()}`);
   }
 
@@ -336,29 +427,6 @@ function windowsTaskName(): string {
 function windowsConfigDirPath(deps: { home: string; configDir?: string }): string {
   if (deps.configDir) return deps.configDir;
   return join(deps.home, ".opencodex");
-}
-
-/** Decode an on-disk Windows text asset (task XML, VBS), which is UTF-16LE (often BOM-prefixed). */
-function decodeWindowsText(buffer: Buffer): string {
-  if (buffer.length === 0) return "";
-  const bomUtf16Le = buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe;
-  const bomUtf16Be = buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff;
-  const looksUtf16Le = buffer.length >= 4
-    && buffer[1] === 0x00
-    && buffer[3] === 0x00
-    && buffer[0] !== 0x00;
-  if (bomUtf16Le || looksUtf16Le) {
-    return buffer.toString("utf16le").replace(/^\uFEFF/, "").trim();
-  }
-  if (bomUtf16Be) {
-    const swapped = Buffer.alloc(buffer.length - 2);
-    for (let i = 2; i + 1 < buffer.length; i += 2) {
-      swapped[i - 2] = buffer[i + 1]!;
-      swapped[i - 1] = buffer[i]!;
-    }
-    return swapped.toString("utf16le").trim();
-  }
-  return buffer.toString("utf8").replace(/^\uFEFF/, "").trim();
 }
 
 /** Decode the XML entities emitted by the service-definition writers. */
@@ -478,7 +546,9 @@ const SCHTASKS_TASK_NOT_FOUND_EN = /cannot find the file specified/i;
  * other nonzero responses use a bounded full listing as the locale-neutral
  * fallback, and only a successful list without our task proves absence.
  */
-function probeWindowsTaskRegistration(deps: Required<Pick<ProbeDeps, "runRaw">>): {
+function probeWindowsTaskRegistration(
+  deps: Required<Pick<ProbeDeps, "runRaw">> & Pick<ProbeDeps, "windowsLocale">,
+): {
   registered: "present" | "absent" | "unknown";
   registeredXml: string;
 } {
@@ -492,13 +562,14 @@ function probeWindowsTaskRegistration(deps: Required<Pick<ProbeDeps, "runRaw">>)
   const queried = deps.runRaw(schtasks, ["/query", "/tn", windowsTaskName(), "/xml"]);
   if (queried.spawnFailed || queried.timedOut) return { registered: "unknown", registeredXml: "" };
   if (queried.status === 0) {
-    const registeredXml = decodeWindowsText(queried.stdout) || decodeWindowsText(queried.stderr);
+    const registeredXml = decodeWindowsTextBytes(queried.stdout, { locale: deps.windowsLocale })
+      || decodeWindowsTextBytes(queried.stderr, { locale: deps.windowsLocale });
     return registeredXml
       ? { registered: "present", registeredXml }
       : { registered: "unknown", registeredXml: "" };
   }
 
-  const queryText = `${decodeWindowsText(queried.stdout)}\n${decodeWindowsText(queried.stderr)}`;
+  const queryText = `${decodeWindowsTextBytes(queried.stdout, { locale: deps.windowsLocale })}\n${decodeWindowsTextBytes(queried.stderr, { locale: deps.windowsLocale })}`;
   if (queried.status !== null && SCHTASKS_TASK_NOT_FOUND_EN.test(queryText)) {
     return { registered: "absent", registeredXml: "" };
   }
@@ -507,7 +578,8 @@ function probeWindowsTaskRegistration(deps: Required<Pick<ProbeDeps, "runRaw">>)
   if (listed.spawnFailed || listed.timedOut || listed.status !== 0) {
     return { registered: "unknown", registeredXml: "" };
   }
-  const listing = decodeWindowsText(listed.stdout) || decodeWindowsText(listed.stderr);
+  const listing = decodeWindowsTextBytes(listed.stdout, { locale: deps.windowsLocale })
+    || decodeWindowsTextBytes(listed.stderr, { locale: deps.windowsLocale });
   return windowsTaskListContains(listing, windowsTaskName())
     ? { registered: "unknown", registeredXml: "" }
     : { registered: "absent", registeredXml: "" };
@@ -545,7 +617,8 @@ function probeWinswRegistration(
 }
 
 function inspectWindows(
-  deps: Required<Pick<ProbeDeps, "runRaw" | "home">> & Pick<ProbeDeps, "configDir" | "winswStatus">,
+  deps: Required<Pick<ProbeDeps, "runRaw" | "home">>
+    & Pick<ProbeDeps, "configDir" | "winswStatus" | "windowsLocale">,
 ): ServiceManagerInstallation {
   const configDir = windowsConfigDirPath(deps);
   const taskXmlPath = join(configDir, "opencodex-service-task.xml");
@@ -557,7 +630,7 @@ function inspectWindows(
   let xml = "";
   if (task !== "absent") {
     try {
-      xml = decodeWindowsText(readFileSync(taskXmlPath));
+      xml = decodeWindowsTextBytes(readFileSync(taskXmlPath), { locale: deps.windowsLocale });
     } catch (error) {
       return unknown(`the scheduled-task XML exists but could not be read: ${String(error)}`);
     }
@@ -659,7 +732,7 @@ function homesEqual(
  * generated service-asset directory.
  */
 function walkWindowsChain(
-  deps: Required<Pick<ProbeDeps, "home">> & Pick<ProbeDeps, "configDir">,
+  deps: Required<Pick<ProbeDeps, "home">> & Pick<ProbeDeps, "configDir" | "windowsLocale">,
   xml: string,
   definitionPath: string,
 ): ServiceManagerInstallation {
@@ -683,7 +756,7 @@ function walkWindowsChain(
   }
   let launcherBody: string;
   try {
-    launcherBody = decodeWindowsText(readFileSync(launcherPath));
+    launcherBody = decodeWindowsTextBytes(readFileSync(launcherPath), { locale: deps.windowsLocale });
   } catch (error) {
     return unknown(`the scheduled-task launcher could not be read: ${String(error)}`);
   }
@@ -702,7 +775,7 @@ function walkWindowsChain(
   }
   let wrapperBody: string;
   try {
-    wrapperBody = decodeWindowsText(readFileSync(wrapperPath));
+    wrapperBody = decodeWindowsTextBytes(readFileSync(wrapperPath), { locale: deps.windowsLocale });
   } catch (error) {
     return unknown(`the launcher wrapper could not be read: ${String(error)}`);
   }
@@ -734,7 +807,8 @@ function walkWindowsChain(
  * this read-only ownership probe.
  */
 function walkWinswChain(
-  deps: Required<Pick<ProbeDeps, "runRaw" | "home">> & Pick<ProbeDeps, "configDir" | "winswStatus">,
+  deps: Required<Pick<ProbeDeps, "runRaw" | "home">>
+    & Pick<ProbeDeps, "configDir" | "winswStatus" | "windowsLocale">,
 ): ServiceManagerInstallation {
   const configDir = windowsConfigDirPath(deps);
   const exePath = join(configDir, "winsw", `${WINSW_SERVICE_ID}.exe`);
@@ -744,6 +818,16 @@ function walkWinswChain(
   const registration = probeWinswRegistration(deps);
 
   if (xml === "absent" && exe === "absent" && registration === "absent") return { kind: "absent" };
+  // A query we could not ask is a question about a service that cannot exist: WinSW is an
+  // optional backend, and with neither its XML nor its exe on disk there is nothing for a
+  // registration to belong to. Fencing here on an `sc.exe` timeout is one of the two
+  // triggers behind #2108, where a scheduler-only install answers 503 until `ocx restart`.
+  //
+  // The disk outranks the unaskable query only when BOTH assets are gone. Either one
+  // present means a real install may be there and the old `unknown` still holds.
+  if (registration === "unknown" && xml === "absent" && exe === "absent") {
+    return { kind: "absent" };
+  }
   if (registration === "unknown") {
     return unknown("the native WinSW service registration could not be verified");
   }
@@ -753,7 +837,7 @@ function walkWinswChain(
 
   let body: string;
   try {
-    body = decodeWindowsText(readFileSync(xmlPath));
+    body = decodeWindowsTextBytes(readFileSync(xmlPath), { locale: deps.windowsLocale });
   } catch (error) {
     return unknown(`the WinSW XML could not be read: ${String(error)}`);
   }
@@ -801,6 +885,7 @@ export function inspectServiceManagerInstallation(deps: ProbeDeps = {}): Service
       home,
       configDir: deps.configDir,
       winswStatus: deps.winswStatus,
+      windowsLocale: deps.windowsLocale,
     });
   }
   return unknown(`no service manager probe for platform ${platform}`);

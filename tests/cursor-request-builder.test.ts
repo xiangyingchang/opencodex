@@ -198,7 +198,12 @@ describe("Cursor request builder", () => {
     });
 
     expect(request.messages[0]?.content).toContain("see");
-    expect(request.messages[0]?.content).toContain("image input unsupported");
+    // A USER-message image is still flattened here (this path builds the plain-text prompt).
+    // The tool-result ENCODER does build real McpImageContent, so the placeholder no longer
+    // claims the encoder as a whole is unable to send images. (Neither kind reaches Cursor in
+    // production today: every Cursor model is in noVisionModels, so the vision sidecar runs
+    // first — see devlog/_plan/260817_cursor_toolcall_decode/020_*.md.)
+    expect(request.messages[0]?.content).toContain("image omitted from this Cursor text prompt");
     expect(request.messages[0]?.content).toContain("high");
   });
 
@@ -438,6 +443,163 @@ describe("Cursor request builder", () => {
     expect(budget.tools).toContain(shell);
     expect(budget.tools).toContain(patch);
     expect(budget.tools.length).toBeLessThanOrEqual(CURSOR_TOOL_COUNT_LIMIT);
+  });
+
+  test("pins Codex Desktop unified exec through count truncation", () => {
+    const regular = Array.from({ length: CURSOR_TOOL_COUNT_LIMIT + 20 }, (_, index) => ({
+      name: `regular_${index}`,
+      namespace: "mcp__regular",
+      description: "Regular",
+      parameters: {},
+    }));
+    const exec = { name: "exec", description: "Run", parameters: { type: "object", properties: { cmd: { type: "string" } } } };
+    const budget = applyCursorToolBudget([...regular, exec], "auto");
+
+    expect(budget.tools).toContain(exec);
+    expect(budget.omitted).not.toContain(exec);
+    expect(budget.tools.length).toBeLessThanOrEqual(CURSOR_TOOL_COUNT_LIMIT);
+  });
+
+
+  test("a deferred Cursor catalog stays inside the wire budget while a nested one does not (#1830)", () => {
+    // Why #1832 flips supports_search_tool for Cursor: with deferred discovery OFF, Codex
+    // inlines the whole MCP catalog into `exec.description` instead of leaving it callable
+    // through tool_search. This asserts the consequence in bytes, on the real serializer,
+    // rather than trusting the flag alone.
+    const nestedCatalogText = Array.from({ length: 120 }, (_, index) =>
+      `mcp__server_${index}__tool: ${"d".repeat(1_200)}`).join("\n");
+
+    const execDeferred = {
+      name: "exec",
+      namespace: "opencodex-responses",
+      description: "Run JavaScript. Discover tools with tool_search.",
+      parameters: { type: "object", properties: { input: { type: "string" } } },
+      freeform: true,
+    };
+    const execInlined = { ...execDeferred, description: `${execDeferred.description}\n${nestedCatalogText}` };
+    const wait = {
+      name: "wait",
+      namespace: "opencodex-responses",
+      description: "Resume a running call",
+      parameters: { type: "object", properties: { id: { type: "string" } } },
+    };
+
+    // Deferred: the advertised catalog serializes well inside the cap and keeps both tools.
+    expect(cursorMcpToolsEncodedSize([execDeferred, wait], "auto")).toBeLessThanOrEqual(CURSOR_TOOL_BYTES_LIMIT);
+    const deferred = applyCursorToolBudget([execDeferred, wait], "auto");
+    expect(deferred.tools).toContain(execDeferred);
+    expect(deferred.tools).toContain(wait);
+    expect(deferred.omitted).toHaveLength(0);
+
+    // Inlined: the same two tools blow the cap purely because the catalog moved into exec.
+    expect(cursorMcpToolsEncodedSize([execInlined, wait], "auto")).toBeGreaterThan(CURSOR_TOOL_BYTES_LIMIT);
+  });
+
+  test("the Responses execution bridge survives the budget even when it must be trimmed (#1830)", () => {
+    // #1830's symptom is a child whose advertised catalog has no Responses execution tool at
+    // all. Whatever else the budget drops, exec and wait have to be what is left.
+    const filler = Array.from({ length: 60 }, (_, index) => ({
+      name: `mcp_tool_${index}`,
+      namespace: `mcp__server_${index}`,
+      description: "z".repeat(4_000),
+      parameters: { type: "object", properties: {} },
+    }));
+    const exec = {
+      name: "exec",
+      namespace: "opencodex-responses",
+      description: "Run JavaScript",
+      parameters: { type: "object", properties: { input: { type: "string" } } },
+      freeform: true,
+    };
+    const wait = {
+      name: "wait",
+      namespace: "opencodex-responses",
+      description: "Resume",
+      parameters: { type: "object", properties: { id: { type: "string" } } },
+    };
+
+    const catalog = [...filler, exec, wait];
+    expect(cursorMcpToolsEncodedSize(catalog, "auto")).toBeGreaterThan(CURSOR_TOOL_BYTES_LIMIT);
+
+    const budget = applyCursorToolBudget(catalog, "auto");
+    expect(budget.tools).toContain(exec);
+    expect(budget.tools).toContain(wait);
+    expect(cursorMcpToolsEncodedSize(budget.tools, "auto")).toBeLessThanOrEqual(CURSOR_TOOL_BYTES_LIMIT);
+    expect(budget.omitted.length).toBeGreaterThan(0);
+  });
+  test("pins namespaced opencodex-responses exec ahead of filler", () => {
+    const filler = Array.from({ length: 80 }, (_, index) => ({
+      name: `filler_${index}`,
+      namespace: "mcp__filler",
+      description: "y".repeat(3_000),
+      parameters: { type: "object", properties: {} },
+    }));
+    const exec = {
+      name: "exec",
+      namespace: "opencodex-responses",
+      description: "Run",
+      parameters: { type: "object", properties: { cmd: { type: "string" } } },
+    };
+    const wait = {
+      name: "wait",
+      namespace: "opencodex-responses",
+      description: "Resume",
+      parameters: { type: "object", properties: { id: { type: "string" } } },
+    };
+    const catalog = [...filler, wait, exec];
+    expect(cursorMcpToolsEncodedSize(catalog, "auto")).toBeGreaterThan(CURSOR_TOOL_BYTES_LIMIT);
+    const budget = applyCursorToolBudget(catalog, "auto");
+
+    expect(budget.tools).toContain(exec);
+    expect(budget.tools).toContain(wait);
+    expect(budget.omitted.some(tool => tool.namespace === "mcp__filler")).toBe(true);
+  });
+
+  test("keeps unified exec when a large apply_patch would otherwise consume the byte budget first", () => {
+    const hugePatch = {
+      name: "apply_patch",
+      description: "x".repeat(Math.floor(CURSOR_TOOL_BYTES_LIMIT * 0.7)),
+      parameters: { type: "object", properties: {} },
+      freeform: true,
+    };
+    const exec = {
+      name: "exec",
+      description: "Run",
+      parameters: { type: "object", properties: { cmd: { type: "string" } } },
+    };
+    const wait = {
+      name: "wait",
+      description: "Resume",
+      parameters: { type: "object", properties: { id: { type: "string" } } },
+    };
+    const filler = Array.from({ length: 40 }, (_, index) => ({
+      name: `filler_${index}`,
+      namespace: "mcp__filler",
+      description: "y".repeat(2_000),
+      parameters: { type: "object", properties: {} },
+    }));
+    const budget = applyCursorToolBudget([hugePatch, wait, ...filler, exec], "auto");
+
+    expect(budget.tools).toContain(exec);
+    expect(cursorMcpToolsEncodedSize(budget.tools, "auto")).toBeLessThanOrEqual(CURSOR_TOOL_BYTES_LIMIT);
+  });
+
+  test("omits wait when the execution path cannot fit in the Cursor byte budget", () => {
+    const exec = {
+      name: "exec",
+      description: "x".repeat(CURSOR_TOOL_BYTES_LIMIT + 10_000),
+      parameters: { type: "object", properties: {} },
+    };
+    const wait = {
+      name: "wait",
+      description: "Resume",
+      parameters: { type: "object", properties: { id: { type: "string" } } },
+    };
+    const budget = applyCursorToolBudget([wait, exec], "auto");
+
+    expect(budget.tools).not.toContain(exec);
+    expect(budget.tools).not.toContain(wait);
+    expect(budget.omitted).toEqual(expect.arrayContaining([exec, wait]));
   });
 
   test("adds an honest recovery note only when tool_search survives", () => {

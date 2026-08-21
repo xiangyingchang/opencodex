@@ -9,11 +9,11 @@ format. Every adapter implements the `ProviderAdapter` interface (`src/adapters/
 ```ts
 interface ProviderAdapter {
   name: string;
-  buildRequest(parsed, incoming?): AdapterRequest | Promise<AdapterRequest>;
-  fetchResponse?(request, context): Promise<Response>;   // custom retry/transport
-  parseStream(response): AsyncGenerator<AdapterEvent>;
-  parseResponse?(response): Promise<AdapterEvent[]>;   // non-streaming
-  runTurn?(parsed, incoming, emit): Promise<void>;      // bidirectional transport
+  buildRequest(parsed: OcxParsedRequest, incoming: IncomingMeta): AdapterRequest | Promise<AdapterRequest>;
+  fetchResponse?(request: AdapterRequest, ctx?: AdapterFetchContext): Promise<Response>;
+  parseStream(response: Response, budget: TranslatorBudget): AsyncGenerator<AdapterEvent>;
+  parseResponse?(response: Response, budget: TranslatorBudget): Promise<AdapterEvent[]>;
+  runTurn?(parsed: OcxParsedRequest, incoming: IncomingMeta, emit: (event: AdapterEvent) => void): Promise<void>;
 }
 ```
 
@@ -25,7 +25,7 @@ then turns the events into Responses SSE.
 
 ## `openai-chat`
 
-**Targets:** OpenAI **Chat Completions** (`POST {baseUrl}/chat/completions`) and every compatible
+**Targets:** OpenAI **Chat Completions** (`POST {baseUrl}/chat/completions`; a trailing `/chat/completions` or `/` on `baseUrl` is stripped first) and every compatible
 provider — xAI, Kimi, DeepSeek, GLM, Groq, OpenRouter, Ollama (local & cloud), and more.
 **Auth:** `key` (Bearer).
 
@@ -41,22 +41,34 @@ provider — xAI, Kimi, DeepSeek, GLM, Groq, OpenRouter, Ollama (local & cloud),
   adapter **omits it entirely** for ids in `provider.noReasoningModels`.
 - Streams `delta.content` (text), `delta.reasoning_content` (thinking), and `delta.tool_calls[]`;
   collects `usage`.
-- ClinePass uses the live-verified gateway format `reasoning: { enabled: true, effort: "low" }`
-  (or `{ enabled: false }` when reasoning is disabled); its public API docs do not currently specify
-  this request shape. The adapter clamps other effort requests to the verified `low` tier, accepts
-  reasoning deltas from either `delta.reasoning_content` or `delta.reasoning`, requests streamed
-  usage with `stream_options.include_usage`, and reads usage from non-stream response envelopes.
+- ClinePass uses the live-verified gateway format `reasoning: { enabled: true, effort }` (or
+  `{ enabled: false }` when reasoning is disabled); its public API docs do not currently specify
+  this request shape. The adapter preserves requested `low`, `medium`, `high`, `xhigh`, and `max`
+  tiers, accepts reasoning deltas from either `delta.reasoning_content` or `delta.reasoning`, requests
+  streamed usage with `stream_options.include_usage`, and reads usage from non-stream response envelopes.
 
 ## `openai-responses`
 
-**Targets:** the OpenAI **Responses API**. **`passthrough: true`** — forwards the raw request body and
-streams the response back **untranslated**.
-**Auth:** `forward` (relay the caller's headers) or `key`.
+**Targets:** the OpenAI **Responses API**. **`passthrough: true`** — normally forwards the raw request
+body and response, with narrow compatibility rewrites for routed gateways.
+**Auth:** canonical OpenAI `forward` relays only the safe caller-header allowlist; noncanonical
+`forward` uses configured static headers without relaying caller authorization; `key` uses the
+configured provider key.
+
+Noncanonical Responses gateways receive Codex's client-executed `tool_search` declaration as a
+collision-safe public function tool. Matching request history and JSON/SSE function calls are
+translated back to the private `tool_search` lifecycle for the client. Canonical OpenAI forward
+keeps the native private type unchanged.
 
 For `key` auth, [`retryOn429`](/reference/configuration/) applies here too: a pre-stream 429
 waits and replays the identical request on the same key before any other handling, exactly like
 the translated `openai-chat` / Anthropic request path. Custom `runTurn` transports are not part
 of the HTTP retry loop.
+
+- DeepSeek's stateless Responses parser receives provider-scoped history normalization: hook-injected
+  context moves after an unambiguous tool-call/result batch. Parallel calls remain grouped before
+  their matching outputs so every call stays in the reasoning-bearing assistant turn. Tolerant
+  providers and ambiguous duplicate, missing, or out-of-order call IDs keep their original input order.
 
 - `forward` URL → `{baseUrl}/responses`. A `key` provider defaults to the legacy `{baseUrl}/v1/responses` construction.
 - A `key` provider may set a validated relative `responsesPath`; the adapter removes one trailing slash from `baseUrl` and sends `{trimmedBaseUrl}{responsesPath}`. For Ark Agent Plan, use `baseUrl: "https://ark.cn-beijing.volces.com/api/plan/v3"` with `responsesPath: "/responses"`.
@@ -74,6 +86,16 @@ of the HTTP retry loop.
   maps reasoning effort to a budget (minimal 1024 … max 32000), then computes a safe `max_tokens` with
   output headroom, and **drops `temperature`/`top_p`** when thinking is enabled (Anthropic forbids
   them there).
+- **Structured output:** Responses `text.format` and Chat Completions `response_format` requests
+  with `type: "json_schema"` become Anthropic `output_config.format`. The format merges into an
+  existing adaptive-thinking output configuration, preserving a compatible `output_config.effort`.
+  Routed Anthropic Messages requests preserve the same format through stored-OAuth translation.
+  The adapter mirrors the Anthropic TypeScript SDK's supported JSON Schema subset: unsupported
+  constraints are moved into `description` as model guidance, `oneOf` becomes `anyOf`, and object
+  schemas receive `additionalProperties: false`. A root `$ref` retains its adjacent `$defs` so the
+  local reference remains resolvable. OpenAI envelope fields such as schema `name`, envelope
+  `description`, and `strict` are not part of the Anthropic wire format. JSON object mode without a
+  schema has no Anthropic equivalent and is not translated.
 - Always sends `anthropic-version: 2023-06-01`. Streams `content_block_delta` (`text_delta`,
   `thinking_delta`, compatible `reasoning_delta`, `input_json_delta`). The SSE decoder preserves
   event state across fetch chunks and accepts a terminal `message_stop` without a trailing newline.
@@ -90,8 +112,10 @@ of the HTTP retry loop.
 
 - System prompt → `systemInstruction`; messages → `contents[]` (assistant → `model`); tools →
   `functionDeclarations`. Data-URL images → `inline_data`.
-- Tool-call ids are synthesized when Gemini omits them. Antigravity preserves and replays real
-  `thoughtSignature` values so reasoning continuity survives later turns.
+- Tool-call ids are synthesized when Gemini omits them. Vertex and Antigravity preserve and replay
+  opaque `thoughtSignature` values so tool-result continuations retain Gemini reasoning continuity.
+  The signature cache is snapshotted to the config directory, so continuations also survive proxy
+  restarts.
 - **Inline image output:** when the model is one of the explicit image-capable chat IDs
   (`gemini-3.1-flash-image`, `gemini-2.0-flash-preview-image-generation`, or
   `gemini-3-pro-image-preview`), the adapter sends `responseModalities: ["TEXT", "IMAGE"]`.
@@ -169,7 +193,10 @@ advertised effort control on those models as proof of upstream-native reasoning 
 
 ## `cursor`
 
-**Targets:** Cursor's `agent.v1.AgentService/Run` over HTTP/2 Connect streaming at `api2.cursor.sh`.
+**Targets:** Cursor's `agent.v1.AgentService/Run` over HTTP/2 Connect streaming at `api2.cursor.sh`
+by default. With `upstreamHttpVersion: "http1.1"` (or `"h1"`), uses Cursor's HTTP/1.1
+compatibility pair: `agent.v1.AgentService/RunSSE` for server output and
+`aiserver.v1.BidiService/BidiAppend` for client messages.
 **Auth:** Cursor OAuth/access token from `provider.apiKey` or the forwarded authorization header.
 
 - Uses `runTurn` rather than the ordinary fetch/parse path. Requests, server events, tool arguments,
@@ -178,6 +205,8 @@ advertised effort control on those models as proof of upstream-native reasoning 
 - Replays conversation state through content-addressed blobs, maps server tool calls back to Codex,
   discovers live Cursor models through the protobuf `GetUsableModels` RPC, and retries only before a
   run request is committed to the wire.
+- Honors `upstreamHttpVersion` for both live model discovery and inference. `auto`, `http2`, and `h2`
+  preserve the existing HTTP/2 transport; only `http1.1` and `h1` select compatibility mode.
 - Exposes Cursor Router as `cursor/auto` plus explicit `cursor/auto-cost`,
   `cursor/auto-balance`, and `cursor/auto-intelligence` entries. Explicit levels are encoded in
   `requested_model.parameters` while the legacy `cursor/auto` entry retains the account/team default.

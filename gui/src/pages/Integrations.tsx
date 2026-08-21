@@ -31,19 +31,27 @@ const TABS: readonly TabDefinition[] = [
   { id: "grok", hash: "integrations/grok", labelKey: "integrations.tab.grok" },
   { id: "opencode", hash: "integrations/opencode", labelKey: "integrations.tab.opencode" },
   { id: "pi", hash: "integrations/pi", labelKey: "integrations.tab.pi" },
+  { id: "omp", hash: "integrations/omp", labelKey: "integrations.tab.omp" },
   { id: "hermes", hash: "integrations/hermes", labelKey: "integrations.tab.hermes" },
   { id: "openclaw", hash: "integrations/openclaw", labelKey: "integrations.tab.openclaw" },
   { id: "kimi", hash: "integrations/kimi", labelKey: "integrations.tab.kimi" },
   { id: "gajae", hash: "integrations/gajae", labelKey: "integrations.tab.gajae" },
+  { id: "dsh", hash: "integrations/dsh", labelKey: "integrations.tab.dsh" },
+  { id: "mcode", hash: "integrations/mcode", labelKey: "integrations.tab.mcode" },
+  { id: "zcode", hash: "integrations/zcode", labelKey: "integrations.tab.zcode" },
 ] as const;
 
 const FILE_CLIENTS = new Set<FileIntegrationClientId>([
   "opencode",
   "pi",
+  "omp",
   "hermes",
   "openclaw",
   "kimi",
   "gajae",
+  "dsh",
+  "mcode",
+  "zcode",
 ]);
 
 function readIntegrationTab(hash = window.location.hash): IntegrationTab {

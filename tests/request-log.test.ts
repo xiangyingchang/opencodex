@@ -11,6 +11,7 @@ import {
 } from "../src/server";
 import {
   aggregateAttemptUsage,
+  addRequestLog,
   beginRequestAttempt,
   clearRequestLogsForTests,
   finishRequestAttempt,
@@ -258,12 +259,108 @@ describe("request log metadata", () => {
     expect(captured2[0]).not.toHaveProperty("firstOutputMs");
   });
 
+  test("persists the shadow helper source marker to usage.jsonl", () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-shadow-usage-"));
+    const previousHome = process.env.OPENCODEX_HOME;
+    process.env.OPENCODEX_HOME = home;
+    try {
+      clearRequestLogsForTests();
+      resetUsageReadCacheForTests();
+      addFinalRequestLog("ocx-shadow-marker", 1, {
+        model: "grok-4.5",
+        provider: "xai",
+        requestedModel: "gpt-5.6-luna",
+        shadowCallRewrittenFrom: "gpt-5.6-luna",
+      }, 200);
+
+      const [persisted] = readUsageEntries();
+      expect(persisted?.shadowCallRewrittenFrom).toBe("gpt-5.6-luna");
+      expect(getRequestLogEntries()[0]?.shadowCallRewrittenFrom).toBe("gpt-5.6-luna");
+    } finally {
+      clearRequestLogsForTests();
+      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousHome;
+      resetUsageReadCacheForTests();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // The value is caller-controlled, so proving it lands is only half the contract: the
+  // persistence path must also be the SANITIZED one. A test that only ever writes a safe
+  // short slug passes identically whether `sanitizeLogMetadataString` is applied or not.
+  test("the shadow marker reaches usage.jsonl through the sanitizer, not raw", () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-shadow-unsafe-"));
+    const previousHome = process.env.OPENCODEX_HOME;
+    process.env.OPENCODEX_HOME = home;
+    try {
+      clearRequestLogsForTests();
+      resetUsageReadCacheForTests();
+      addFinalRequestLog("ocx-shadow-unsafe", 1, {
+        model: "grok-4.5",
+        provider: "xai",
+        // A newline would let one field forge a record boundary in a line-oriented log
+        // viewer, and the trailing run is long enough to be over the 64-character bound.
+        shadowCallRewrittenFrom: `gpt-5.6-luna\nInjected: yes ${"x".repeat(80)}`,
+      }, 200);
+
+      const [persisted] = readUsageEntries();
+      const marker = persisted?.shadowCallRewrittenFrom;
+      expect(marker).toBeDefined();
+      expect(marker).not.toContain("\n");
+      expect(marker!.length).toBeLessThanOrEqual(64);
+      expect(marker!.startsWith("gpt-5.6-luna")).toBe(true);
+      expect(getRequestLogEntries()[0]?.shadowCallRewrittenFrom).not.toContain("\n");
+    } finally {
+      clearRequestLogsForTests();
+      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousHome;
+      resetUsageReadCacheForTests();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // `addFinalRequestLog` is not the only ingress: `addRequestLog` is exported and callable
+  // directly. Sanitizing only on the disk projection left the in-memory ring — and therefore
+  // /api/logs — serving the raw value, which is the worst shape for a sanitization bug
+  // because the surface you would check is the clean one.
+  test("the direct addRequestLog ingress sanitizes memory and disk identically", () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-shadow-ingress-"));
+    const previousHome = process.env.OPENCODEX_HOME;
+    process.env.OPENCODEX_HOME = home;
+    try {
+      clearRequestLogsForTests();
+      resetUsageReadCacheForTests();
+      addRequestLog({
+        requestId: "ocx-shadow-direct",
+        timestamp: Date.now(),
+        provider: "xai",
+        model: "grok-4.5",
+        status: 200,
+        shadowCallRewrittenFrom: `gpt-5.6-luna\nInjected: yes ${"x".repeat(80)}`,
+      } as RequestLogEntry);
+
+      const inMemory = getRequestLogEntries()[0]?.shadowCallRewrittenFrom;
+      const [persisted] = readUsageEntries();
+      expect(inMemory).toBeDefined();
+      expect(inMemory).not.toContain("\n");
+      expect(inMemory!.length).toBeLessThanOrEqual(64);
+      // The two surfaces must agree: a divergence here is exactly the bug.
+      expect(inMemory).toBe(persisted?.shadowCallRewrittenFrom);
+    } finally {
+      clearRequestLogsForTests();
+      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousHome;
+      resetUsageReadCacheForTests();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("records ordered attempts with sealed identity, fresh estimates, and deduplicated recoveries", () => {
     const a = beginRequestAttempt(1, "provisional-a", "model-a", "openai-chat");
     noteAttemptSend(a, 100);
     noteAttemptSend(a, 120, "transient-5xx");
     noteAttemptSend(a, 120, "transient-5xx");
-    sealRequestAttemptIdentity(a, "chatgpt-pabcdef", "openai-responses");
+    sealRequestAttemptIdentity(a, "chatgpt-pabcdef", "openai-responses", "pabcdef");
     finishRequestAttempt(a, 503, 12);
 
     const b = beginRequestAttempt(2, "prov-b", "model-b", "openai-chat");
@@ -278,6 +375,7 @@ describe("request log metadata", () => {
     expect(a).toMatchObject({
       ordinal: 1,
       provider: "chatgpt-pabcdef",
+      accountLogLabel: "pabcdef",
       adapter: "openai-responses",
       status: 503,
       sendCount: 3,
@@ -550,6 +648,11 @@ describe("request log metadata", () => {
     expect(requestLogErrorCode(429)).toBe("rate_limit_exceeded");
     expect(requestLogErrorCode(499)).toBe("client_closed_request");
     expect(requestLogErrorCode(502, "client closed request during web-search")).toBe("client_closed_request");
+    expect(requestLogErrorCode(400, "blocked", "cyber_policy")).toBe("cyber_policy");
+    expect(requestLogErrorCode(
+      502,
+      "This content was flagged for possible cybersecurity risk. To get authorized for security work, join the Trusted Access for Cyber program.",
+    )).toBe("cyber_policy");
     expect(requestLogErrorCode(503)).toBe("server_is_overloaded");
     expect(requestLogErrorCode(502)).toBe("upstream_server_error");
     expect(requestLogErrorCode(404)).toBe("http_404");
@@ -849,6 +952,39 @@ describe("request log metadata", () => {
     });
   });
 
+  test("deferred SSE logging preserves structured cyber_policy status and code", async () => {
+    const entries: RequestLogEntry[] = [];
+    const failedPayload = JSON.stringify({
+      type: "response.failed",
+      response: {
+        status: "failed",
+        error: { type: "invalid_request_error", code: "cyber_policy", message: "blocked" },
+      },
+    });
+    const response = responseWithDeferredRequestLog(
+      new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(`data: ${failedPayload}\n\n`));
+          controller.close();
+        },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } }),
+      "ocx-test-cyber-policy",
+      Date.now(),
+      { model: "gpt-5.6-sol", provider: "openai" },
+      entry => entries.push(entry),
+    );
+
+    await response.text();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      terminalStatus: "failed",
+      upstreamError: "blocked",
+      status: 400,
+      errorCode: "cyber_policy",
+      closeReason: "terminal",
+    });
+  });
+
   test("deferred SSE logging maps web-search client closes to 499 client_cancel", async () => {
     const entries: RequestLogEntry[] = [];
     const message = "client closed request during web-search";
@@ -1014,10 +1150,12 @@ describe("request log metadata", () => {
     const text = await response.text();
     expect(text).toContain("\"input_tokens\":9");
     expect(entries).toHaveLength(1);
+    // The 240k estimate exceeds claude-sonnet-4.5's 200k window; a request the provider
+    // answered cannot have exceeded the window, so the estimate is capped (codex-router PR #140).
     expect(entries[0]).toMatchObject({
       usageStatus: "estimated",
-      totalTokens: 240_004,
-      usage: { inputTokens: 240_000, outputTokens: 4, estimated: true },
+      totalTokens: 200_004,
+      usage: { inputTokens: 200_000, outputTokens: 4, estimated: true },
     });
   });
 
@@ -1271,6 +1409,7 @@ describe("request log restart hydrate", () => {
       provider: "chatgpt-pabcdef",
       model: "gpt-5.6-sol",
       requestedModel: "gpt-5.6-sol",
+      shadowCallRewrittenFrom: "gpt-5.6-luna",
       requestedEffort: "high",
       effectiveEffort: "high",
       reasoningWireField: "reasoning_effort",
@@ -1293,6 +1432,7 @@ describe("request log restart hydrate", () => {
       provider: "chatgpt-pabcdef",
       model: "gpt-5.6-sol",
       requestedModel: "gpt-5.6-sol",
+      shadowCallRewrittenFrom: "gpt-5.6-luna",
       requestedEffort: "high",
       effectiveEffort: "high",
       reasoningWireField: "reasoning_effort",
@@ -1340,6 +1480,7 @@ describe("request log restart hydrate", () => {
         terminalStatus: "failed",
         closeReason: "terminal",
         upstreamError: "Provider unreachable",
+        shadowCallRewrittenFrom: "gpt-5.6-luna",
       },
     ];
 
@@ -1351,6 +1492,7 @@ describe("request log restart hydrate", () => {
       errorCode: "upstream_server_error",
       upstreamError: "Provider unreachable",
       requestedEffort: "xhigh",
+      shadowCallRewrittenFrom: "gpt-5.6-luna",
     });
 
     // Idempotent: a second start in the same process must not duplicate.

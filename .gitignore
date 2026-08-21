@@ -4,6 +4,10 @@ dist/
 *.log
 .DS_Store
 
+# Generated CL compatibility identity embedded by prepare:package. It must stay
+# untracked so the manifest cannot hash itself.
+src/generated/compatibility-version.json
+
 # Maintainer planning notes are TRACKED in this repository (`devlog/`). Security
 # material is not: see the "Security working notes" section of AGENTS.md.
 #
@@ -26,6 +30,13 @@ devlog/**/security-advisory-draft*
 .tmp/
 .opencode/
 
+# Capability probes from the trusted-artifact directory check
+# (src/lab/artifacts/secure-fs.ts detectArtifactIoMode). The probe is normally
+# unlinked immediately, but a process that dies between rename and unlink leaves
+# an empty file behind, and they accumulate in whatever directory the check ran
+# from. They are machine-local scratch and must never be committed.
+.dirfd-probe-*
+
 # Local agent/session artifacts
 # These are per-machine agent state (goalplans, ledgers, evidence scratch).
 # They are never part of the product and must not be committed, not even with
@@ -40,7 +51,12 @@ devlog/**/security-advisory-draft*
 .worktrees/
 
 # Test-generated artifacts
-tests/.tmp-*/
+# Trailing slash matched directories only, but the same tests also leave plain
+# files behind when a run dies mid-write -- and on Windows those can stay locked
+# by an exiting child, so they cannot simply be deleted. An unignorable leftover
+# blocks the release preflight's clean-tree check for work that has nothing to do
+# with it, so ignore both shapes.
+tests/.tmp-*
 .claude/
 
 # Retired Go native-runtime experiment. `go/` is not part of the build, the

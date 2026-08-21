@@ -2,9 +2,9 @@
  * "What is on disk, and did we put it there?"
  *
  * The classifier is deliberately ordered, and the order is load-bearing: an
- * unreadable file can never be reported as absent, and a foreign edit can never
- * be reported as ordinary drift. Getting that wrong would let `disable` delete
- * a user's own edits.
+ * unreadable file can never be reported as absent, and an edit to a fragment
+ * we own can never be reported as ordinary drift. Getting that wrong would let
+ * `disable` delete a user's own edits.
  *
  * Design of record: devlog/_fin/260802_client_toggle_api/021 §3.
  */
@@ -100,8 +100,49 @@ export function blockedContainerPath(
 }
 
 /**
- * The two-axis rule: the FILE hash proves nobody touched the file after us, and
- * the BLOCK hash proves our content is still what we would write today.
+ * Fingerprint the recorded fragments as they appear in the document now.
+ *
+ * The record intentionally names every path we own. Comparing just those
+ * values lets another integration or a user add a sibling without blocking a
+ * later refresh, while a change inside our block still fails closed.
+ */
+function recordedFragmentFingerprint(
+  doc: unknown,
+  record: OwnershipRecord,
+): string | null {
+  if (
+    !Array.isArray(record.fragmentPaths)
+    || record.fragmentPaths.length === 0
+    || !record.fragmentPaths.every(path => (
+      Array.isArray(path)
+      && path.length > 0
+      && path.every(key => typeof key === "string")
+    ))
+  ) return null;
+  const fragments = [];
+  for (const path of record.fragmentPaths) {
+    const value = readPath(doc, path);
+    if (value === undefined) return null;
+    fragments.push({ path, value });
+  }
+  return fingerprint(canonicalContribution({
+    clientId: record.clientId,
+    fragments,
+  }));
+}
+
+/**
+ * The two-axis rule: the recorded bytes or fragments prove nobody changed
+ * what we may rewrite, and the contribution hash proves our catalog has not
+ * moved on. Three classes of client (revising the unconditional whole-file
+ * rule of devlog 260802_client_toggle_api/021 §3 for json — #1631):
+ * registry-declared source-preserving YAML clients are fragment-scoped because
+ * their writers patch only the owned leaf, so the whole-file check is skipped;
+ * strict-json clients keep the whole-file check but downgrade a drift with
+ * intact owned fragments to `stale`, because a rewrite there can lose only
+ * formatting (comments cannot parse, non-round-tripping numbers are refused
+ * by the serializer); every comment-capable whole-document serializer (yaml,
+ * json5, toml) retains the whole-file fingerprint guard as a hard conflict.
  */
 export function classifyIntegration(input: {
   fileText: string | null;
@@ -144,8 +185,38 @@ export function classifyIntegration(input: {
   if (input.configPath !== undefined && input.record.configPath !== input.configPath) {
     return { state: "conflict", reason: "unowned-key" };
   }
-  if (fingerprint(input.fileText ?? "") !== input.record.fileFingerprint) {
+  const clientId = input.clientId ?? input.record.clientId;
+  /*
+   * Checked BEFORE file-level drift: an edit INSIDE an owned fragment is a
+   * conflict no matter what the rest of the file looks like, so the sibling-
+   * edit exemption below can never mask it.
+   */
+  if (recordedFragmentFingerprint(input.parsed, input.record) !== input.record.blockFingerprint) {
     return { state: "conflict", reason: "foreign-edit" };
+  }
+  if (!INTEGRATION_CLIENTS[clientId].sourcePreservingYaml
+    && fingerprint(input.fileText ?? "") !== input.record.fileFingerprint) {
+    /*
+     * The file changed since we wrote it, but every fragment we own is still
+     * byte-for-byte what we put there — a sibling edit, not tampering. Apply
+     * rewrites the WHOLE document, so for comment-capable formats (yaml,
+     * json5, toml) it would drop comments the user wrote next to us: fail
+     * closed there. Strict JSON cannot carry comments — a commented file
+     * never reaches this branch because parsing already failed — so the only
+     * possible loss is formatting normalization: everything a rewrite would
+     * actually change (numbers that would not round-trip, duplicate members
+     * a rewrite would delete) is PARSE_FAILED in parseConfig and classifies
+     * as unsafe long before this branch, exactly like comments. Refusing
+     * forever over formatting
+     * dead-ends the integration on the user's first own config edit (#1631).
+     * Report drift instead; a re-apply merges into the parsed document as it
+     * stands and re-owns the file. This also lets disable proceed on a
+     * drifted file — removal still touches only the recorded fragment paths.
+     */
+    if (EXPORT_CLIENTS[clientId].format !== "json") {
+      return { state: "conflict", reason: "foreign-edit" };
+    }
+    return { state: "stale" };
   }
   return input.record.blockFingerprint === fingerprint(canonicalContribution(input.contribution))
     ? { state: "current" }

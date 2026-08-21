@@ -92,6 +92,38 @@ describe("per-model wire override (#404)", () => {
 });
 
 describe("registry per-model wire defaults", () => {
+  function xai(authMode: "oauth" | "key", overrides: Partial<OcxProviderConfig> = {}): OcxProviderConfig {
+    return gateway({
+      baseUrl: "https://api.x.ai/v1",
+      authMode,
+      ...overrides,
+    });
+  }
+
+  test("routes current xAI subscription models through Responses for native Codex traffic", () => {
+    for (const model of ["grok-4.6", "grok-4.5"]) {
+      expect(resolveWireProtocolOverride("xai", model, xai("oauth"), "responses").adapter)
+        .toBe("openai-responses");
+    }
+  });
+
+  test("keeps xAI key auth and translated callers on their existing Chat wire", () => {
+    expect(resolveWireProtocolOverride("xai", "grok-4.6", xai("key"), "responses").adapter)
+      .toBe("openai-chat");
+    expect(resolveWireProtocolOverride("xai", "grok-4.6", xai("oauth"), "chat").adapter)
+      .toBe("openai-chat");
+    expect(resolveWireProtocolOverride("xai", "grok-4.6", xai("oauth"), "anthropic").adapter)
+      .toBe("openai-chat");
+    expect(resolveWireProtocolOverride("xai", "grok-4.3", xai("oauth"), "responses").adapter)
+      .toBe("openai-chat");
+  });
+
+  test("an explicit xAI Chat override opts out of the subscription Responses default", () => {
+    const provider = xai("oauth", { modelAdapters: { "grok-4.6": "openai-chat" } });
+    expect(resolveWireProtocolOverride("xai", "grok-4.6", provider, "responses").adapter)
+      .toBe("openai-chat");
+  });
+
   function deepseek(overrides: Partial<OcxProviderConfig> = {}): OcxProviderConfig {
     return gateway({
       baseUrl: "https://api.deepseek.com",
@@ -100,11 +132,13 @@ describe("registry per-model wire defaults", () => {
     });
   }
 
-  test("routes only the official Flash API id through Responses", () => {
+  test("routes the official V4 API ids through Responses", () => {
     expect(resolveWireProtocolOverride("deepseek", "deepseek-v4-flash", deepseek()).adapter)
       .toBe("openai-responses");
+    // V4 Pro GA (DeepSeek-V4-Pro-0813) is officially on the Responses wire too —
+    // the /responses reference lists both V4 ids as accepted `model` values.
     expect(resolveWireProtocolOverride("deepseek", "deepseek-v4-pro", deepseek()).adapter)
-      .toBe("openai-chat");
+      .toBe("openai-responses");
     // The dated release label is not the API model id and must not be silently rewritten.
     expect(resolveWireProtocolOverride("deepseek", "deepseek-v4-flash-0731", deepseek()).adapter)
       .toBe("openai-chat");

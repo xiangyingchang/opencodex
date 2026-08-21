@@ -3,10 +3,14 @@ import { readJsonIfOk } from "../../fetch-json";
 export const FILE_INTEGRATION_CLIENTS = [
   "opencode",
   "pi",
+  "omp",
   "hermes",
   "openclaw",
   "kimi",
   "gajae",
+  "dsh",
+  "mcode",
+  "zcode",
 ] as const;
 
 export type FileIntegrationClientId = (typeof FILE_INTEGRATION_CLIENTS)[number];

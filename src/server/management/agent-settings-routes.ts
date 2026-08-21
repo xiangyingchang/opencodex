@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { CatalogModel } from "../../codex/catalog";
-import { catalogModelSlug, invalidateCodexModelsCache, nativeModelRows, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
+import { catalogModelSlug, invalidateCodexModelsCache, nativeContextLimits, nativeModelRows, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
 import {
   DEFAULT_SUBAGENT_MODELS,
   codexAutoStartEnabled,
@@ -31,7 +31,7 @@ import { deriveProviderPresets } from "../../providers/derive";
 import { providerCodexAccountMode } from "../../providers/registry";
 import { routedSlug, slugEquals } from "../../providers/slug-codec";
 import { clearProviderQuotaCache, fetchProviderQuotaReports } from "../../providers/quota";
-import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
+import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import { clearThreadAccountMap } from "../../codex/routing";
 import { primeCodexPoolQuotas } from "../../codex/auth-api";
 import { DEFAULT_PROVIDER_CONTEXT_CAP, globalContextCapValue, providerContextCap, providerContextCaps, setAllProviderContextCaps, setGlobalContextCapValue, setProviderContextCap } from "../../providers/context-cap";
@@ -51,6 +51,11 @@ import {
   type DebugFlag,
 } from "../../lib/debug-settings";
 import type { OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
+import {
+  visionCandidateRows,
+  visionDescriberIsProvablyBlind,
+  visionDescriberRejection,
+} from "./vision-sidecar-options";
 import { drainAndShutdown } from "../lifecycle";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
 import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../../usage/cost";
@@ -60,7 +65,7 @@ import { applySystemEnvToggle } from "../system-env";
 
 import { isPlainRecord, parseDebugLogQuery, tokPerSecondResult, unavailableCostReason, costResult, requestLogDto, stripRegistryOnlyStaticHeaders, fetchAllModels, fetchGrokCandidateModels, buildClaudeDesktopState } from "./shared";
 import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, CostResult, MetricSource } from "./shared";
-import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
+import { readManagementJsonBody, readOptionalManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
 
 const GROK_APPLY_JOIN_MS = 120_000;
 export const GROK_APPLY_TERMINAL_MS = 10 * 60_000;
@@ -202,6 +207,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         current.apiKeys?.[0]?.key,
         "static",
         current.claudeCode.desktopProfile,
+        nativeContextLimits(current),
       );
       if (result.written && result.fingerprint) {
         current.claudeCode = { ...current.claudeCode, desktopProfile: { ...current.claudeCode.desktopProfile, appliedFingerprint: result.fingerprint, appliedAt: new Date().toISOString() } };
@@ -219,6 +225,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     const {
       isMultiAgentV2Enabled, hasAgentsMaxThreads, getLogicalMaxThreads,
       getAgentsEnabled, getAgentsMaxDepth, getSubagentDeveloperInstructions,
+      getMultiAgentModeHintText,
     } = await import("../../codex/features");
     const enabled = isMultiAgentV2Enabled();
     return jsonResponse({
@@ -226,9 +233,11 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       agentsMaxThreadsConflict: enabled && hasAgentsMaxThreads(),
       maxConcurrentThreadsPerSession: getLogicalMaxThreads(),
       multiAgentMode: config.multiAgentMode ?? "default",
+      keepNativeChatGptOnV1: config.keepNativeChatGptOnV1 === true,
       agentsEnabled: getAgentsEnabled(),
       agentsMaxDepth: getAgentsMaxDepth(),
       subagentDeveloperInstructions: getSubagentDeveloperInstructions(),
+      multiAgentModeHintText: getMultiAgentModeHintText(),
       // max_depth is V1-only upstream; this is the global-flag statement, derived
       // server-side so no client can present it as an effective V2 limit.
       agentsMaxDepthAppliesWhenV2Disabled: !enabled,
@@ -239,23 +248,30 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       enabled?: unknown;
       maxConcurrentThreadsPerSession?: unknown;
       multiAgentMode?: unknown;
+      keepNativeChatGptOnV1?: unknown;
       agentsEnabled?: unknown;
       agentsMaxDepth?: unknown;
       subagentDeveloperInstructions?: unknown;
+      multiAgentModeHintText?: unknown;
     };
     try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
     const wantsFlag = body.enabled !== undefined;
     const wantsThreads = body.maxConcurrentThreadsPerSession !== undefined;
     const wantsMode = body.multiAgentMode !== undefined;
+    const wantsKeepNative = body.keepNativeChatGptOnV1 !== undefined;
     const wantsAgentsEnabled = body.agentsEnabled !== undefined;
     const wantsMaxDepth = body.agentsMaxDepth !== undefined;
     const wantsSubagentInstructions = body.subagentDeveloperInstructions !== undefined;
-    if (!wantsFlag && !wantsThreads && !wantsMode && !wantsAgentsEnabled && !wantsMaxDepth && !wantsSubagentInstructions) {
-      return jsonResponse({ error: "body must set enabled, multiAgentMode, maxConcurrentThreadsPerSession, agentsEnabled, agentsMaxDepth, and/or subagentDeveloperInstructions" }, 400);
+    const wantsModeHintText = body.multiAgentModeHintText !== undefined;
+    if (!wantsFlag && !wantsThreads && !wantsMode && !wantsKeepNative && !wantsAgentsEnabled && !wantsMaxDepth && !wantsSubagentInstructions && !wantsModeHintText) {
+      return jsonResponse({ error: "body must set enabled, multiAgentMode, keepNativeChatGptOnV1, maxConcurrentThreadsPerSession, agentsEnabled, agentsMaxDepth, subagentDeveloperInstructions, and/or multiAgentModeHintText" }, 400);
     }
     if (wantsFlag && typeof body.enabled !== "boolean") return jsonResponse({ error: "body.enabled must be a boolean" }, 400);
     if (wantsMode && body.multiAgentMode !== "v1" && body.multiAgentMode !== "default" && body.multiAgentMode !== "v2") {
       return jsonResponse({ error: "body.multiAgentMode must be 'v1', 'default', or 'v2'" }, 400);
+    }
+    if (wantsKeepNative && typeof body.keepNativeChatGptOnV1 !== "boolean") {
+      return jsonResponse({ error: "body.keepNativeChatGptOnV1 must be a boolean" }, 400);
     }
     if (wantsThreads && (typeof body.maxConcurrentThreadsPerSession !== "number" || !Number.isInteger(body.maxConcurrentThreadsPerSession) || body.maxConcurrentThreadsPerSession < 1)) {
       return jsonResponse({ error: "body.maxConcurrentThreadsPerSession must be an integer >= 1" }, 400);
@@ -275,6 +291,14 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     if (wantsSubagentInstructions && body.subagentDeveloperInstructions !== null && typeof body.subagentDeveloperInstructions !== "string") {
       return jsonResponse({ error: "body.subagentDeveloperInstructions must be a string or null" }, 400);
     }
+    // null unsets the upstream key (effort-derived policy resumes); an empty/whitespace
+    // string is rejected because codex-rs treats any present hint as an override that
+    // suppresses even the Ultra-derived Proactive message (Option<String>, no blank
+    // special-case in effective_multi_agent_mode).
+    if (wantsModeHintText && body.multiAgentModeHintText !== null
+        && (typeof body.multiAgentModeHintText !== "string" || body.multiAgentModeHintText.trim().length === 0)) {
+      return jsonResponse({ error: "body.multiAgentModeHintText must be a non-empty string or null" }, 400);
+    }
     const mode = wantsMode ? body.multiAgentMode as "v1" | "default" | "v2" : undefined;
     const modeFlag = mode === "v2" ? true : mode === "v1" ? false : undefined;
     if (wantsFlag && modeFlag !== undefined && body.enabled !== modeFlag) {
@@ -283,8 +307,18 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     const {
       isMultiAgentV2Enabled, hasAgentsMaxThreads, getLogicalMaxThreads, transitionMultiAgentV2,
       getAgentsEnabled, getAgentsMaxDepth, getSubagentDeveloperInstructions,
-      setAgentsEnabled, setAgentsMaxDepth, setSubagentDeveloperInstructions,
+      getMultiAgentModeHintText, probeCodexSupportsModeHint, setAgentsEnabled, setAgentsMaxDepth,
+      setSubagentDeveloperInstructions, setMultiAgentModeHintText, MODE_HINT_UNSUPPORTED_ERROR,
     } = await import("../../codex/features");
+    // Probe the capability before any combined-request mutation. The scalar writer
+    // repeats this check, but doing it here prevents an earlier flag/mode/agents
+    // write from landing before an unsupported runtime returns 502.
+    if (wantsModeHintText && body.multiAgentModeHintText !== null
+        && probeCodexSupportsModeHint() === false) {
+      return jsonResponse({
+        error: `writing multiAgentModeHintText failed: ${MODE_HINT_UNSUPPORTED_ERROR}`,
+      }, 502);
+    }
     const warnings: string[] = [];
     const requestedFlag = wantsFlag ? body.enabled as boolean : modeFlag;
     if (requestedFlag !== undefined || wantsThreads) {
@@ -306,6 +340,17 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       saveConfigPreservingClaudeCode(config);
       warnings.push(`Multi-agent mode set to '${mode}'. Applies to new sessions.`);
     }
+    if (wantsKeepNative) {
+      if (body.keepNativeChatGptOnV1 === true) config.keepNativeChatGptOnV1 = true;
+      else delete config.keepNativeChatGptOnV1;
+      saveConfigPreservingClaudeCode(config);
+      const effectiveMode = mode ?? config.multiAgentMode ?? "default";
+      warnings.push(body.keepNativeChatGptOnV1 === true
+        ? (effectiveMode === "v2"
+          ? "ChatGPT-native models stay on v1 while other models use v2. Applies to new sessions."
+          : "keepNativeChatGptOnV1 is stored but inactive until multi-agent mode is v2. Applies to new sessions.")
+        : "ChatGPT-native models follow the selected v1/v2/base surface. Applies to new sessions.");
+    }
     // New-key scalar writes: each writer is individually atomic, so apply them in
     // sequence after the transition. A failure here is a persistence failure (the
     // writers' ok:false result or a throw from the underlying atomic write helper),
@@ -317,6 +362,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     if (wantsAgentsEnabled) scalarWrites.push({ field: "agentsEnabled", run: () => setAgentsEnabled(body.agentsEnabled as boolean | null) });
     if (wantsMaxDepth) scalarWrites.push({ field: "agentsMaxDepth", run: () => setAgentsMaxDepth(body.agentsMaxDepth as number | null) });
     if (wantsSubagentInstructions) scalarWrites.push({ field: "subagentDeveloperInstructions", run: () => setSubagentDeveloperInstructions(body.subagentDeveloperInstructions as string | null) });
+    if (wantsModeHintText) scalarWrites.push({ field: "multiAgentModeHintText", run: () => setMultiAgentModeHintText(body.multiAgentModeHintText as string | null) });
     const landed: string[] = [];
     for (const write of scalarWrites) {
       try {
@@ -345,9 +391,11 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       agentsMaxThreadsConflict: enabled && hasAgentsMaxThreads(),
       maxConcurrentThreadsPerSession: getLogicalMaxThreads(),
       multiAgentMode: config.multiAgentMode ?? "default",
+      keepNativeChatGptOnV1: config.keepNativeChatGptOnV1 === true,
       agentsEnabled: getAgentsEnabled(),
       agentsMaxDepth: getAgentsMaxDepth(),
       subagentDeveloperInstructions: getSubagentDeveloperInstructions(),
+      multiAgentModeHintText: getMultiAgentModeHintText(),
       agentsMaxDepthAppliesWhenV2Disabled: !enabled,
       warnings,
       catalogRefresh,
@@ -565,15 +613,29 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         stored === catalogModelSlug(m) || slugEquals(stored, m.provider, m.id)
       ))
       .map(catalogModelSlug))];
-    const available = [
+    const chosen = config.subagentModels ?? [];
+    const selectable = [
       ...listCatalogNativeSlugs().filter(ns => !disabled.has(ns)),
       ...visibleRouted,
+    ];
+    // A saved roster slot must stay representable even after its model is disabled
+    // elsewhere (Models page, provider allowlist, a provider row going away). The
+    // dashboard treats `available` as the set of rows it can render, so a chosen id
+    // missing from it disappears from the roster UI and the next Save — which PUTs
+    // exactly what the UI holds — silently truncates the persisted list. Losing a
+    // deliberate 5-model roster to an unrelated visibility toggle is data loss, not a
+    // filter. Same reasoning as `fetchGrokCandidateModels`, which deliberately lists a
+    // model the user already excluded so its switch remains reachable.
+    const selectableSet = new Set(selectable);
+    const available = [
+      ...selectable,
+      ...[...new Set(chosen)].filter(model => !selectableSet.has(model)),
     ];
     // #857: let CLI/GUI show when a running Codex app-server keeps an older
     // in-memory catalog than the one on disk.
     const { collectCodexAppServerCatalogState } = await import("../../codex/app-server-processes");
     const catalogState = collectCodexAppServerCatalogState();
-    return jsonResponse({ chosen: config.subagentModels ?? [], available, catalogState });
+    return jsonResponse({ chosen, available, catalogState });
   }
   if (url.pathname === "/api/subagent-models" && req.method === "PUT") {
     let body: { models?: unknown };
@@ -759,32 +821,22 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
   }
   if (url.pathname === "/api/claude-desktop/apply" && req.method === "POST") {
     try {
-      const { setIntegrationEnabled, claudeDesktopIntegrationEnabled } = await import("../../codex/desired-state");
-      const desired = setIntegrationEnabled("claude-desktop", true);
-      if (!desired.ok) return jsonResponse({ error: desired.message }, desired.retryable ? 409 : 500);
-      // Disk now says ON; the reused server snapshot must agree, or the native
-      // GET reports OFF and a later whole-snapshot save undoes this transition.
-      mirrorDesiredEnabledOntoSnapshot(config, "claude-desktop", true);
-      // Disk now says ON; the reused server snapshot must agree, or the native
-      // GET reports OFF and a later whole-snapshot save undoes this transition.
       // #859: the CLI delegates here so the registry is built in the serving
       // process. Accept an optional mode; default stays static for back-compat.
       let mode: "static" | "hybrid" | "discovery" = "static";
-      const rawBody = await req.text();
       let parsed: unknown;
-      if (rawBody.trim()) {
-        try {
-          parsed = JSON.parse(rawBody);
-        } catch {
-          return jsonResponse({ error: "invalid JSON body" }, 400);
-        }
-        const requested = (parsed as { mode?: unknown } | null)?.mode;
-        if (requested !== undefined) {
-          if (requested === "static" || requested === "hybrid" || requested === "discovery") {
-            mode = requested;
-          } else {
-            return jsonResponse({ error: "mode must be static, hybrid, or discovery" }, 400);
-          }
+      try {
+        parsed = await readOptionalManagementJsonBody(req);
+      } catch (error) {
+        rethrowManagementBodyTooLarge(error);
+        return jsonResponse({ error: "invalid JSON body" }, 400);
+      }
+      const requested = (parsed as { mode?: unknown } | null)?.mode;
+      if (requested !== undefined) {
+        if (requested === "static" || requested === "hybrid" || requested === "discovery") {
+          mode = requested;
+        } else {
+          return jsonResponse({ error: "mode must be static, hybrid, or discovery" }, 400);
         }
       }
       // #859: a delegated CLI apply carries the profile it just saved — the
@@ -800,6 +852,12 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
           return jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 400);
         }
       }
+      const { setIntegrationEnabled, claudeDesktopIntegrationEnabled } = await import("../../codex/desired-state");
+      const desired = setIntegrationEnabled("claude-desktop", true);
+      if (!desired.ok) return jsonResponse({ error: desired.message }, desired.retryable ? 409 : 500);
+      // Disk now says ON; the reused server snapshot must agree, or the native
+      // GET reports OFF and a later whole-snapshot save undoes this transition.
+      mirrorDesiredEnabledOntoSnapshot(config, "claude-desktop", true);
       const state = await buildClaudeDesktopState(config, profileOverride);
       // `setIntegrationEnabled` above wrote desired ON to DISK; it does not touch
       // this long-lived server snapshot. Saving the snapshot wholesale would carry
@@ -842,6 +900,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         latest.apiKeys?.[0]?.key,
         mode,
         state.profile,
+        nativeContextLimits(latest),
       );
       if (!result.written) return jsonResponse({ error: result.reason ?? "Claude Desktop apply failed", saved: true, path: result.path }, 500);
       // Persist applied fingerprint + timestamp so GUI can show saved-vs-applied state.
@@ -866,6 +925,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       }
       return jsonResponse({ ok: true, saved: true, applied: true, path: result.path, fingerprint: result.fingerprint });
     } catch (error) {
+      rethrowManagementBodyTooLarge(error);
       return jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 400);
     }
   }
@@ -932,7 +992,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       if (isDisabled(m.provider, m.id)) continue;
       aliases.push({ id: claudeCodeAlias(m.provider, m.id), display_name: `${m.id} (${m.provider})` });
     }
-    const contextWindows = buildClaudeContextWindows([...visibleNativeSlugs(config)], models);
+    const contextWindows = buildClaudeContextWindows([...visibleNativeSlugs(config)], models, nativeContextLimits(config));
     const webSearchOverride = config.claudeCode?.webSearchSidecar;
     const visionOverride = config.claudeCode?.visionSidecar;
     // Auto is a RESOLUTION, recomputed per request — never stored state. Detection is
@@ -961,8 +1021,10 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       smallFastModel: config.claudeCode?.smallFastModel ?? "",
       tierModels: config.claudeCode?.tierModels ?? {},
       modelMap: config.claudeCode?.modelMap ?? {},
+      classifierModel: config.claudeCode?.classifierModel ?? "",
+      classifierFallbacks: config.claudeCode?.classifierFallbacks ?? [],
       systemEnv: config.claudeCode?.systemEnv === true,
-      autoConnectSupported: process.platform === "darwin",
+      autoConnectSupported: (ctx.deps.platform ?? process.platform) === "darwin",
       maxContextTokens: config.claudeCode?.maxContextTokens ?? null,
       alwaysEnableEffort: config.claudeCode?.alwaysEnableEffort === true,
       autoContext: config.claudeCode?.autoContext !== false,
@@ -998,7 +1060,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       return prototype === Object.prototype || prototype === null;
     };
     if (!isPlainObject(parsedBody)) return jsonResponse({ error: "body must be an object" }, 400);
-    const body = parsedBody as { enabled?: unknown; authMode?: unknown; model?: unknown; smallFastModel?: unknown; modelMap?: unknown; systemEnv?: unknown; fastMode?: unknown; maxContextTokens?: unknown; alwaysEnableEffort?: unknown; tierModels?: unknown; autoContext?: unknown; autoCompactWindow?: unknown; blockedSkills?: unknown; injectAgents?: unknown; webSearchSidecar?: unknown; visionSidecar?: unknown };
+    const body = parsedBody as { enabled?: unknown; authMode?: unknown; model?: unknown; smallFastModel?: unknown; modelMap?: unknown; classifierModel?: unknown; classifierFallbacks?: unknown; systemEnv?: unknown; fastMode?: unknown; maxContextTokens?: unknown; alwaysEnableEffort?: unknown; tierModels?: unknown; autoContext?: unknown; autoCompactWindow?: unknown; blockedSkills?: unknown; injectAgents?: unknown; webSearchSidecar?: unknown; visionSidecar?: unknown };
     for (const field of ["webSearchSidecar", "visionSidecar"] as const) {
       const section = body[field];
       if (section === undefined || section === null) continue;
@@ -1009,6 +1071,19 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       }
       if (section.model !== undefined && typeof section.model !== "string") {
         return jsonResponse({ error: `${field}.model must be a string` }, 400);
+      }
+      // Vision override only: reject a model we can prove is blind. Unknown ids stay
+      // allowed; webSearchSidecar has no vision requirement and is left alone. Shares
+      // one policy module with /api/sidecar-settings so the two gates cannot drift.
+      if (field === "visionSidecar" && typeof section.model === "string" && section.model !== "") {
+        const requested = section.model;
+        const candidates = await visionCandidateRows(config);
+        const hint = section.backend === "anthropic" || section.backend === "openai"
+          ? section.backend
+          : config.claudeCode?.visionSidecar?.backend;
+        if (visionDescriberIsProvablyBlind(config, requested, candidates, hint)) {
+          return jsonResponse(visionDescriberRejection("visionSidecar.model", requested, config, candidates), 400);
+        }
       }
     }
     const next = { ...(config.claudeCode ?? {}) };
@@ -1118,18 +1193,37 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         else delete next.tierModels;
       }
     }
+    let nextFastMode = config.fastMode;
     if (body.fastMode !== undefined) {
       if (body.fastMode !== true && body.fastMode !== false && body.fastMode !== null) {
         return jsonResponse({ error: "fastMode must be true, false, or null" }, 400);
       }
-      config.fastMode = body.fastMode === null ? undefined : body.fastMode;
+      nextFastMode = body.fastMode === null ? undefined : body.fastMode;
     }
-    for (const field of ["model", "smallFastModel"] as const) {
+    for (const field of ["model", "smallFastModel", "classifierModel"] as const) {
       const value = body[field];
       if (value === undefined) continue;
       if (typeof value !== "string") return jsonResponse({ error: `${field} must be a string` }, 400);
       if (value.trim() === "") delete next[field];
       else next[field] = value.trim();
+    }
+    if (body.classifierFallbacks !== undefined) {
+      if (body.classifierFallbacks === null) {
+        delete next.classifierFallbacks;
+      } else {
+        if (!Array.isArray(body.classifierFallbacks)) {
+          return jsonResponse({ error: "classifierFallbacks must be an array of strings, or null" }, 400);
+        }
+        const list: string[] = [];
+        for (const entry of body.classifierFallbacks) {
+          if (typeof entry !== "string" || entry.trim() === "") {
+            return jsonResponse({ error: "classifierFallbacks entries must be non-empty strings" }, 400);
+          }
+          list.push(entry.trim());
+        }
+        if (list.length > 0) next.classifierFallbacks = list;
+        else delete next.classifierFallbacks;
+      }
     }
     if (body.modelMap !== undefined) {
       if (body.modelMap === null) {
@@ -1149,6 +1243,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         else delete next.modelMap;
       }
     }
+    if (body.fastMode !== undefined) config.fastMode = nextFastMode;
     config.claudeCode = next;
     // Stamp the migration sentinel on EVERY persist of this block. The migration reads
     // "a claudeCode block with no authMode" as a pre-upgrade subscriber and pins it to

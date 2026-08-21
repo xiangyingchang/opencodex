@@ -47,7 +47,7 @@ ocx claude
 | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:<port>` |
 | `ANTHROPIC_AUTH_TOKEN` | Only when the proxy requires an API key — otherwise it is NOT set, so your claude.ai login (subscription + connectors) stays active |
 | `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` | `1` (native `/model` picker discovery) |
-| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Auto-context compaction threshold (default `350000`); only injected when auto-context is enabled |
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Auto-context compaction threshold (default `829800`); only injected when auto-context is enabled |
 | `ANTHROPIC_MODEL` | `claudeCode.model` (optional) |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `claudeCode.tierModels.haiku ?? claudeCode.smallFastModel` (optional; legacy `ANTHROPIC_SMALL_FAST_MODEL` too) |
 | `ANTHROPIC_DEFAULT_{OPUS,SONNET,FABLE}_MODEL` | `claudeCode.tierModels.*` (optional) |
@@ -142,7 +142,10 @@ requiring the `ocx claude` wrapper. Already-open shells are unaffected and must 
 
 `ocx stop` and proxy shutdown **unset the injected keys** (it does not restore previous values —
 only the keys opencodex injected are removed). The proxy also writes `~/.opencodex/claude-env.sh`;
-`ocx start` installs a `.zshrc` source hook that loads it automatically.
+`ocx start` installs a `.zshrc` source hook that loads it automatically only when an executable
+Claude Code CLI is present on `PATH`. Startup and `ocx ensure` remove the OpenCodex-owned hook when
+Claude Code is absent or system environment integration is inactive. Claude Desktop uses its
+separate profile and does not cause shell-hook installation.
 
 Disable with `claudeCode.systemEnv: false` in the configuration or with the GUI toggle. This
 feature is macOS-only; on other platforms, use `ocx claude`.
@@ -156,12 +159,16 @@ caching and billing identity stay fully native, and routed models keep working i
 via the picker aliases.
 
 **Header handling:** hop-by-hop headers plus `host`, `content-length`, `accept-encoding`,
-`x-opencodex-api-key`, and `origin` are stripped before forwarding. All other headers (including
-`anthropic-beta` and `anthropic-version`) pass through.
+`x-opencodex-api-key`, and `origin` are always stripped before forwarding. On a non-loopback bind,
+native passthrough also requires a valid proxy credential in `x-opencodex-api-key`; `Authorization`
+and `x-api-key` then belong only to Anthropic. A proxy admission secret found in either provider
+header is removed, while a genuine provider credential in the other header is preserved. Ambiguous
+comma-joined credential headers are not forwarded.
 
-The passthrough fires when **all four** conditions are met: `nativePassthrough` is not `false`;
-the model begins with `claude` or `anthropic`; the bearer or `x-api-key` starts with `sk-ant-`;
-and alias/model-map resolution returns the same model unchanged. This also means the
+The passthrough fires when all of these conditions are met: `nativePassthrough` is not `false`;
+the model begins with `claude` or `anthropic`; the bearer token or `x-api-key` starts with `sk-ant-`;
+alias/model-map resolution returns the same model unchanged; and, on a non-loopback bind, the
+dedicated proxy admission header is valid. This also means the
 "claude.ai connectors are disabled" warning no longer appears with `ocx claude`.
 
 Disable with `claudeCode.nativePassthrough: false`; point elsewhere with
@@ -229,7 +236,7 @@ default) fixes that:
 
 1. Models whose real window is above 200k **and** at least the auto-compact threshold get the
    `[1m]` marker on their picker rows and env slots.
-2. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (default `350000`, range `100000`–`1000000`) is injected so
+2. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (default `829800`, range `100000`–`1000000`) is injected so
    the conversation auto-summarizes at that point.
 
 Three config states:
@@ -243,7 +250,7 @@ window breaks that model — the chat errors out before the summary can fire.
 
 Sub-1M native Anthropic models are never auto-marked. Values you export yourself always win (the
 proxy uses YOUR value to decide which models are safe to mark). Invalid hand-edited config values
-fall back to 350k.
+fall back to 829,800.
 
 ### Effective model environment
 
@@ -371,7 +378,7 @@ Claude Code's `/effort` setting is preserved across the adapter:
 | --- | --- |
 | `thinking.type: "adaptive"` + `output_config.effort` | Effort passed directly (`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`\|`ultra`) |
 | `thinking.type: "enabled"` + `budget_tokens` | ≤4096→`low`, ≤16384→`medium`, above→`high` |
-| `thinking.type: "disabled"` | Reasoning parameters omitted entirely |
+| `thinking.type: "disabled"` | `reasoning: { effort: "none" }`; summary omitted |
 
 The resolved value appears in the request log's **Reasoning effort** column.
 
@@ -389,7 +396,7 @@ The proxy translates every Anthropic Messages API request into the Codex Respons
 | User `tool_result` | `function_call_output` (`is_error` → `[tool error]` prefix) |
 | `thinking` / `redacted_thinking` replay | Dropped |
 | Function tools | `{type: "function"}` (`web_search*` → `{type: "web_search"}`) |
-| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, named→`{type:"function",name}` |
+| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, named function→`{type:"function",name}`, hosted WebSearch/web_search→`{type:"web_search"}` |
 | `max_tokens` | `max_output_tokens` |
 | `stop_sequences` | `stop` |
 

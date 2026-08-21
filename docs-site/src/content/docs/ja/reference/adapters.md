@@ -35,21 +35,31 @@ interface ProviderAdapter {
   プロバイダーが明示的に alias を設定しない限り、`xhigh` と `max` は異なるラベルのまま保ちます。`provider.noReasoningModels` に含まれる id には値を **一切送りません**。
 - `delta.content`（テキスト）、`delta.reasoning_content`（thinking）、`delta.tool_calls[]` を
   ストリーミングし、`usage` を収集します。
-- ClinePass は、ライブ検証済みのゲートウェイ形式 `reasoning: { enabled: true, effort: "low" }`
+- ClinePass は、ライブ検証済みのゲートウェイ形式 `reasoning: { enabled: true, effort }`
   （reasoning を無効にする場合は `{ enabled: false }`）を使用します。公開 API ドキュメントには
-  現在このリクエスト形式が明記されていません。アダプターは他の effort リクエストを検証済みの
-  `low` に調整し、`delta.reasoning_content` または `delta.reasoning` を reasoning delta として扱い、
-  `stream_options.include_usage` でストリーム usage を要求し、非ストリームのレスポンス envelope からも usage を読み取ります。
+  現在このリクエスト形式が明記されていません。アダプターは要求された `low`、`medium`、`high`、
+  `xhigh`、`max` tier をそのまま保持し、`delta.reasoning_content` または `delta.reasoning` を
+  reasoning delta として扱い、`stream_options.include_usage` でストリーム usage を要求し、非ストリームのレスポンス envelope からも usage を読み取ります。
 
 ## `openai-responses`
 
-**対象:** OpenAI **Responses API**。**`passthrough: true`** — 元のリクエスト本文をそのまま渡し、レスポンスを **変換せずに** ストリーミングします。
-**認証:** `forward`（呼び出し元ヘッダー中継）または `key`。
+**対象:** OpenAI **Responses API**。**`passthrough: true`** — 通常は元のリクエストとレスポンスをそのまま渡し、ルーティング先ゲートウェイに必要な限定的な互換変換だけを適用します。
+**認証:** canonical OpenAI `forward` は安全な呼び出し元ヘッダー許可リストだけを中継します。非 canonical な `forward` は呼び出し元の authorization を中継せず、設定済みの静的ヘッダーだけを使用します。`key` は設定済み provider key を使用します。
+
+非 canonical な Responses ゲートウェイには、Codex のクライアント実行型 `tool_search`
+宣言を既存の公開 function tool と衝突しない名前で送り、対応するリクエスト履歴と JSON/SSE
+function call をクライアント向けの非公開 `tool_search` ライフサイクルに復元します。
+canonical OpenAI forward はネイティブな非公開型を維持します。
 
 `key` 認証では、[`retryOn429`](/ja/reference/configuration/) もここに適用されます: プリストリームの
 429 は、翻訳された `openai-chat` / Anthropic リクエスト経路と同様に、他の処理やフェイルオーバーに
 先立って、同じキーで同一リクエストを待機して再送します。カスタム `runTurn` トランスポートは
 HTTP リトライ ループの対象外です。
+
+- DeepSeek のステートレス Responses パーサーは、プロバイダーにスコープされた履歴正規化を受けます: フックで
+  注入されたコンテキストは、あいまいさのない tool-call/result バッチの後に移動します。並列呼び出しは、
+  それぞれの出力の前にグループ化されたままなので、すべての呼び出しが推論を含むアシスタントターンにとどまり
+  ます。寛容なプロバイダーと、重複・欠落・順序不正の call ID は元の入力順を保持します。
 
 - `forward` URL → `{baseUrl}/responses`。`key` provider はデフォルトで従来の `{baseUrl}/v1/responses` 構築を使います。
 - `key` provider は検証済みの相対 `responsesPath` を設定できます。adapter は `baseUrl` 末尾の `/` を 1 つ除き、`{trimmedBaseUrl}{responsesPath}` に送信します。Ark Agent Plan では `baseUrl: "https://ark.cn-beijing.volces.com/api/plan/v3"` と `responsesPath: "/responses"` を使います。
@@ -74,7 +84,8 @@ HTTP リトライ ループの対象外です。
 
 - システムプロンプト → `systemInstruction`；メッセージ → `contents[]`（assistant → `model`）；ツール →
   `functionDeclarations`。data URL 画像 → `inline_data`。
-- Gemini が tool-call id を省略すると合成します。Antigravity では実際の `thoughtSignature` 値を保存・再利用し、次のターンでも reasoning の連続性を保ちます。
+- Gemini が tool-call id を省略すると合成します。Vertex と Antigravity では不透明な `thoughtSignature` 値を保存・再利用し、tool-result の継続ターンでも reasoning の連続性を保ちます。
+  署名キャッシュは設定ディレクトリにスナップショットされるため、プロキシ再起動後も継続ターンを維持できます。
 
 ## `kiro`
 

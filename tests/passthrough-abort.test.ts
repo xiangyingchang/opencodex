@@ -46,7 +46,10 @@ describe("passthrough relayWithAbort (RC2, passthrough path)", () => {
       capsSource.indexOf("export function selectEagerPath"),
     );
 
-    expect(sseBranch).toContain("upstreamResponse.body.tee()");
+    expect(sseBranch).toContain("const terminalRepairPolicy = providerModelResponsesTerminalRepair(");
+    expect(sseBranch).toContain("const passthroughSseBody = terminalRepairPolicy");
+    expect(sseBranch).toContain(": upstreamResponse.body;");
+    expect(sseBranch).toContain("passthroughSseBody.tee()");
     // Rewrite traffic is derived from the finalized block chain so every
     // provider-specific transform participates in the platform gate.
     expect(sseBranch).toContain("const repairConfig = route.provider.responsesItemIdRepair;");
@@ -54,7 +57,8 @@ describe("passthrough relayWithAbort (RC2, passthrough path)", () => {
     expect(sseBranch).toContain("const needsClientRewrite = clientBlockRewrite !== undefined;");
     expect(sseBranch).toContain("new Response(eagerBody");
     expect(sseBranch).toContain("const rewrittenBody = clientBlockRewrite !== undefined");
-    expect(sseBranch).toContain("eagerPath?.useEagerRelay || win32EagerRewrite");
+    expect(sseBranch).toContain("isCodexWsUpstreamResponse(upstreamResponse)");
+    expect(sseBranch).toContain("forceCodexWsEagerRelay || eagerPath?.useEagerRelay || win32EagerRewrite");
     expect(sseBranch).not.toContain("win32TerminalRelay");
     // #864: win32 traffic that DOES need a client rewrite takes the eager single
     // reader with the payload rewrite applied inline — never the tee()+JS-pull
@@ -71,7 +75,7 @@ describe("passthrough relayWithAbort (RC2, passthrough path)", () => {
     expect(sseBranch).toContain("config.streamMode ?? \"auto\",");
     expect(selector).toContain('platform !== "win32" && platform !== "darwin"');
     expect(selector).toContain('decision.reason === "config-eager"');
-    expect(sseBranch).toContain("relaySseEagerBounded(upstreamResponse.body, turnAc,");
+    expect(sseBranch).toContain("relaySseEagerBounded(passthroughSseBody, turnAc,");
     expect(sseBranch).not.toContain("relaySseWithHeartbeat(");
     expect(sseBranch).not.toContain("trackStreamLifetime(");
     expect(logWrapper.indexOf("isNativePassthroughSseResponse(response)")).toBeGreaterThanOrEqual(0);

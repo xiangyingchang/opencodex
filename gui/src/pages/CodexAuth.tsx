@@ -2,9 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useT } from "../i18n/shared";
 import CodexAccountPool from "../components/CodexAccountPool";
 import DefaultModeRequestUserInputSetting from "../components/DefaultModeRequestUserInputSetting";
+import CodexAccountPickerSetting from "../components/CodexAccountPickerSetting";
 import { codexAccountModeState, type CodexAccountModeState } from "../codex-multi-state";
+import { navigateHash } from "../hash-routing";
 import { ensureOpenAiProvider, openAiAccountProviderState, OpenAiEnableError } from "../provider-payload";
 import { readSessionListCache, writeSessionListCache } from "../session-list-cache";
+import { startVisibilityPoll } from "../visibility-poll";
+import { createBoundedFetch } from "../bounded-fetch";
 
 export type OpenAiAccountBannerState = CodexAccountModeState | "invalid" | null;
 
@@ -46,7 +50,10 @@ export function OpenAiAccountModeBanner({
       )}
       {state === "direct" && (
         <p className="card-sub openai-account-mode-banner__desc">
-          {t("codexAuth.accountModeDirectDesc")} <a href="#providers">{t("codexAuth.openProviders")}</a>
+          {t("codexAuth.accountModeDirectDesc")}{" "}
+          <button type="button" className="link-btn" onClick={() => navigateHash("providers")}>
+            {t("codexAuth.openProviders")}
+          </button>
         </p>
       )}
       {(state === "absent" || state === "disabled") && (
@@ -59,7 +66,10 @@ export function OpenAiAccountModeBanner({
       )}
       {state === "invalid" && (
         <p className="card-sub openai-account-mode-banner__desc">
-          {t("codexAuth.openaiMissing")} <a href="#providers">{t("codexAuth.openProviders")}</a>
+          {t("codexAuth.openaiMissing")}{" "}
+          <button type="button" className="link-btn" onClick={() => navigateHash("providers")}>
+            {t("codexAuth.openProviders")}
+          </button>
         </p>
       )}
     </div>
@@ -111,8 +121,9 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
   const [enableError, setEnableError] = useState("");
 
   const loadMode = useCallback(async () => {
+    const bounded = createBoundedFetch(15_000);
     try {
-      const res = await fetch(`${apiBase}/api/config`);
+      const res = await fetch(`${apiBase}/api/config`, { signal: bounded.signal });
       if (!res.ok) throw new Error(String(res.status));
       const config = await res.json();
       const providerState = openAiAccountProviderState(openaiProviderFromConfig(config));
@@ -130,6 +141,8 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
       writeSessionListCache(configCacheKey, { bannerState: mode, accountModeState: mode });
     } catch {
       // Keep last-good banner on transient config failures.
+    } finally {
+      bounded.clear();
     }
   }, [apiBase, configCacheKey]);
 
@@ -143,8 +156,10 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
       initialModeKeyRef.current = apiBase;
       void Promise.resolve().then(() => { void loadMode(); });
     }
-    const iv = window.setInterval(() => { void loadMode(); }, 30_000);
-    return () => { window.clearInterval(iv); };
+    // Hidden tabs hold no timer and fire nothing; the visible make-up tick re-reads
+    // the mode the moment the user returns.
+    const stop = startVisibilityPoll(() => { void loadMode(); }, 30_000);
+    return () => { stop(); };
   }, [apiBase, loadMode]);
 
   const enableOpenAi = async () => {
@@ -177,8 +192,15 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
 
   return (
     <>
-      <CodexAccountPool apiBase={apiBase} accountModeState={accountModeState} banner={banner} />
-      <DefaultModeRequestUserInputSetting apiBase={apiBase} />
+      <CodexAccountPool
+        apiBase={apiBase}
+        accountModeState={accountModeState}
+        banner={banner}
+        advancedExtras={<>
+          <CodexAccountPickerSetting apiBase={apiBase} />
+          <DefaultModeRequestUserInputSetting apiBase={apiBase} />
+        </>}
+      />
     </>
   );
 }

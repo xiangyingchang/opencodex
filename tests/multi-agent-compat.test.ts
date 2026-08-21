@@ -4,13 +4,15 @@
  * the Proactive delegation prompt when they arrive with the synthetic top tier.
  */
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { injectDeveloperMessage, multiAgentGuidanceText, sanitizeEncryptedContentInPlace } from "../src/server/responses";
 import { parseRequest } from "../src/responses/parser";
 import type { OcxParsedRequest } from "../src/types";
 import { CODEX_ACCOUNT_BOUND_CATALOG_KIND, effectiveSubagentRoster } from "../src/codex/catalog";
+import { collectCodexAppServerCatalogState, resetCodexAppServerCatalogStateCache } from "../src/codex/app-server-processes";
+import { setTrustedWindowsElevationExecutablesForTests } from "../src/lib/windows-elevation";
 import { clearDebugSettings, setDebugSettings } from "../src/lib/debug-settings";
 import {
   getInjectionDebugLogEntries,
@@ -117,7 +119,126 @@ describe("multiAgentGuidanceText", () => {
     expect(await multiAgentGuidanceText(parsedFixture({ reasoning: "max", tools: [{ name: "shell" }] }))).toBeNull();
   });
 
+  // Every catalog-state test in this file injects `collectCatalogState`, which means none
+  // of them observes which collector the DEFAULT path picks. Rewiring the v2 boundary back
+  // to the synchronous collector left this whole suite green — the regression #1852 exists
+  // to prevent would have shipped unnoticed. This pins the default wiring itself.
+  test("the v2 default catalog path uses the request collector, not the synchronous one (#1852)", async () => {
+    const dir = codexHomeFixture(V2_ON);
+    catalogFixture(dir, [{
+      slug: "anthropic/claude-sonnet-5",
+      efforts: ["low", "medium", "high", "xhigh"],
+    }]);
+    const parsed = parsedFixture({ reasoning: "medium", tools: [{ name: "spawn_agent" }] });
+
+    // Force the default dependency by passing NO collectCatalogState, and make the
+    // underlying process enumeration observable through the trusted-executable seam:
+    // a stalling fake stands in for a slow CIM walk. The async request collector leaves
+    // the loop free; the synchronous collector parks it.
+    const fakeDir = mkdtempSync(join(tmpdir(), "ocx-collab-ps-"));
+    // Platform-shaped: execFile takes no shell, so a POSIX script is not executable on
+    // Windows — the platform this fix targets, whose CI shard runs this suite.
+    const fake = join(fakeDir, process.platform === "win32" ? "fake-powershell.cmd" : "fake-powershell.sh");
+    if (process.platform === "win32") {
+      writeFileSync(fake, ["@echo off", "ping -n 1 -w 200 192.0.2.1 >nul 2>&1"].join("\r\n"));
+    } else {
+      writeFileSync(fake, ["#!/bin/sh", "sleep 0.2", "printf ''"].join("\n"));
+      chmodSync(fake, 0o755);
+    }
+    setTrustedWindowsElevationExecutablesForTests({ powershell: fake });
+    const realPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    resetCodexAppServerCatalogStateCache();
+    // This suite sets a hermetic state override at module load so the host's real
+    // app-server cannot leak in. That override short-circuits before any collector runs,
+    // so it has to come off for exactly this test — which is the one test that needs the
+    // real default path.
+    delete process.env.OPENCODEX_APP_SERVER_CATALOG_STATE_OVERRIDE;
+
+    // Phase signal rather than a tick count: a threshold between "sync" and "async"
+    // observations has to guess how many timer callbacks a loaded runner will deliver,
+    // and setInterval promises no catch-up. This asks the binary question instead — did
+    // any event-loop work run WHILE the child was alive? A synchronous exec parks the
+    // loop, so the flag cannot flip regardless of machine speed.
+    let loopRanDuringExec = false;
+    const beat = setInterval(() => { loopRanDuringExec = true; }, 5);
+    try {
+      await multiAgentGuidanceText(parsed, { injectionModel: "anthropic/claude-sonnet-5" });
+    } finally {
+      clearInterval(beat);
+      Object.defineProperty(process, "platform", realPlatform);
+      setTrustedWindowsElevationExecutablesForTests(null);
+      rmSync(fakeDir, { recursive: true, force: true });
+      resetCodexAppServerCatalogStateCache();
+      process.env.OPENCODEX_APP_SERVER_CATALOG_STATE_OVERRIDE = "fresh";
+    }
+
+    expect(loopRanDuringExec).toBe(true);
+  });
+
   test("v2 guidance suppresses positive model claims while the app-server catalog is stale or unknown (#857)", async () => {
+    const dir = codexHomeFixture(V2_ON);
+    catalogFixture(dir, [{
+      slug: "anthropic/claude-sonnet-5",
+      efforts: ["low", "medium", "high", "xhigh"],
+    }]);
+    const parsed = parsedFixture({ reasoning: "medium", tools: [{ name: "spawn_agent" }] });
+    const options = { injectionModel: "anthropic/claude-sonnet-5" };
+
+    for (const state of ["stale", "unknown"] as const) {
+      const text = await multiAgentGuidanceText(parsed, options, {
+        collectCatalogState: async () => ({ state }),
+      });
+      // #1395: withhold OpenCodex's disk-derived claims, but do not prohibit
+      // options the active spawn_agent tool advertises — the global catalog
+      // observation cannot be attributed to the request that triggered it.
+      expect(text).toBeNull();
+    }
+
+    for (const state of ["fresh", "not_running"] as const) {
+      const text = await multiAgentGuidanceText(parsed, options, {
+        collectCatalogState: () => ({ state }),
+      });
+      expect(text).toContain("Preferred sub-agent");
+    }
+  });
+
+  test("a mixed stale/fresh process set does not produce a blanket no-override instruction (#1395)", async () => {
+    // The scoping bug this guards: `collectCodexAppServerCatalogState()` folds
+    // every current-user app-server into ONE global observation. Process 42
+    // predates the catalog and process 43 does not, so the global state is
+    // `stale` — but the inbound request carries no sender PID, so we cannot tell
+    // whether it came from the stale server or the fresh one.
+    const appServerCmd = "/usr/local/bin/codex app-server";
+    const global = collectCodexAppServerCatalogState({
+      listSnapshots: () => [
+        { pid: 42, commandLine: appServerCmd },
+        { pid: 43, commandLine: appServerCmd },
+      ],
+      readStartMs: pid => (pid === 42 ? 500 : 3_000),
+      catalogMtimeMs: () => 1_000,
+    });
+    expect(global.state).toBe("stale");
+
+    const dir = codexHomeFixture(V2_ON);
+    catalogFixture(dir, [{
+      slug: "anthropic/claude-sonnet-5",
+      efforts: ["low", "medium", "high", "xhigh"],
+    }]);
+    const parsed = parsedFixture({ reasoning: "medium", tools: [{ name: "spawn_agent" }] });
+    const options = { injectionModel: "anthropic/claude-sonnet-5" };
+
+    const text = await multiAgentGuidanceText(parsed, options, {
+      collectCatalogState: () => ({ state: global.state }),
+    });
+
+    // A request we cannot attribute to the stale process must not be told to
+    // stop setting model or reasoning_effort — that prohibits options the active
+    // spawn_agent tool legitimately advertises, for a session that may be fresh.
+    expect(text).toBeNull();
+  });
+
+  test("stale and unknown withhold OpenCodex's own catalog claims (#1354, #1395)", async () => {
     const dir = codexHomeFixture(V2_ON);
     catalogFixture(dir, [{
       slug: "anthropic/claude-sonnet-5",
@@ -130,11 +251,13 @@ describe("multiAgentGuidanceText", () => {
       const text = await multiAgentGuidanceText(parsed, options, {
         collectCatalogState: () => ({ state }),
       });
-      expect(text).toContain("do not set");
-      expect(text).not.toContain("Preferred sub-agent");
-      expect(text).not.toContain("Available models");
+      // No preferred model, no roster, no fallback, and no override prohibition.
+      // The active tool schema stays authoritative.
+      expect(text).toBeNull();
     }
 
+    // `fresh` and `not_running` are unchanged: there the catalog can be
+    // positively described, so the designation guidance still applies.
     for (const state of ["fresh", "not_running"] as const) {
       const text = await multiAgentGuidanceText(parsed, options, {
         collectCatalogState: () => ({ state }),
@@ -176,15 +299,19 @@ describe("multiAgentGuidanceText", () => {
     const configured = ["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"];
 
     const effective = effectiveSubagentRoster(configured, "v2");
+    // Upstream 6d4d9442c: a "v1" pin means eligible LEAF worker, not "ineligible".
+    // gpt-5.6-luna carries upstream's own "v1" pin, so it belongs in the roster.
     expect(effective.candidates.map(model => model.model)).toEqual([
       "gpt-5.6-sol",
       "gpt-5.5",
       "gpt-5.6-terra",
+      "gpt-5.6-luna",
     ]);
     expect(effective.advertised.map(model => model.model)).toEqual([
       "gpt-5.6-sol",
       "gpt-5.5",
       "gpt-5.6-terra",
+      "gpt-5.6-luna",
     ]);
 
     const text = await multiAgentGuidanceText(
@@ -192,11 +319,11 @@ describe("multiAgentGuidanceText", () => {
       { subagentModels: configured },
     );
     expect(text).toContain('"gpt-5.6-sol"');
-    // Option B: an unpinned (null) model is a routed/unpinned-native model and is
-    // now advertised; only a genuine "v1" pin stays excluded.
+    // Since upstream 6d4d9442c only an explicit "disabled" pin excludes a model.
+    // Unpinned (null) rows and "v1"-pinned rows are both eligible leaf workers.
     expect(text).toContain('"gpt-5.5"');
     expect(text).toContain('"gpt-5.6-terra"');
-    expect(text).not.toContain('"gpt-5.6-luna"');
+    expect(text).toContain('"gpt-5.6-luna"');
     for (const advertised of effective.advertised) {
       expect(effective.candidates.map(model => model.model)).toContain(advertised.model);
     }
@@ -390,15 +517,17 @@ describe("multiAgentGuidanceText", () => {
       { slug: "eligible-a", efforts: ["high"], priority: 1 },
       { slug: "eligible-b", efforts: ["high"], priority: 1 },
       { slug: "hidden-model", efforts: ["high"], visibility: "hide", priority: 2 },
-      { slug: "v1-model", efforts: ["high"], priority: 3, multiAgentVersion: "v1" },
-      { slug: "filler-a", efforts: ["high"], priority: 4 },
-      { slug: "filler-b", efforts: ["high"], priority: 5 },
+      // "v1" is an eligible LEAF worker since upstream 6d4d9442c; only "disabled"
+      // is a capability-based exclusion, so the disabled row carries that role now.
+      { slug: "disabled-model", efforts: ["high"], priority: 3, multiAgentVersion: "disabled" },
+      { slug: "v1-model", efforts: ["high"], priority: 4, multiAgentVersion: "v1" },
+      { slug: "filler-a", efforts: ["high"], priority: 5 },
       { slug: "displaced-model", efforts: ["high"], priority: 6 },
     ]);
     const configured = [
       "provider/vendor/model",
       "hidden-model",
-      "v1-model",
+      "disabled-model",
       "missing-model",
       "displaced-model",
     ];
@@ -408,13 +537,13 @@ describe("multiAgentGuidanceText", () => {
       "provider/vendor-model",
       "eligible-a",
       "eligible-b",
+      "v1-model",
       "filler-a",
-      "filler-b",
     ]);
     expect(effective.advertised.map(model => model.model)).toEqual(["provider/vendor-model"]);
     expect(effective.excluded).toEqual([
       { configured: "hidden-model", catalogModel: "hidden-model", reason: "picker_hidden" },
-      { configured: "v1-model", catalogModel: "v1-model", reason: "surface_incompatible" },
+      { configured: "disabled-model", catalogModel: "disabled-model", reason: "surface_incompatible" },
       { configured: "missing-model", reason: "missing_catalog_entry" },
       { configured: "displaced-model", catalogModel: "displaced-model", reason: "outside_display_limit" },
     ]);
@@ -434,7 +563,7 @@ describe("multiAgentGuidanceText", () => {
     );
     const lines = getInjectionDebugLogEntries().map(entry => entry.line).join("\n");
     expect(lines).toContain("hidden-model:picker_hidden");
-    expect(lines).toContain("v1-model:surface_incompatible");
+    expect(lines).toContain("disabled-model:surface_incompatible");
     expect(lines).toContain("missing-model:missing_catalog_entry");
     expect(lines).toContain("displaced-model:outside_display_limit");
   });
@@ -605,11 +734,12 @@ describe("multiAgentGuidanceText", () => {
       },
     );
 
+    // gpt-5.6-luna carries upstream's "v1" pin, which is now an eligible LEAF worker
+    // (codex-rs 6d4d9442c), so it joins the substituted roster.
     expect(text).toBe(
       '<multi_agent_mode>CUSTOM model=raw/preferred-model effort=max'
-        + ' Available models (reasoning_effort high/max): "gpt-5.6-terra".</multi_agent_mode>',
+        + ' Available models (reasoning_effort high/max): "gpt-5.6-terra", "gpt-5.6-luna".</multi_agent_mode>',
     );
-    expect(text).not.toContain("gpt-5.6-luna");
   });
 
   test("injectionPrompt substitutes fallback guidance via {{fallback}}", async () => {
@@ -822,28 +952,35 @@ describe("injectDeveloperMessage", () => {
       && (part as Record<string, unknown>).text === text;
   }).length;
 
-  test("appends to both the parsed messages and the raw passthrough input", () => {
-    const parsed = parsedFixture({ reasoning: "max" });
-    injectDeveloperMessage(parsed, "hello there");
-    const last = parsed.context.messages.at(-1)!;
-    expect(last.role).toBe("developer");
-    expect(last.content).toBe("hello there");
-    const rawInput = (parsed._rawBody as { input: unknown[] }).input;
-    expect(rawInput.at(-1)).toEqual({
-      type: "message",
-      role: "developer",
-      content: [{ type: "input_text", text: "hello there" }],
+  test("inserts after leading developer metadata and before conversation", () => {
+    const parsed = parseRequest({
+      model: "gpt-5.5",
+      input: [
+        { type: "message", role: "system", content: [{ type: "input_text", text: "system" }] },
+        { type: "message", role: "developer", content: [{ type: "input_text", text: "native mode" }] },
+        { type: "additional_tools", role: "developer", tools: [] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "work" }] },
+      ],
     });
+    injectDeveloperMessage(parsed, "hello there");
+
+    expect(parsed.context.systemPrompt).toEqual(["system"]);
+    expect(parsed.context.messages.map(message => message.role)).toEqual(["developer", "developer", "user"]);
+    expect(parsed.context.messages[1]!.content).toBe("hello there");
+    const rawInput = (parsed._rawBody as { input: unknown[] }).input;
+    expect(rawInput[2]).toMatchObject({ type: "additional_tools", role: "developer" });
+    expect(rawInput[3]).toEqual(generatedItem("hello there"));
+    expect(rawInput[4]).toMatchObject({ type: "message", role: "user" });
   });
 
   test("string raw input is left alone", () => {
     const parsed = parsedFixture({ reasoning: "max", rawInput: "plain" });
     injectDeveloperMessage(parsed, "note");
     expect((parsed._rawBody as { input: unknown }).input).toBe("plain");
-    expect(parsed.context.messages.at(-1)!.content).toBe("note");
+    expect(parsed.context.messages[0]!.content).toBe("note");
   });
 
-  test("inserts BEFORE compaction_trigger so it stays the final input item", () => {
+  test("inserts before conversation while compaction_trigger stays final", () => {
     const parsed = parsedFixture({ reasoning: "max" });
     const rawBody = parsed._rawBody as { input: unknown[] };
     rawBody.input = [
@@ -853,9 +990,135 @@ describe("injectDeveloperMessage", () => {
     injectDeveloperMessage(parsed, "guidance text");
     const input = rawBody.input;
     expect(input).toHaveLength(3);
-    expect((input[1] as { type: string }).type).toBe("message");
-    expect((input[1] as { role: string }).role).toBe("developer");
+    expect((input[0] as { type: string }).type).toBe("message");
+    expect((input[0] as { role: string }).role).toBe("developer");
+    expect((input[1] as { role: string }).role).toBe("user");
     expect((input[2] as { type: string }).type).toBe("compaction_trigger");
+  });
+
+  test("consecutive stateless requests keep one fresh guidance item before conversation", async () => {
+    const dir = codexHomeFixture(V2_ON);
+    catalogFixture(dir, [{
+      slug: "anthropic/claude-sonnet-5",
+      efforts: ["low", "medium", "high", "xhigh"],
+      multiAgentVersion: "v2",
+    }]);
+    const fixture = parsedFixture({ reasoning: "medium" });
+    const text = await multiAgentGuidanceText(
+      fixture,
+      {
+        injectionModel: "anthropic/claude-sonnet-5",
+      },
+      { collectCatalogState: () => ({ state: "fresh" }) },
+    );
+
+    expect(text).toContain("Preferred sub-agent");
+    for (const content of ["first", "second"]) {
+      const parsed = parsedFixture({
+        reasoning: "medium",
+        rawInput: [{ type: "message", role: "user", content }],
+      });
+      injectDeveloperMessage(parsed, text!);
+      const rawInput = (parsed._rawBody as { input: unknown[] }).input;
+      expect(countExact(rawInput, text!)).toBe(1);
+      expect(rawInput).toEqual([generatedItem(text!), { type: "message", role: "user", content }]);
+    }
+  });
+
+  test("keeps an unexpanded previous_response_id tool delta first", () => {
+    const parsed = parsedFixture({
+      reasoning: "max",
+      rawInput: [{ type: "function_call_output", call_id: "call_1", output: "ok" }],
+    });
+    parsed.previousResponseId = "resp_remote";
+    injectDeveloperMessage(parsed, guidance);
+
+    const rawInput = (parsed._rawBody as { input: unknown[] }).input;
+    expect(rawInput[0]).toMatchObject({ type: "function_call_output", call_id: "call_1" });
+    expect(rawInput[1]).toEqual(generatedItem());
+    expect(parsed.context.messages.at(-1)).toMatchObject({ role: "developer", content: guidance });
+  });
+
+  test("inserts changed stateful guidance before an ordinary new user delta", () => {
+    const guidanceA = "<multi_agent_mode>A</multi_agent_mode>";
+    const guidanceB = "<multi_agent_mode>B</multi_agent_mode>";
+    const rawInput = [
+      generatedItem(guidanceA),
+      { type: "message", role: "user", content: "previous turn" },
+      { type: "message", role: "assistant", content: "done" },
+      { type: "message", role: "user", content: "current turn" },
+    ];
+    const parsed = parseRequest({ model: "gpt-5.5", input: rawInput });
+    parsed.previousResponseId = "resp_1";
+    parsed._replayPrefixLen = 3;
+    parsed._continuationConversationMessageIndex = 3;
+
+    injectDeveloperMessage(parsed, guidanceB);
+
+    expect(rawInput).toEqual([
+      generatedItem(guidanceA),
+      { type: "message", role: "user", content: "previous turn" },
+      { type: "message", role: "assistant", content: "done" },
+      generatedItem(guidanceB),
+      { type: "message", role: "user", content: "current turn" },
+    ]);
+    expect(parsed.context.messages.map(message => message.role)).toEqual([
+      "developer",
+      "user",
+      "assistant",
+      "developer",
+      "user",
+    ]);
+  });
+
+  test("keeps leading stateful protocol items before changed guidance and conversation", () => {
+    const rawInput = [
+      { type: "function_call_output", call_id: "call_1", output: "ok" },
+      { type: "message", role: "user", content: "current turn" },
+    ];
+    const parsed = parseRequest({ model: "gpt-5.5", input: rawInput, previous_response_id: "resp_remote" });
+
+    injectDeveloperMessage(parsed, guidance);
+
+    expect(rawInput).toEqual([
+      { type: "function_call_output", call_id: "call_1", output: "ok" },
+      generatedItem(),
+      { type: "message", role: "user", content: "current turn" },
+    ]);
+    expect(parsed.context.messages.map(message => message.role)).toEqual(["toolResult", "developer", "user"]);
+  });
+
+  test("keeps raw and parsed stateful placement aligned across reconstructed compaction history", () => {
+    const rawInput = [
+      { type: "message", role: "user", content: "current turn" },
+      { type: "compaction", encrypted_content: "ocx1:c3VtbWFyeQ==" },
+    ];
+    const parsed = parseRequest({ model: "gpt-5.5", input: rawInput, previous_response_id: "resp_remote" });
+
+    injectDeveloperMessage(parsed, guidance);
+
+    expect(rawInput[0]).toEqual(generatedItem());
+    expect(parsed.context.messages.map(message => message.role)).toEqual(["developer", "user", "user"]);
+  });
+
+  test("stateful guidance dedup uses the latest tagged item across A-B-A transitions", () => {
+    const guidanceA = "<multi_agent_mode>A</multi_agent_mode>";
+    const guidanceB = "<multi_agent_mode>B</multi_agent_mode>";
+    const parsed = parsedFixture({ rawInput: [generatedItem(guidanceA), { role: "user", content: "work" }] });
+    parsed.previousResponseId = "resp_1";
+    parsed._replayPrefixLen = 2;
+    injectDeveloperMessage(parsed, guidanceB);
+
+    const replay = parsedFixture({ rawInput: [
+      ...(parsed._rawBody as { input: unknown[] }).input,
+      { role: "assistant", content: "done" },
+    ] });
+    replay.previousResponseId = "resp_2";
+    replay._replayPrefixLen = 4;
+    injectDeveloperMessage(replay, guidanceB);
+    expect((replay._rawBody as { input: unknown[] }).input).toHaveLength(4);
+    injectDeveloperMessage(replay, guidanceA);
+    expect((replay._rawBody as { input: unknown[] }).input.at(-1)).toEqual(generatedItem(guidanceA));
   });
 
   test("exact-guidance predicate rejects every near-match replay-prefix shape (#326)", () => {
@@ -940,14 +1203,64 @@ describe("sanitizeEncryptedContentInPlace", () => {
     expect(sanitizeEncryptedContentInPlace(undefined)).toBe(0);
   });
 
+  test("deep unknown input does not overflow the call stack", () => {
+    const root: Array<Record<string, unknown>> = [{ type: "unknown" }];
+    let cursor = root[0]!;
+    for (let depth = 0; depth < 30_000; depth += 1) {
+      const child: Record<string, unknown> = {};
+      cursor.child = child;
+      cursor = child;
+    }
+    cursor.content = [{ type: "encrypted_content", encrypted_content: "deep plaintext" }];
+
+    expect(sanitizeEncryptedContentInPlace(root)).toBe(1);
+    expect(cursor.content).toEqual([{ type: "input_text", text: "deep plaintext" }]);
+  });
+
+  test("nested agent messages normalize after child rewrites without changing the rewrite count", () => {
+    const input = [{
+      type: "agent_message",
+      id: "outer",
+      author: "/root",
+      recipient: "/root/outer",
+      content: [{
+        type: "agent_message",
+        id: "inner",
+        author: "/root/outer",
+        recipient: "/root/outer/inner",
+        content: [
+          { type: "encrypted_content", encrypted_content: "first plaintext" },
+          { type: "encrypted_content", encrypted_content: "second plaintext" },
+        ],
+      }],
+    }];
+
+    expect(sanitizeEncryptedContentInPlace(input)).toBe(2);
+    const outer = input[0] as Record<string, unknown>;
+    const inner = (outer.content as Array<Record<string, unknown>>)[0]!;
+    expect(outer).toMatchObject({ type: "message", role: "user" });
+    expect(inner).toMatchObject({ type: "message", role: "user" });
+    for (const message of [outer, inner]) {
+      expect(message).not.toHaveProperty("id");
+      expect(message).not.toHaveProperty("author");
+      expect(message).not.toHaveProperty("recipient");
+    }
+  });
+
   test("mixed slot (hook preamble + embedded Fernet task) splits into text + encrypted parts", () => {
     const fernet = fernetFixture();
     const input = [
-      { type: "message", role: "user", content: [
+      { type: "agent_message", id: "mixed", author: "/root", recipient: "/root/worker", content: [
         { type: "encrypted_content", encrypted_content: `[CXC-LEAF-GUARD] follow the rules.\n\n${fernet}` },
       ] },
     ];
     expect(sanitizeEncryptedContentInPlace(input)).toBe(1);
+    expect(input[0]).toMatchObject({
+      type: "agent_message",
+      id: "mixed",
+      author: "/root",
+      recipient: "/root/worker",
+    });
     const parts = (input[0] as { content: Array<Record<string, unknown>> }).content;
     expect(parts).toHaveLength(2);
     expect(parts[0]).toEqual({ type: "input_text", text: "[CXC-LEAF-GUARD] follow the rules.\n\n" });

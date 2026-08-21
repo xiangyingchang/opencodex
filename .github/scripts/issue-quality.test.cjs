@@ -396,12 +396,71 @@ describe("validateIssue - feature", () => {
       false,
     );
     assert.equal(isMediaOnly('<picture><source srcset="x.webp"><img src="x.png"></picture>'), true);
+    assert.equal(isMediaOnly('<video>No response</video>'), true);
+    assert.equal(isMediaOnly('<audio> _No response_ </audio>'), true);
+    assert.equal(isMediaOnly('<video><p><em>No response</em></p></video>'), true);
+    assert.equal(clean('<video>No response</video>'), "");
+    for (const caption of [
+      "TBD",
+      "N/A",
+      "None",
+      "설명 없음",
+      "🎬",
+      "demo.mp4",
+      "https://example.com/demo.mp4",
+    ]) {
+      const media = `<video>${caption}</video>`;
+      assert.equal(stripMediaTokens(media), media, `caption must survive: ${caption}`);
+      assert.equal(isMediaOnly(media), false, `caption must be substantive: ${caption}`);
+      assert.equal(clean(media), media, `caption must survive cleaning: ${caption}`);
+    }
+    assert.equal(
+      isMediaOnly('<picture>\n    <source srcset="x.webp">\n    <img src="x.png">\n</picture>'),
+      true,
+    );
+    assert.equal(
+      isMediaOnly('<video>\n    <source src="clip.mp4">\n    Real fallback caption\n</video>'),
+      false,
+    );
+    assert.equal(
+      isMediaOnly([
+        "<picture",
+        '    data-kind="responsive"',
+        ">",
+        '    <source srcset="x.webp">',
+        '    <img src="x.png">',
+        "</picture>",
+      ].join("\n")),
+      true,
+    );
     assert.equal(isMediaOnly('<video src="clip.mp4"></video>'), true);
     assert.equal(isMediaOnly('<img src="x.png" />\nCaption text'), false);
     assert.equal(isMediaOnly("Some real description."), false);
     assert.equal(stripMediaTokens('<img src="x.png" />').trim(), "");
     assert.equal(stripMediaTokens('![alt](url "title")').trim(), "");
     assert.equal(stripMediaTokens('before ![alt](url) after').replace(/\s+/g, " ").trim(), "before after");
+
+    const fencedMediaExample = [
+      "```html",
+      "<video>No response</video>",
+      "```",
+    ].join("\n");
+    assert.equal(stripMediaTokens(fencedMediaExample), fencedMediaExample);
+    assert.equal(isMediaOnly(fencedMediaExample), false);
+
+    const protectedAroundMedia = [
+      "    ![before](url)",
+      "<video>",
+      '    <source src="clip.mp4">',
+      "</video>",
+      "    ![after](url)",
+    ].join("\n");
+    const strippedAroundMedia = stripMediaTokens(protectedAroundMedia);
+    assert.ok(strippedAroundMedia.includes("    ![before](url)"));
+    assert.ok(strippedAroundMedia.includes("    ![after](url)"));
+    assert.equal(strippedAroundMedia.includes("<video>"), false);
+    assert.equal(strippedAroundMedia.includes("<source"), false);
+    assert.equal(strippedAroundMedia.includes("\u0000"), false);
   });
 
   it("accepts a concise but actionable feature", () => {
@@ -652,6 +711,13 @@ describe("validateIssue - feature", () => {
     assert.equal(hasActionableReproductionDetail("```\n\n```"), false);
     assert.equal(hasActionableReproductionDetail("~~~\n\n~~~"), false);
     assert.equal(hasActionableReproductionDetail("```\nSIGSEGV at 0x0000\n```"), true);
+  });
+
+  it("bounds long non-matching reproduction path tokens", () => {
+    const startedAt = performance.now();
+    assert.equal(hasActionableReproductionDetail(`${"a".repeat(60_000)}.unknown`), false);
+    assert.ok(performance.now() - startedAt < 500, "actionable reproduction check took too long");
+    assert.equal(hasActionableReproductionDetail("CONFIG.JSON"), true);
   });
 
   it("rejects fenced placeholder-only examples", () => {
@@ -1313,6 +1379,8 @@ describe("normalisation", () => {
 
   it("strips HTML comments", () => {
     assert.equal(clean("Hello <!-- hidden --> world"), "Hello  world");
+    assert.equal(clean("<!--\nhidden issue text"), "");
+    assert.equal(clean("<!-- hidden -->\nVisible text"), "Visible text");
   });
 
   it("normalises punctuation and capitalisation", () => {
@@ -2024,5 +2092,52 @@ describe("detectAreaLabels", () => {
       labels: ["bug"],
     });
     assert.ok(labels.includes("streaming"), `got ${labels.join(",")}`);
+  });
+});
+
+describe("clean() respects fenced code (regression)", () => {
+  it("keeps section text that follows a comment-like literal in a fence", () => {
+    // A `<!--` inside a code sample is literal text under GFM. Stripping
+    // comments before fences let it run to EOF and swallow the rest of the
+    // section, so a valid issue was rejected as too vague to act on.
+    const goal = [
+      "```html",
+      "<!-- literal unclosed-comment example",
+      "```",
+      "",
+      "The provider catalog fails to load on startup and blocks routing.",
+    ].join("\n");
+
+    assert.ok(clean(goal).includes("provider catalog fails to load"));
+  });
+
+  it("still strips a real HTML comment outside code", () => {
+    assert.equal(clean("<!-- hidden -->").trim(), "");
+  });
+});
+
+describe("code-region scanning is GFM-correct and linear (regression)", () => {
+  it("honors a closing fence longer than its opener", () => {
+    // GFM allows the closing fence to be longer. Requiring an exact-length
+    // match left the block unterminated, so the comment inside it ran to EOF
+    // and swallowed the visible section below.
+    const goal = ["```html", "<!-- literal example", "````", "", "The catalog fails to load."].join("\n");
+    assert.ok(clean(goal).includes("The catalog fails to load."));
+  });
+
+  it("honors a code span containing a line ending", () => {
+    const goal = ["`first", "second`", "", "The catalog fails to load."].join("\n");
+    assert.ok(clean(goal).includes("The catalog fails to load."));
+  });
+
+  it("stays linear on adversarial input", () => {
+    // The previous masker combined a variable-length delimiter capture, a lazy
+    // whole-input scan and a backreference. A 60k-character body took ~10.5s
+    // inside an automation trust boundary anyone can post to.
+    const started = Date.now();
+    clean("```html\n" + "x".repeat(60000) + "\n");
+    clean("`a`".repeat(20000));
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 2000, `code-region scan took ${elapsed}ms; expected a linear scan`);
   });
 });

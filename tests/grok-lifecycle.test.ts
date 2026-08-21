@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { isServiceOwnershipError, ServiceOwnershipError } from "../src/service";
 
 const CLI_SOURCE = readFileSync(join(import.meta.dir, "..", "src", "cli", "index.ts"), "utf8");
+const DISPATCH_SOURCE = readFileSync(join(import.meta.dir, "..", "src", "cli", "dispatch.ts"), "utf8");
 const SERVICE_SOURCE = readFileSync(join(import.meta.dir, "..", "src", "service.ts"), "utf8");
 const MANAGEMENT_SOURCE = readFileSync(join(import.meta.dir, "..", "src", "server", "management-api.ts"), "utf8");
 const PROCESS_CONTROL_SOURCE = readFileSync(join(import.meta.dir, "..", "src", "lib", "process-control.ts"), "utf8");
@@ -76,6 +77,13 @@ describe("Grok fence lifecycle wiring", () => {
     const detailEchoes = stopFn.match(/const detail = err instanceof Error \? err\.message : String\(err\);/g);
     expect(detailEchoes).toHaveLength(2);
     expect(stopFn.match(/if \(detail\) console\.error\(`   \$\{detail\}`\);/g)).toHaveLength(2);
+
+    // A proxy ownership refusal means a foreign service still owns the running proxy, so the
+    // shared teardown must be skipped at both call sites, exactly like the service-manager path.
+    const ownershipRefusals = stopFn.match(/err instanceof ProxyOwnershipRefusedError[\s\S]{0,200}?ownershipBlocked = true;/g);
+    expect(ownershipRefusals).toHaveLength(2);
+    expect(stopFn.match(/Skipping shared teardown \(native Codex restore, Grok config\): the foreign proxy is still running\./g)).toHaveLength(2);
+    expect(PROCESS_CONTROL_SOURCE).toContain("throw new ProxyOwnershipRefusedError(");
   });
 
   test("handleStop returns its outcome while both restart surfaces share the in-place lifecycle", () => {
@@ -85,8 +93,8 @@ describe("Grok fence lifecycle wiring", () => {
     expect(stopFn).toContain("return !stopFailed");
     expect(stopFn).not.toContain("process.exit(1)");
 
-    const restartCase = sliceFn(CLI_SOURCE, 'case "restart"', 'case "health"');
-    expect(restartCase).toContain("await handleProxyRestart(handleRestartStartWhenStopped)");
+    const restartCase = sliceFn(DISPATCH_SOURCE, "restart: async", "health: async");
+    expect(restartCase).toContain("await deps.handleProxyRestart(deps.handleRestartStartWhenStopped)");
     const trayRestart = sliceFn(CLI_SOURCE, "async function handleTrayProxyRestart(", "async function restoreSharedClientStateAfterStop(");
     const restartHelper = sliceFn(CLI_SOURCE, "async function handleProxyRestart(", "async function handleTrayProxyRestart(");
     expect(trayRestart).toContain("await handleProxyRestart(() => handleTrayProxyStart(false))");
@@ -177,6 +185,6 @@ describe("POST /api/stop teardown", () => {
     const killAt = stopProxyFn.indexOf("killProxy(pid)");
     expect(refusedAt).toBeGreaterThan(-1);
     expect(refusedAt).toBeLessThan(killAt);
-    expect(stopProxyFn).toContain("throw new Error(");
+    expect(stopProxyFn).toContain("throw new ProxyOwnershipRefusedError(");
   });
 });

@@ -1,23 +1,46 @@
 ---
 title: Integrations
-description: Connect opencodex to OpenCode, Pi, Hermes, OpenClaw, Kimi Code and Gajae Code from the dashboard — one switch per client, with a backup taken before every write.
+description: Connect opencodex to OpenCode, Pi, OMP, Hermes, OpenClaw, Kimi Code, Gajae Code, DeepSeek Harness and MiniMax Code from the dashboard — one switch per client, with a backup taken before every write.
 ---
 
 The **Integrations** tab writes opencodex's provider block into a client's own config
-file, and removes it again. Six clients work this way, each with a switch:
+file, and removes it again. Nine clients work this way, each with a switch:
 
 | Client | Config file | Format | When the change takes effect | Credential |
 |---|---|---|---|---|
 | OpenCode | `~/.config/opencode/opencode.json` | JSON | next direct launch | `OPENCODEX_OPENCODE_API_KEY` |
-| Pi | `~/.pi/agent/models.json` | JSON | new sessions | `OPENCODEX_API_KEY` |
+| Pi | `~/.pi/agent/models.json` | JSON | new sessions | loopback placeholder |
+| OMP | `~/.omp/agent/models.yml` | YAML | after restarting OMP | `opencodex-loopback` placeholder |
 | Hermes | `~/.hermes/config.yaml` | YAML | new sessions | `OPENCODEX_HERMES_API_KEY` |
 | OpenClaw | `~/.openclaw/openclaw.json` | JSON5 | immediately, on a running gateway | `OPENCODEX_OPENCLAW_API_KEY` |
 | Kimi Code | `~/.kimi-code/config.toml` | TOML | on restart, or `/reload` | loopback placeholder |
 | Gajae Code | `~/.gjc/agent/models.yml` | YAML | new sessions, or when you open `/model` |`OPENCODEX_GAJAE_API_KEY` |
+| DeepSeek Harness (DSH) | `$DSH_HOME/settings.yaml` (default `~/.dsh/settings.yaml`) | YAML | hot reload | non-secret loopback bearer placeholder |
+| MiniMax Code | `~/.minimax/config.yaml` | YAML | new sessions, or after opening the model picker | loopback placeholder |
 
-Paths honor each client's own environment override where it has one, so a relocated
-`HERMES_HOME`, `KIMI_CODE_HOME` or `XDG_CONFIG_HOME` is followed rather than guessed
-at. The table lists each client's default; an override always wins.
+Managed DSH support has a compatibility floor of **DSH 0.1.0-rc.6**. OpenCodex owns only
+`llm-pi-ai.providers.opencodex`; Apply and Refresh replace that fragment, Disable removes only that
+fragment, and Restore puts back a recorded snapshot. DSH hot reloads provider changes. These
+operations do not change the user's default model or the native `deepseek-official` provider.
+The managed DSH integration is currently loopback-only and never writes a real credential.
+
+MiniMax Code follows `MINIMAX_DATA_DIR`, then `MAVIS_DATA_DIR`, before falling
+back to `~/.minimax`. Its managed block owns only `custom_provider.opencodex`.
+It does not change `defaultModel`, the selected MiniMax credential source, or
+the user's MiniMax login. Choose a `custom_provider:opencodex/<provider/model>`
+entry in MCode after connecting it.
+
+Paths honor each client's own environment override where it has one. For OMP,
+`OMP_PROFILE` wins over `PI_PROFILE` by presence, even when explicitly empty. A named profile
+uses `PI_CONFIG_DIR` as a directory name relative to the user's home and ignores `PI_CODING_AGENT_DIR`; without a named profile,
+`PI_CODING_AGENT_DIR` wins. OMP supports provider-level headers, but this initial integration
+is deliberately loopback-only; remote `x-opencodex-api-key` wiring is deferred. Relocated
+`HERMES_HOME`, `KIMI_CODE_HOME`, and `XDG_CONFIG_HOME` paths are likewise followed rather than
+guessed at. The table lists each client's default.
+
+For native OpenAI models, the generated OMP block selects its model-level Responses API, preserving
+image input and reasoning-effort controls. Routed models retain the provider's Chat Completions
+dialect so their existing adapters remain compatible.
 
 OpenClaw has several, and they do different jobs. `OPENCLAW_CONFIG_PATH` selects the
 file; `OPENCLAW_STATE_DIR`, `OPENCLAW_PROFILE` and `OPENCLAW_HOME` select the state
@@ -56,16 +79,31 @@ always recoverable:
   and their history rows read **Backup expired**.
 
 Disable removes only the entries opencodex recorded as its own. If your file changed
-after we wrote it, the switch locks and disable refuses rather than guessing which
-edits were yours.
+after we wrote it, what happens depends on whether our own entries are still intact
+and on the file's format. For strict-JSON configs (OpenCode, Pi), an edit **next to**
+our block — adding an MCP server, a provider of your own — shows as **Update needed**:
+refreshing merges around your entries and keeps them, though formatting may be
+normalized. The exception is something JSON cannot rewrite exactly — a non-finite
+number like `1e999`, a number a rewrite would round (a very large integer, or one
+so small it collapses to zero), `-0`, the same key written twice in one object, or nesting deeper
+than 1000 levels — which locks the switch instead, so nothing is silently changed or dropped.
+**OMP** is unaffected by sibling edits too, for a different reason: its writer
+patches only its own `providers.opencodex` range byte-wise, so the rest of the
+file is never rewritten. For the remaining formats that can carry comments
+(Hermes, OpenClaw, Kimi Code, Gajae Code, MiniMax Code — YAML, JSON5 and TOML
+written as whole documents), or
+whenever our own entries were edited, the switch locks and disable refuses rather
+than guessing which edits were yours.
 
 ## What to expect, honestly
 
-**Formatting is not preserved.** Applying parses your config and writes it back out, so
-every format may be reformatted, and YAML, JSON5 and TOML additionally lose their
-comments. Your settings survive the round trip and the bytes change. If you need the
-file exactly as it was, use Restore rather than Disable: the snapshot is a verbatim
-copy.
+**Formatting is generally not preserved.** Applying parses a config and writes it back
+out, so JSON, JSON5 and TOML may be reformatted and comments in JSON5 or TOML are lost.
+OMP and DSH are the exceptions: their YAML writers patch only `providers.opencodex` and
+`llm-pi-ai.providers.opencodex`, respectively, preserving
+unrelated provider comments and formatting byte-for-byte. If that exact source range
+cannot be identified safely, the operation refuses instead. For other clients, use
+Restore when you need the previous file bytes: the snapshot is a verbatim copy.
 
 **If a value cannot be rewritten faithfully, the switch refuses instead.** The round
 trip covers the value kinds these formats use in practice, and where it does not —
@@ -75,12 +113,16 @@ changed value and calling it success. You will see the file named and nothing on
 disk will have moved. Editing that file by hand still works; it is only our
 automatic rewrite that declines.
 
-**Pi, Kimi Code and Gajae Code only work against a loopback bind.** None of their config
-schemas has a place for the `x-opencodex-api-key` header that a non-loopback bind
-requires, so a generated config would simply be rejected — and writing one by hand does
-not help, because there is nowhere in the file to put the header either. Reaching a
-remote opencodex from these clients is not supported directly; give them loopback access
-instead, through an SSH tunnel or a local forwarder that adds the header.
+**Pi, Kimi Code, Gajae Code, MiniMax Code and the managed DSH integration only work against a loopback bind.**
+The first four have no config field for the `x-opencodex-api-key` header a non-loopback bind
+requires. DSH has a generic headers map, but rc.6 does not document that dedicated admission
+header as a supported integration contract, so the managed writer fails closed instead of
+guessing. Give them loopback access through an SSH tunnel or a local forwarder that adds the header.
+
+**The generated OMP integration is also deliberately loopback-only.** OMP does support
+provider-level headers, but this initial integration does not emit remote
+`x-opencodex-api-key` credential wiring. Manual remote OMP configuration is outside the
+managed integration for now.
 
 **Kimi Code cannot hold an environment reference,** so its config carries an
 `opencodex-loopback` placeholder rather than a key. No real credential is ever written
@@ -102,6 +144,29 @@ ocx integration client disable --client hermes
 ocx integration client history --client hermes
 ocx integration client restore --op <opId> [--confirm-drift]
 ```
+
+For MiniMax Code, connect the provider once and launch through the checked wrapper:
+
+```bash
+ocx integration client enable --client mcode
+ocx mcode
+```
+
+The separate MiniMax platform CLI (`mmx`) is not a file-toggle integration. Its text
+commands use MiniMax's Anthropic-compatible endpoint, so OpenCodex provides a
+credential-isolated, loopback-only launcher:
+
+```bash
+ocx mmx text chat --model anthropic/claude-opus-5 --message "Hello"
+ocx mmx text repl --model openai/gpt-5.6-sol
+```
+
+Only `mmx text chat` and `mmx text repl` are proxied. Run plain `mmx` for
+MiniMax-native image, video, speech, music, vision, search, quota, auth, config, file
+and update commands. The wrapper uses a temporary config containing only a non-secret
+loopback placeholder; it never loads your `~/.mmx` OAuth or API-key credentials, and
+it refuses `--api-key`, `--base-url` and `--region` overrides. See
+[MiniMax clients](/guides/minimax/) for the complete workflow and limits.
 
 `--confirm-drift` is never assumed. If the file changed after the operation you are
 restoring, the command refuses and tells you, because replacing your newer edits is your

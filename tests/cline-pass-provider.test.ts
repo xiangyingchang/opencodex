@@ -2,12 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { createOpenAIChatAdapter } from "../src/adapters/openai-chat";
 import { createTranslatorBudget } from "../src/lib/translator-budget";
 import { KEY_LOGIN_PROVIDERS } from "../src/oauth/key-providers";
-import { providerConfigSeed } from "../src/providers/derive";
+import { enrichProviderFromRegistry, providerConfigSeed } from "../src/providers/derive";
 import { PROVIDER_REGISTRY } from "../src/providers/registry";
 import { routeModel } from "../src/router";
 import type { OcxConfig, OcxParsedRequest } from "../src/types";
 
 const OFFICIAL_CLINE_PASS_MODELS = [
+  "cline-pass/glm-5.3",
   "cline-pass/glm-5.2",
   "cline-pass/kimi-k3",
   "cline-pass/kimi-k2.7-code",
@@ -17,6 +18,7 @@ const OFFICIAL_CLINE_PASS_MODELS = [
   "cline-pass/mimo-v2.5",
   "cline-pass/mimo-v2.5-pro",
   "cline-pass/minimax-m3",
+  "cline-pass/qwen3.8-max",
   "cline-pass/qwen3.7-max",
   "cline-pass/qwen3.7-plus",
 ];
@@ -64,15 +66,19 @@ describe("ClinePass provider", () => {
     expect(entry?.models).toEqual(OFFICIAL_CLINE_PASS_MODELS);
     expect(entry?.models).toContain(entry?.defaultModel);
     expect(entry?.liveModels).toBeUndefined();
-    expect(entry?.reasoningEfforts).toEqual(["low"]);
+    expect(entry?.reasoningEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(entry?.modelReasoningEfforts).toBeUndefined();
     expect(entry?.modelMaxInputTokens).toBeUndefined();
     expect(entry?.noVisionModels).toEqual([
+      "cline-pass/glm-5.3",
       "cline-pass/glm-5.2",
       "cline-pass/deepseek-v4-pro",
       "cline-pass/deepseek-v4-flash",
       "cline-pass/mimo-v2.5-pro",
       "cline-pass/qwen3.7-max",
     ]);
+    expect(entry?.modelContextWindows?.["cline-pass/qwen3.8-max"]).toBeUndefined();
+    expect(entry?.modelInputModalities?.["cline-pass/qwen3.8-max"]).toBeUndefined();
     expect(entry?.modelInputModalities?.["cline-pass/kimi-k3"]).toEqual(["text", "image"]);
     expect(entry?.modelInputModalities?.["cline-pass/glm-5.2"]).toEqual(["text"]);
     expect(KEY_LOGIN_PROVIDERS["cline-pass"]?.models).toEqual(OFFICIAL_CLINE_PASS_MODELS);
@@ -80,6 +86,19 @@ describe("ClinePass provider", () => {
     const seed = providerConfigSeed(entry);
     expect(seed).toMatchObject({ reasoningWireFormat: "gateway-object" });
     expect(seed).not.toHaveProperty("preserveCustomDestination");
+  });
+
+  test("catalog enrichment repairs the low-only ladder persisted by older ClinePass presets", () => {
+    const stale = providerConfigSeed(registryEntry());
+    stale.reasoningEfforts = ["low"];
+
+    enrichProviderFromRegistry("cline-pass", stale);
+
+    expect(stale.reasoningEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+
+    const custom = { ...stale, baseUrl: "https://custom.example/v1", reasoningEfforts: ["low"] };
+    enrichProviderFromRegistry("cline-pass", custom);
+    expect(custom.reasoningEfforts).toEqual(["low"]);
   });
 
   test("routing keeps the full upstream model slug and emits the Cline gateway reasoning object", () => {
@@ -102,12 +121,12 @@ describe("ClinePass provider", () => {
     expect(route.modelId).toBe("cline-pass/kimi-k3");
     expect(route.provider).toMatchObject({ reasoningWireFormat: "gateway-object" });
     expect(body.model).toBe("cline-pass/kimi-k3");
-    expect(body.reasoning).toEqual({ enabled: true, effort: "low" });
+    expect(body.reasoning).toEqual({ enabled: true, effort: "high" });
     expect(body).not.toHaveProperty("reasoning_effort");
     expect(request.reasoningLog).toEqual({
-      effectiveEffort: "low",
+      effectiveEffort: "high",
       wireField: "reasoning.effort",
-      wireValue: "low",
+      wireValue: "high",
     });
   });
 

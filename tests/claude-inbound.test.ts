@@ -96,7 +96,7 @@ describe("claude inbound translation", () => {
     expect((anthropicToResponsesBody({ ...base, thinking: { type: "adaptive" } }) as any).reasoning).toEqual({ summary: "auto" });
     // "disabled" and omitted must NOT collapse to the same state: for a model that thinks by
     // default, omission means thinking is ON and shares the caller's max_tokens (#545).
-    expect((anthropicToResponsesBody({ ...base, thinking: { type: "disabled" } }) as any).reasoning).toEqual({ effort: "none", summary: "none" }); // justified: sibling assertions in this test use the same cast
+    expect((anthropicToResponsesBody({ ...base, thinking: { type: "disabled" } }) as any).reasoning).toEqual({ effort: "none" }); // justified: sibling assertions in this test use the same cast
     expect((anthropicToResponsesBody(base) as any).reasoning).toBeUndefined();
     expect(effortForThinkingBudget(1024)).toBe("low");
     expect(effortForThinkingBudget(8192)).toBe("medium");
@@ -134,11 +134,56 @@ describe("claude inbound translation", () => {
     // rather than left to think anyway (#545).
     expect(reasoningOf(anthropicToResponsesBody({
       ...base, thinking: { type: "disabled" }, output_config: { effort: "high" },
-    }))).toEqual({ effort: "none", summary: "none" });
+    }))).toEqual({ effort: "none" });
     // unknown effort strings are dropped so downstream defaults win
     expect(reasoningOf(anthropicToResponsesBody({
       ...base, thinking: { type: "adaptive" }, output_config: { effort: "turbo" },
     }))).toEqual({ summary: "auto" });
+  });
+
+  test("structured output maps output_config.format to text.format", () => {
+    const schema = {
+      type: "object",
+      properties: { answer: { type: "string" } },
+      required: ["answer"],
+      additionalProperties: false,
+    };
+    const body = anthropicToResponsesBody({
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+      output_config: { format: { type: "json_schema", schema } },
+    });
+
+    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema } });
+    expect(parseRequest(body).options.textFormat).toEqual({ type: "json_schema", name: "response", schema });
+  });
+
+  test("structured output rejects unsupported schemas and preserves root references", () => {
+    const base = {
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+    };
+    const invalid = anthropicToResponsesBody({
+      ...base,
+      output_config: {
+        format: { type: "json_schema", schema: { description: "answer" } },
+      },
+    });
+    const refSchema = {
+      $defs: { answer: { type: "object", properties: { value: { type: "string" } } } },
+      $ref: "#/$defs/answer",
+    };
+    const referenced = anthropicToResponsesBody({
+      ...base,
+      output_config: { format: { type: "json_schema", schema: refSchema } },
+    });
+
+    expect(invalid.text).toBeUndefined();
+    expect(referenced.text).toEqual({
+      format: { type: "json_schema", name: "response", schema: refSchema },
+    });
   });
 
   test("tool_choice any/tool/none", () => {
@@ -147,6 +192,23 @@ describe("claude inbound translation", () => {
     expect((anthropicToResponsesBody({ ...base, tool_choice: { type: "none" } }) as any).tool_choice).toBe("none");
     expect((anthropicToResponsesBody({ ...base, tool_choice: { type: "tool", name: "Read" } }) as any).tool_choice)
       .toEqual({ type: "function", name: "Read" });
+  });
+
+  test("forced Claude WebSearch stays a hosted Responses tool choice", () => {
+    const body = anthropicToResponsesBody({
+      model: "gpt-5.6-luna",
+      max_tokens: 10,
+      messages: [{ role: "user", content: "search" }],
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      tool_choice: { type: "tool", name: "web_search" },
+      thinking: { type: "disabled" },
+    }) as Record<string, unknown>;
+
+    expect(body.tools).toEqual([{ type: "web_search" }]);
+    expect(body.tool_choice).toEqual({ type: "web_search" });
+    expect(body.reasoning).toEqual({ effort: "none" });
+    expect(() => responsesRequestSchema.parse(body)).not.toThrow();
+    expect(() => parseRequest(body)).not.toThrow();
   });
 
   test("system role messages fold into instructions (real Claude Code sends them; native backend rejects system items)", () => {
@@ -221,6 +283,44 @@ describe("claude inbound translation", () => {
     expect(resolveInboundModel("claude-opus-4-20250514", cc)).toBe("xai/grok-4");
     expect(resolveInboundModel("gpt-5.5", cc)).toBe("gpt-5.5");
     expect(resolveInboundModel("anything", undefined)).toBe("anything");
+  });
+
+  test("Claude Code Auto Mode classifier routing uses only operator-declared targets (#1697)", () => {
+    // A bare classifier check carries no provider, so without this it falls through to
+    // defaultProvider -- which may not speak Anthropic at all. What it must NOT do is pick a
+    // provider nobody chose.
+
+    // 1. Explicit classifierModel is used.
+    const ccExplicit = { model: "RelayA/claude-fable-5", classifierModel: "RelayB/claude-opus-5" };
+    expect(resolveInboundModel("claude-opus-5", ccExplicit)).toBe("RelayB/claude-opus-5");
+    expect(resolveInboundModel("claude-opus-5-20250514", ccExplicit)).toBe("RelayB/claude-opus-5");
+
+    // 2. modelMap outranks it: an explicit per-model mapping is the operator's most specific say.
+    const ccWithModelMap = {
+      model: "RelayA/claude-fable-5",
+      classifierModel: "RelayB/claude-opus-5",
+      modelMap: { "claude-opus-5": "Custom/my-opus-5" },
+    };
+    expect(resolveInboundModel("claude-opus-5", ccWithModelMap)).toBe("Custom/my-opus-5");
+
+    // 3. Ordered fallbacks are used when no classifierModel is set.
+    const ccWithFallbacks = { classifierFallbacks: ["RelayC/claude-opus-5", "RelayD/claude-opus-5"] };
+    expect(resolveInboundModel("claude-opus-5", ccWithFallbacks)).toBe("RelayC/claude-opus-5");
+
+    // 4. NO affinity inferred from cc.model. That value is the injected/default config slot, not
+    // the provider the live session actually selected, so it goes stale the moment the user
+    // changes the model picker -- and acting on it would silently move a classifier turn onto a
+    // provider with its own privacy and billing consequences.
+    expect(resolveInboundModel("claude-opus-5", { model: "RelayA/claude-fable-5" })).toBe("claude-opus-5");
+    expect(resolveInboundModel("claude-opus-5", { model: "claude-ocx-RelayA--claude-fable-5" })).toBe("claude-opus-5");
+    expect(resolveInboundModel("claude-opus-5", { model: "native/claude-opus-5" })).toBe("claude-opus-5");
+
+    // 5. Malformed operator config is ignored rather than half-applied.
+    expect(resolveInboundModel("claude-opus-5", { classifierModel: "   " })).toBe("claude-opus-5");
+    expect(resolveInboundModel("claude-opus-5", { classifierFallbacks: [] })).toBe("claude-opus-5");
+
+    // 6. A non-classifier model is untouched by any of this.
+    expect(resolveInboundModel("claude-fable-5", ccExplicit)).toBe("claude-fable-5");
   });
 
   test("error cases: no model, empty messages, bad role, bad tool_result", () => {

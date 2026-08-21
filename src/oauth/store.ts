@@ -10,10 +10,11 @@
  * Exceptions:
  * - `chatgpt` stays single-slot (always replaced): codex-auth-api uses it as a scratch slot
  *   for Codex pool logins, which have their own ledger (codex-accounts.json).
- * - Credentials without identity (no accountId/email) replace the active slot
- *   instead of appending: their refresh tokens rotate, so a derived id would duplicate the
- *   same human on every re-login. Kimi extracts JWT `user_id`/`sub` as accountId; Cursor
- *   extracts JWT `sub` — both append distinct accounts under multiauth.
+ * - Credentials without identity (no accountId/email) replace the active slot on a normal
+ *   login: their refresh tokens rotate, so a derived id would duplicate the same human on every
+ *   re-login. An explicit add-account login instead preserves the prior slot and appends a
+ *   distinct one. Kimi extracts JWT `user_id`/`sub` as accountId; Cursor extracts JWT `sub` —
+ *   both append distinct identified accounts under multiauth.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -286,15 +287,29 @@ function normalizeCredential(cred: unknown): OAuthCredentials | null {
 }
 
 /**
- * Stable short account id. MUST be deterministic for a given credential: legacy
- * single-credential stores are re-normalized on EVERY load without being persisted,
+ * Stable collision-resistant account id. MUST be deterministic for a given credential:
+ * legacy single-credential stores are re-normalized on EVERY load without being persisted,
  * so a time-salted id would differ between two loads (getAccountSet vs
  * getAccountCredential), surfacing as a spurious OAuthLoginRequiredError and making
  * refresh persists silently miss the account (rotated refresh token lost).
+ *
+ * Keep 128 bits of SHA-256 rather than the historical 32-bit prefix. Existing persisted
+ * account ids are read as-is; only newly-derived ids and legacy normalization use this width.
  */
 function newAccountId(cred: OAuthCredentials): string {
   const identity = cred.accountId ?? cred.email ?? cred.refresh;
-  return createHash("sha256").update(identity).digest("hex").slice(0, 8);
+  return createHash("sha256").update(identity).digest("hex").slice(0, 32);
+}
+
+/** Allocate a persisted slot id without reusing any existing account's ownership key. */
+function distinctAccountId(cred: OAuthCredentials, accounts: readonly ProviderAccount[]): string {
+  const base = newAccountId(cred);
+  const occupied = new Set(accounts.map(account => account.id));
+  if (!occupied.has(base)) return base;
+  for (let suffix = 1; ; suffix += 1) {
+    const candidate = `${base}-${suffix}`;
+    if (!occupied.has(candidate)) return candidate;
+  }
 }
 
 function normalizeAccount(value: unknown): ProviderAccount | null {
@@ -450,10 +465,11 @@ function serializeMutation<T>(work: () => Promise<T>, retainedValues: readonly u
   drainOAuthMutations();
   return result;
 }
-export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValues: readonly unknown[] = [], options?: { waitMs?: number }):Promise<T>{return serializeMutation(async()=>{const guard=await createOAuthFileLock({path:getAuthStoreLockPath(),staleAfterMs:30000}).acquire();try{
+export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValues: readonly unknown[] = [], options?: { waitMs?: number; assertBeforePersist?: () => void }):Promise<T>{return serializeMutation(async()=>{const guard=await createOAuthFileLock({path:getAuthStoreLockPath(),staleAfterMs:30000}).acquire();try{
     const { store, hadLegacy } = loadAuthStoreInternal();
     if (hadLegacy) backupLegacyOnce();
     const result = await fn(store);
+    options?.assertBeforePersist?.();
     persist(store);
     return result;
   }finally{guard.release();}}, retainedValues, options?.waitMs);
@@ -470,12 +486,13 @@ export function getCredential(provider: string): OAuthCredentials | null {
  * Persist a credential as the ACTIVE account. Identity-matching (accountId ?? email) upserts
  * the same human's slot; a new identity appends a new account. Credentials without identity
  * (rotating refresh tokens would fabricate duplicates) and single-slot providers replace the
- * active slot / whole set instead.
+ * active slot / whole set instead. An explicit add-account login can preserve the legacy slot;
+ * an identity-less credential then gets its deterministic refresh-derived account id.
  */
 export async function saveCredential(
   provider: string,
   cred: OAuthCredentials,
-  opts: { preserveIdentityless?: boolean } = {},
+  opts: { preserveIdentityless?: boolean; assertBeforePersist?: () => void } = {},
 ): Promise<void> {
   const safe = normalizeCredential(cred);
   if (!safe) return;
@@ -505,21 +522,72 @@ export async function saveCredential(
         delete active.needsReauth;
         return;
       }
-      const id = newAccountId(safe);
+      const id = distinctAccountId(safe, set.accounts);
       set.accounts.push({ id, credential: safe, addedAt: Date.now() });
       set.activeAccountId = id;
       return;
     }
-    // No identity: replace the active slot in place (single-account semantics).
+    if (opts.preserveIdentityless) {
+      const id = distinctAccountId(safe, set.accounts);
+      set.accounts.push({ id, credential: safe, addedAt: Date.now() });
+      set.activeAccountId = id;
+      return;
+    }
+    // No identity during a normal login: replace the active slot in place.
     const active = set.accounts.find(a => a.id === set.activeAccountId);
     if (active) {
       active.credential = safe;
       delete active.needsReauth;
     } else {
-      const id = newAccountId(safe);
+      const id = distinctAccountId(safe, set.accounts);
       set.accounts.push({ id, credential: safe, addedAt: Date.now() });
       set.activeAccountId = id;
     }
+  }, [provider, safe], { assertBeforePersist: opts.assertBeforePersist });
+}
+
+/**
+ * Atomically insert or replace an identity-bearing credential and report the disposition.
+ * Importers use this instead of a read-then-save pair so duplicate detection and persistence
+ * happen inside the existing serialized temp-then-rename store mutation.
+ */
+export async function upsertCredentialByIdentity(
+  provider: string,
+  cred: OAuthCredentials,
+): Promise<"inserted" | "updated"> {
+  const safe = normalizeCredential(cred);
+  if (!safe || (!safe.accountId && !safe.email)) {
+    throw new Error("Refusing to persist OAuth credential without verified identity");
+  }
+  return await mutateStore(store => {
+    const set = store[provider];
+    const matchesEmailOnly = (account: ProviderAccount): boolean => {
+      if (account.credential.accountId) return false;
+      return Boolean(
+        safe.email
+        && account.credential.email
+        && account.credential.email.toLowerCase() === safe.email.toLowerCase(),
+      );
+    };
+    const existing = safe.accountId
+      ? set?.accounts.find(account => account.credential.accountId === safe.accountId)
+        ?? set?.accounts.find(matchesEmailOnly)
+      : set?.accounts.find(matchesEmailOnly);
+    if (existing && set) {
+      existing.credential = safe;
+      delete existing.needsReauth;
+      set.activeAccountId ??= existing.id;
+      return "updated";
+    }
+    const id = newAccountId(safe);
+    const account: ProviderAccount = { id, credential: safe, addedAt: Date.now() };
+    if (set) {
+      set.accounts.push(account);
+      set.activeAccountId ??= id;
+    } else {
+      store[provider] = { activeAccountId: id, accounts: [account] };
+    }
+    return "inserted";
   }, [provider, safe]);
 }
 
@@ -565,7 +633,12 @@ export function getAccountCredential(provider: string, accountId: string): OAuth
 }
 
 /** Persist a refreshed credential for a SPECIFIC account without touching activeAccountId. */
-export async function saveAccountCredential(provider: string, accountId: string, cred: OAuthCredentials): Promise<void> {
+export async function saveAccountCredential(
+  provider: string,
+  accountId: string,
+  cred: OAuthCredentials,
+  opts: { assertBeforePersist?: () => void } = {},
+): Promise<void> {
   const safe = normalizeCredential(cred);
   if (!safe) return;
   await mutateStore(store => {
@@ -573,7 +646,7 @@ export async function saveAccountCredential(provider: string, accountId: string,
     if (!account) return;
     account.credential = safe;
     delete account.needsReauth;
-  }, [provider, accountId, safe]);
+  }, [provider, accountId, safe], { assertBeforePersist: opts.assertBeforePersist });
 }
 
 export async function setActiveAccount(provider: string, accountId: string): Promise<boolean> {

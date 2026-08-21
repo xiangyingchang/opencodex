@@ -21,9 +21,9 @@ function directDependencies(
   options?: { privateNetwork?: boolean; address?: string },
 ): {
   dependencies: ProviderOutboundDependencies;
-  captured: { address?: string; rejectUnauthorized?: boolean; authorization?: string };
+  captured: { address?: string; rejectUnauthorized?: boolean; authorization?: string; body?: string };
 } {
-  const captured: { address?: string; rejectUnauthorized?: boolean; authorization?: string } = {};
+  const captured: { address?: string; rejectUnauthorized?: boolean; authorization?: string; body?: string } = {};
   const address = options?.address ?? "93.184.216.34";
   return {
     captured,
@@ -37,6 +37,13 @@ function directDependencies(
         captured.address = pinned.address;
         captured.rejectUnauthorized = requestOptions?.rejectUnauthorized;
         captured.authorization = new Headers(requestOptions?.headers).get("authorization") ?? undefined;
+        return response;
+      }),
+      pinnedPost: mock(async (_url, pinned, body, _signal, requestOptions) => {
+        captured.address = pinned.address;
+        captured.rejectUnauthorized = requestOptions?.rejectUnauthorized;
+        captured.authorization = new Headers(requestOptions?.headers).get("authorization") ?? undefined;
+        captured.body = body;
         return response;
       }),
     },
@@ -88,6 +95,113 @@ describe("provider outbound GET transport", () => {
       dependencies,
     )).rejects.toThrow(/add ollama\.lan to NO_PROXY/);
     expect(captured.address).toBeUndefined();
+  });
+
+  test("Clash fake-IP behind a configured proxy uses hostname CONNECT instead of NO_PROXY (#1748)", async () => {
+    const proxyUrl = "http://127.0.0.1:9";
+    process.env.HTTPS_PROXY = proxyUrl;
+    process.env.https_proxy = proxyUrl;
+    process.env.NO_PROXY = "localhost,127.0.0.1,::1,[::1]";
+    process.env.no_proxy = "localhost,127.0.0.1,::1,[::1]";
+    const originalFetch = globalThis.fetch;
+    const fetchMock = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      expect(String(url)).toBe("https://www.packyapi.com/v1/models");
+      expect(init?.redirect).toBe("manual");
+      return new Response('{"data":[{"id":"gpt-5.5"}]}', {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    globalThis.fetch = fetchMock;
+    try {
+      const { providerOutboundGet } = await import("../src/lib/provider-outbound");
+      const resolveOptions: { allowBenchmarkAddresses?: boolean }[] = [];
+      const { dependencies, captured } = directDependencies(new Response(null, { status: 500 }));
+      const innerResolve = dependencies.resolveAddresses!;
+      dependencies.resolveAddresses = mock(async (url: string, options?: { allowBenchmarkAddresses?: boolean }) => {
+        resolveOptions.push({ allowBenchmarkAddresses: options?.allowBenchmarkAddresses });
+        await innerResolve(url, options);
+        // What the real resolver returns for a fake-IP-only answer under the
+        // outbound benchmark opt-in: accepted, and NOT marked private.
+        return {
+          hostname: "www.packyapi.com",
+          addresses: [{ address: "198.18.56.214", family: 4 }],
+          privateNetwork: false,
+        };
+      }) as ProviderOutboundDependencies["resolveAddresses"];
+
+      const response = await providerOutboundGet(
+        "packy",
+        { baseUrl: "https://www.packyapi.com/v1" },
+        "https://www.packyapi.com/v1/models",
+        {},
+        dependencies,
+      );
+
+      expect(await response.json()).toEqual({ data: [{ id: "gpt-5.5" }] });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(captured.address).toBeUndefined();
+      // The wrapper enables the benchmark opt-in only because a proxy is configured.
+      expect(resolveOptions).toEqual([{ allowBenchmarkAddresses: true }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("Clash fake-IP without a configured proxy is not granted the benchmark opt-in (#1748)", async () => {
+    for (const key of proxyKeys) delete process.env[key];
+    const { providerOutboundGet } = await import("../src/lib/provider-outbound");
+    const resolveOptions: { allowBenchmarkAddresses?: boolean }[] = [];
+    const { dependencies, captured } = directDependencies(new Response(null, { status: 500 }));
+    dependencies.resolveAddresses = mock(async (_url: string, options?: { allowBenchmarkAddresses?: boolean }) => {
+      resolveOptions.push({ allowBenchmarkAddresses: options?.allowBenchmarkAddresses });
+      // What the real resolver does without the opt-in: benchmark answers reject.
+      throw new Error("provider URL hostname www.packyapi.com resolves to benchmark address (198.18.56.214)");
+    }) as ProviderOutboundDependencies["resolveAddresses"];
+
+    await expect(providerOutboundGet(
+      "packy",
+      { baseUrl: "https://www.packyapi.com/v1" },
+      "https://www.packyapi.com/v1/models",
+      {},
+      dependencies,
+    )).rejects.toThrow(/benchmark address/);
+    expect(captured.address).toBeUndefined();
+    expect(resolveOptions).toEqual([{ allowBenchmarkAddresses: false }]);
+  });
+
+  test("NO_PROXY-matched hosts do not receive the fake-IP benchmark exception", async () => {
+    const proxyUrl = "http://127.0.0.1:9";
+    process.env.HTTPS_PROXY = proxyUrl;
+    process.env.https_proxy = proxyUrl;
+    process.env.NO_PROXY = "www.packyapi.com";
+    process.env.no_proxy = "www.packyapi.com";
+    const originalFetch = globalThis.fetch;
+    const fetchMock = mock(async () => new Response("unexpected", { status: 500 })) as typeof fetch;
+    globalThis.fetch = fetchMock;
+    try {
+      const { providerOutboundGet } = await import("../src/lib/provider-outbound");
+      const resolveOptions: { allowBenchmarkAddresses?: boolean }[] = [];
+      const { dependencies, captured } = directDependencies(new Response(null, { status: 500 }));
+      dependencies.resolveAddresses = mock(async (_url: string, options?: { allowBenchmarkAddresses?: boolean }) => {
+        resolveOptions.push({ allowBenchmarkAddresses: options?.allowBenchmarkAddresses });
+        throw new Error("provider URL hostname www.packyapi.com resolves to benchmark address (198.18.56.214)");
+      }) as ProviderOutboundDependencies["resolveAddresses"];
+
+      await expect(providerOutboundGet(
+        "packy",
+        { baseUrl: "https://www.packyapi.com/v1" },
+        "https://www.packyapi.com/v1/models",
+        {},
+        dependencies,
+      )).rejects.toThrow(/benchmark address/);
+
+      expect(resolveOptions).toEqual([{ allowBenchmarkAddresses: false }]);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(captured.address).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test("built-in ollama admits loopback discovery without an explicit allowPrivateNetwork flag (#758)", async () => {
@@ -237,4 +351,72 @@ describe("provider outbound GET transport", () => {
       rmSync(childHome, { recursive: true, force: true });
     }
   }, 15_000);
+});
+
+describe("provider outbound POST transport", () => {
+  test("direct HTTPS posts only to the validated address with its credential and body", async () => {
+    for (const key of proxyKeys) delete process.env[key];
+    const { providerOutboundPost } = await import("../src/lib/provider-outbound");
+    const { dependencies, captured } = directDependencies(new Response('{"models":{}}', {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    const body = JSON.stringify({ project: "test-project" });
+
+    const response = await providerOutboundPost(
+      "google-antigravity",
+      { baseUrl: "https://provider.example" },
+      "https://provider.example/v1internal:fetchAvailableModels",
+      { headers: { authorization: "Bearer test-token" }, body },
+      dependencies,
+    );
+
+    expect(await response.json()).toEqual({ models: {} });
+    expect(captured).toEqual({
+      address: "93.184.216.34",
+      rejectUnauthorized: true,
+      authorization: "Bearer test-token",
+      body,
+    });
+  });
+
+  test("blocks an unsafe POST destination before invoking a caller-owned executor", async () => {
+    const { providerOutboundPost, ProviderOutboundPolicyError } = await import("../src/lib/provider-outbound");
+    let calls = 0;
+    const provider = {
+      baseUrl: "https://provider.example",
+      fetch: (async () => {
+        calls += 1;
+        return new Response("{}");
+      }) as typeof fetch,
+    };
+
+    await expect(providerOutboundPost(
+      "google-antigravity",
+      provider,
+      "https://169.254.169.254/v1internal:fetchAvailableModels",
+      { headers: { authorization: "Bearer test-token" }, body: '{"project":"test-project"}' },
+    )).rejects.toThrow(ProviderOutboundPolicyError);
+    expect(calls).toBe(0);
+  });
+
+  test("requires HTTPS before invoking a caller-owned executor", async () => {
+    const { providerOutboundPost, ProviderOutboundPolicyError } = await import("../src/lib/provider-outbound");
+    let calls = 0;
+    const provider = {
+      baseUrl: "https://provider.example",
+      fetch: (async () => {
+        calls += 1;
+        return new Response("{}");
+      }) as typeof fetch,
+    };
+
+    await expect(providerOutboundPost(
+      "google-antigravity",
+      provider,
+      "http://93.184.216.34/v1internal:fetchAvailableModels",
+      { headers: { authorization: "Bearer test-token" }, body: '{"project":"test-project"}' },
+    )).rejects.toThrow(ProviderOutboundPolicyError);
+    expect(calls).toBe(0);
+  });
 });

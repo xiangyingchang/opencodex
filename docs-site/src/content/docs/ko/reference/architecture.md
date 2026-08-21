@@ -101,9 +101,11 @@ HTTP 경계는 `server/index.ts`가 맡고, Responses 데이터 플레인은 `se
 | `error` | `response.failed` (with `last_error`) |
 
 브리지는 **하트비트 킵얼라이브**(RC3)도 실행합니다. 업스트림에서 데이터가 오지 않을 때 2초마다
-파서가 무시하는 `response.heartbeat` SSE 이벤트를 보내 Codex의 유휴 타이머를 다시 시작합니다.
-기본 **stall deadline**은 300초(`stallTimeoutSec`)입니다. 이 시간을 넘기면 업스트림을 중단하고
-이유가 `upstream_stall_timeout`인 `response.incomplete`를 내보내 연결이 끝없이 매달리지 않게 합니다.
+파서가 무시하는 `: opencodex heartbeat` SSE 주석 줄을 보내 Codex의 유휴 타이머를 다시 시작합니다.
+주석 줄은 이벤트를 생성하지 않고 모든 eventsource 파서에 의해 버려지므로, 엄격한 Responses 디코더는
+알 수 없는 variant를 절대 보지 못합니다. 기본 **stall deadline**은 300초(`stallTimeoutSec`)입니다.
+이 시간을 넘기면 업스트림을 중단하고 이유가 `upstream_stall_timeout`인 `response.incomplete`를
+내보내 연결이 끝없이 매달리지 않게 합니다.
 
 툴 호출은 파서가 캡처한 네임스페이스 맵, freeform 집합, tool-search 집합을 사용하여 세 가지
 Responses 항목 타입으로 구분됩니다 — 따라서 MCP 네임스페이스, `apply_patch` 스타일의 freeform
@@ -116,6 +118,14 @@ Responses 항목 타입으로 구분됩니다 — 따라서 MCP 네임스페이�
 상태에서 Codex가 Responses WebSocket 업그레이드를 시도하면 opencodex는 `426 upgrade_required`를
 반환하고, Codex는 해당 세션에서 HTTP로 폴백합니다. `"websockets": true`가 설정되면 같은
 엔드포인트가 업그레이드를 받아들이고 WebSocket 브리지를 사용합니다.
+
+이 클라이언트 설정과 별개로, 루트 `stream: true`인 canonical ChatGPT forward 요청은
+stable Bun 1.4.0 이상에서 Codex 업스트림 WebSocket을 사용할 수 있습니다. 번들 Bun 1.3.14,
+prerelease, 또는 검증할 수 없는 런타임 identity는 HTTP/SSE를 사용합니다. 성공한 업스트림 WS
+응답은 같은 downstream SSE 계약을 유지하며, 원시 JSON WebSocket 프레임과 downstream SSE
+envelope를 각각 4 MiB로 제한하고 8 MiB producer queue 상한이 있는 bounded eager single-reader
+relay를 거칩니다. queue overflow 시 업스트림을 닫고 downstream에는
+terminal `response.failed` 이벤트와 `[DONE]`을 내보냅니다.
 
 Codex 컨텍스트 compaction은 라우팅된 모델에서도 동작합니다. `server/responses/compact.ts`는
 `POST /v1/responses/compact`를 내부 라우팅 요약 턴으로 처리해 압축된 히스토리를 반환합니다.

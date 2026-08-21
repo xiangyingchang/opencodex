@@ -13,7 +13,7 @@ ocx init
 
 `ocx init` walks you through:
 
-1. **Pick a provider** — choose one of the 76 built-in registry presets or `custom` to type a base
+1. **Pick a provider** — choose one of the 79 built-in registry presets or `custom` to type a base
    URL and adapter.
 2. **API key** — paste a key, or reference an environment variable like `${ANTHROPIC_API_KEY}`.
 3. **Default model** — for key, local, and custom providers, accept the preset or enter a model id.
@@ -29,7 +29,7 @@ The result is saved to `$OPENCODEX_HOME/config.json` (default `~/.opencodex/conf
 The current stable release seeds GPT-5.6 Sol/Terra/Luna for ChatGPT passthrough, OpenAI API-key,
 OpenRouter, and
 the experimental Cursor adapter. They work only when that upstream account has access. The OpenAI
-API-key and OpenRouter presets advertise a 372,000-token usable context window; Cursor keeps its own
+API-key and OpenRouter presets advertise a 922,000-token usable context window; Cursor keeps its own
 adapter metadata.
 :::
 

@@ -45,11 +45,11 @@ interface ProviderAdapter {
 - Стримит `delta.content` (текст), `delta.reasoning_content` (thinking) и `delta.tool_calls[]`;
   собирает `usage`.
 - ClinePass использует проверенный на живом API формат шлюза
-  `reasoning: { enabled: true, effort: "low" }` (или `{ enabled: false }`, когда reasoning отключён);
-  в публичной документации API этот формат запроса пока не указан. Адаптер прижимает другие
-  уровни effort к проверенному `low`, принимает reasoning delta из `delta.reasoning_content` или
-  `delta.reasoning`, запрашивает usage потока через `stream_options.include_usage` и читает usage
-  из envelope нестримингового ответа.
+  `reasoning: { enabled: true, effort }` (или `{ enabled: false }`, когда reasoning отключён);
+  в публичной документации API этот формат запроса пока не указан. Адаптер сохраняет запрошенный
+  уровень `low`, `medium`, `high`, `xhigh` или `max`, принимает reasoning delta из
+  `delta.reasoning_content` или `delta.reasoning`, запрашивает usage потока через
+  `stream_options.include_usage` и читает usage из envelope нестримингового ответа.
 
 ## `openai-responses`
 
@@ -61,6 +61,12 @@ interface ProviderAdapter {
 начала потока ждёт и, до любой другой обработки или фейловера, повторяет идентичный запрос на
 том же ключе, как и в переводимом пути `openai-chat`/Anthropic. Пользовательские транспорты
 `runTurn` в цикл HTTP-повторов не входят.
+
+- Stateless-парсер DeepSeek Responses получает нормализацию истории на уровне провайдера:
+  контекст, внедрённый хуком, переносится после однозначного батча call/result. Параллельные вызовы
+  остаются сгруппированными перед своими результатами, поэтому каждый вызов сохраняет свой
+  один assistant-ход с рассуждениями. Толерантные провайдеры и неоднозначные (дублирующиеся,
+  отсутствующие или неупорядоченные) идентификаторы call сохраняют исходный порядок входа.
 
 - URL для `forward` → `{baseUrl}/responses`. Провайдер с `key` по умолчанию сохраняет прежнее построение `{baseUrl}/v1/responses`.
 - Провайдер с `key` может задать проверенный относительный `responsesPath`: адаптер удаляет один завершающий `/` из `baseUrl` и отправляет запрос на `{trimmedBaseUrl}{responsesPath}`. Для Ark Agent Plan используйте `baseUrl: "https://ark.cn-beijing.volces.com/api/plan/v3"` и `responsesPath: "/responses"`.
@@ -91,9 +97,10 @@ interface ProviderAdapter {
 
 - Системный промпт → `systemInstruction`; сообщения → `contents[]` (assistant → `model`);
   инструменты → `functionDeclarations`. Изображения из data-URL → `inline_data`.
-- Идентификаторы вызовов инструментов синтезируются, когда Gemini их опускает. Antigravity
-  сохраняет и повторно передаёт настоящие значения `thoughtSignature`, чтобы непрерывность
-  рассуждений сохранялась в последующих ходах.
+- Идентификаторы вызовов инструментов синтезируются, когда Gemini их опускает. Vertex и Antigravity
+  сохраняют и повторно передают непрозрачные значения `thoughtSignature`, чтобы непрерывность
+  рассуждений сохранялась после возврата результата инструмента. Кэш подписей сохраняется в каталог
+  конфигурации, поэтому последующие ходы переживают и перезапуск прокси.
 
 ## `kiro`
 

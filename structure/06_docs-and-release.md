@@ -3,8 +3,7 @@
 ## Public docs
 
 The public documentation site lives in `docs-site/` and is built with Astro + Starlight. English is
-served at the site root, with Korean under `/ko`, Simplified Chinese under `/zh-cn`, Russian under
-`/ru`, and Japanese under `/ja`. `docs-site/astro.config.mjs` is the locale source of truth.
+served at the site root, with Korean under `/ko`, Simplified Chinese under `/zh-cn`, Traditional Chinese under `/zh-tw`, Russian under `/ru`, and Japanese under `/ja`. `docs-site/astro.config.mjs` is the locale source of truth.
 
 Manual navigation is defined in `docs-site/astro.config.mjs`. When adding a public page, update the
 sidebar and either add localized copies or intentionally accept Starlight fallback behavior.
@@ -36,6 +35,16 @@ bun install --frozen-lockfile
 bun run build
 ```
 
+## Windows service wrapper and incomplete updates
+
+[Decision Log]
+- 목적과 의도: Prevent a failed npm replacement from making the Task Scheduler wrapper retry missing package files forever.
+- 기존 구현 및 제약 조건: The wrapper deliberately restarts a proxy after runtime crashes, but an absent baked Bun or CLI path cannot recover inside that process. Current updater preflight and stop-first behavior reduce replacement risk but do not provide a transactional restore of npm's package tree and global launchers.
+- 검토한 주요 대안: Keep unconditional five-second retries, add a generic crash ceiling, restore npm directories in-place, or classify only proven missing executable paths as terminal.
+- 선택한 방식: Check the baked Bun and CLI paths before every spawn; log one actionable incomplete-install message and exit with code 3 when either is absent. Preserve the existing retry loop for a child that actually launched and then failed.
+- 다른 대안 대신 이 방식을 선택한 이유: A generic retry ceiling can stop a service after unrelated intermittent crashes, while copying a package directory without matching npm shims, ownership, and lock guarantees is not a safe rollback.
+- 장점, 단점 및 영향: File-less package skeletons no longer produce unbounded service logs or restart churn. The wrapper still recovers ordinary proxy crashes, but repairing an incomplete npm install remains an explicit reinstall plus `ocx service repair` operation until a verified staged-update design exists.
+
 ## GitHub workflow map
 
 | Workflow | Trigger | Purpose |
@@ -44,7 +53,7 @@ bun run build
 | `.github/workflows/release.yml` | Manual dispatch only | npm publish/dry-run workflow. It requires the exact `GITHUB_SHA` to have a successful Cross-platform CI run before publish or dry-run. |
 | `.github/workflows/deploy-docs.yml` | `push` to `main` touching `docs-site/**` or the workflow, or manual dispatch | Build and publish the Astro/Starlight docs site to GitHub Pages. |
 | `.github/workflows/service-lifecycle.yml` | `pull_request` to `main`/`dev` and `push`, both filtered on the service path set (`src/service.ts`, `src/cli.ts`, `src/cli/index.ts`, `src/lib/bun-runtime.ts`, `package.json`, `bun.lock`, the workflow), or manual dispatch | Service-lifecycle smoke on three platforms: Linux systemd, macOS launchd, and Windows Scheduled Tasks. Each installs, verifies, stops via `ocx stop`, and uninstalls. The path list is kept in sync with the `release.yml` service-gate regex. |
-| `.github/workflows/enforce-pr-target.yml` | `pull_request_target` (opened, reopened, edited, ready_for_review, synchronize) | The `enforce-target` gate: rejects pull requests whose head ancestry sits on the `main` tip while far behind `dev`, rejects empty or malformed descriptions, requires a GUI screenshot when the title/body mentions `gui` (waivable by a maintainer comment), keeps contributor PRs in draft until a four-box readiness checklist is complete, verifies the CI / latest-dev / Codex+CodeRabbit-findings claims (review threads plus current-head CodeRabbit review-body findings outside the diff range), and adds a `review-ready` status label at the ready moment. Stacked child PRs targeting another open PR's head skip the wrong-base gate. |
+| `.github/workflows/enforce-pr-target.yml` | `pull_request_target` (opened, reopened, edited, labeled, unlabeled, ready_for_review, synchronize) plus default-branch `status` events filtered to successful `CodeRabbit` statuses | The `enforce-target` gate: rejects pull requests whose head ancestry sits on the `main` tip while far behind `dev`, rejects empty or malformed descriptions, requires a GUI screenshot when the title/body mentions `gui` (immediately waivable with the maintainer-controlled `gui-screenshot-waived` label; legacy maintainer comments remain compatibility evidence on later PR events), keeps contributor PRs in draft until a four-box readiness checklist is complete, verifies the CI / latest-dev / Codex+CodeRabbit-findings claims (review threads plus current-head CodeRabbit review-body findings outside the diff range), and adds a `review-ready` status label at the ready moment. CodeRabbit status SHAs must resolve to exactly one open current-head PR before writes. Stacked child PRs targeting another open PR's head skip the wrong-base gate. |
 | `.github/workflows/enforce-issue-quality.yml` | `issues` (opened, edited, reopened), `issue_comment` (created, edited), or manual dispatch with an issue number | Issue-template compliance gate. |
 | `.github/workflows/issue-quality-tests.yml` | `pull_request` and `push` filtered on the issue/PR automation scripts, templates, and their workflows | Tests the issue and PR automation scripts themselves, so the gates cannot rot silently. |
 | `.github/workflows/issue-triage.yml` | `issues` (opened) | Duplicate detection and triage labeling for new issues. |

@@ -30,7 +30,7 @@ describe("update-job restart avoids the shell-less .cmd EINVAL (Windows, bun/sou
     expect(src).toContain("runtimeTrusted");
     expect(read("src/cli/index.ts")).toContain("allowEphemeralFallback: !hardPin");
     expect(read("src/cli/index.ts")).toContain("preferRetryMs: hardPin ? 5_000 : 750");
-    expect(read("src/cli/index.ts")).toContain("Not opening the GUI");
+    expect(read("src/cli/dispatch.ts")).toContain("Not opening the GUI");
     expect(read("src/server/ports.ts")).toContain("allowEphemeralFallback");
   });
   test("Windows GUI update worker is launched without inheriting the proxy LISTEN socket", () => {
@@ -39,6 +39,8 @@ describe("update-job restart avoids the shell-less .cmd EINVAL (Windows, bun/sou
     expect(src).toContain("Start-Process");
     expect(src).toContain("buildWindowsElevatedArgumentList");
     expect(src).toContain("resolveTrustedWindowsPowerShellExe");
+    expect(src).toContain("windowsHide: true");
+    expect(src).not.toContain('["-NoProfile", "-NoLogo", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps]');
     expect(src).toContain("spawnWorkerFn: spawnGuiUpdateWorker");
     // Foreign listeners must stay fail-closed; npm rename is covered by ocx identity.
     expect(src).not.toContain("killAnyListenPidOnPort");
@@ -50,7 +52,12 @@ describe("update-job restart avoids the shell-less .cmd EINVAL (Windows, bun/sou
     // Native WinSW installs must stop via stopWinswService, not Task Scheduler /end only.
     expect(src).toContain("readServiceBackend");
     expect(src).toContain("stopWinswService");
-    expect(src).toContain("$_.ProcessId -eq $PID");
+    // The wrapper-killer script (and its self-exclusion) moved to the shared
+    // lib/windows-service-wrappers so the updater and the service teardown path
+    // cannot drift apart again. Follow the invariant to where it lives; the
+    // matching rules themselves are covered by windows-service-wrappers.test.ts.
+    expect(src).toContain("killWindowsSchedulerWrappers");
+    expect(read("src/lib/windows-service-wrappers.ts")).toContain("$_.ProcessId -eq $PID");
     expect(src).toContain("lastChild?.pid && aliveFn(lastChild.pid)");
   });
 });

@@ -123,6 +123,76 @@ describe("GUI/CLI Codex sync backend", () => {
     expect(errors).toEqual([]);
   });
 
+  test("refuses during injection preflight before catalog or cache mutation", async () => {
+    let refreshCalls = 0;
+    let injectCalls = 0;
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const refusal = "Codex config injection refused: ambiguous managed defaults; inspect config.toml.";
+
+    const result = await syncModelsToCodex(12345, config, {
+      log: line => logs.push(String(line)),
+      error: line => errors.push(String(line)),
+    }, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => {
+        refreshCalls++;
+        throw new Error("catalog refresh must not run after a deterministic refusal");
+      },
+      injectCodexConfig: async (_port, _config, options) => {
+        injectCalls++;
+        expect(options.validateOnly).toBe(true);
+        return { success: false, message: refusal };
+      },
+      currentExternalCodexModelProvider: () => null,
+      collectCodexHomeDiagnostic: () => homeDiagnostic(),
+    });
+
+    expect(injectCalls).toBe(1);
+    expect(refreshCalls).toBe(0);
+    expect(result).toEqual({
+      status: "applied",
+      ok: false,
+      added: 0,
+      catalogPath: null,
+      catalogExists: false,
+      catalogWritten: false,
+      cacheSynced: false,
+      message: refusal,
+    });
+    expect(logs).toEqual(["   Target Codex home: C:\\Users\\[USER]\\.codex"]);
+    expect(errors).toEqual([refusal]);
+  });
+
+  test("the real successful injection preflight writes no Codex artifacts", () => {
+    const configPath = join(TEST_CODEX_HOME, "config.toml");
+    const profilePath = join(TEST_CODEX_HOME, "opencodex.config.toml");
+    const journalPath = join(TEST_CODEX_HOME, "opencodex-journal.json");
+    const before = readFileSync(configPath, "utf8");
+
+    const child = spawnSync(process.execPath, ["-e", `
+      const { injectCodexConfig } = await import("./src/codex/inject.ts");
+      const result = await injectCodexConfig(10100, ${JSON.stringify(config)}, { validateOnly: true });
+      console.log(JSON.stringify(result));
+    `], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        HOME: TEST_HOME,
+        USERPROFILE: TEST_HOME,
+        CODEX_HOME: TEST_CODEX_HOME,
+        OPENCODEX_HOME: TEST_OCX_HOME,
+      },
+      encoding: "utf8",
+    });
+
+    expect(child.status).toBe(0);
+    expect(JSON.parse(child.stdout.trim())).toMatchObject({ success: true });
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+    expect(existsSync(profilePath)).toBe(false);
+    expect(existsSync(journalPath)).toBe(false);
+  });
+
   test("returns a policy skip without touching the catalog or config", async () => {
     let refreshed = false;
     let injected = false;
@@ -145,6 +215,90 @@ describe("GUI/CLI Codex sync backend", () => {
     expect(result).toMatchObject({ status: "skipped", skippedReason: "desired_disabled", ok: true });
     expect(refreshed).toBe(false);
     expect(injected).toBe(false);
+  });
+
+  test("explicit sync refreshes the catalog when Codex integration is OFF without injecting", async () => {
+    let refreshed = 0;
+    let injected = false;
+    let refreshOptions: unknown;
+    writeFileSync(join(TEST_OCX_HOME, "config.json"), JSON.stringify({
+      ...config,
+      clientIntegrations: { codex: false },
+    }));
+    const result = await syncModelsToCodex(12345, config, null, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async (_config: unknown, _deps: unknown, options: unknown) => {
+        refreshed++;
+        refreshOptions = options;
+        return {
+          added: 3,
+          path: "/tmp/opencodex-catalog.json",
+          catalogExists: true,
+          catalogWritten: true,
+          cacheSynced: true,
+          comboOmissions: [],
+        };
+      },
+      injectCodexConfig: async () => {
+        injected = true;
+        throw new Error("must not inject");
+      },
+      currentExternalCodexModelProvider: () => null,
+    }, { catalogEvenWhenNotInjected: true });
+
+    expect(refreshed).toBe(1);
+    expect(refreshOptions).toEqual({ allowWhenDesiredDisabled: true });
+    expect(injected).toBe(false);
+    expect(result).toMatchObject({
+      status: "catalog-only",
+      ok: true,
+      added: 3,
+      catalogExists: true,
+      catalogWritten: true,
+      cacheSynced: true,
+      catalogPath: "/tmp/opencodex-catalog.json",
+    });
+    expect(result.message).toContain("Codex config untouched");
+  });
+
+  test("explicit sync refreshes the catalog without injecting or touching the journal for an external provider", async () => {
+    let refreshed = 0;
+    let injectCalls = 0;
+    const journalPath = join(TEST_CODEX_HOME, "opencodex-journal.json");
+    const journalBytes = Buffer.from(JSON.stringify({ injectedOpenaiBaseUrl: "http://127.0.0.1:1/v1" }));
+    writeFileSync(journalPath, journalBytes);
+    const result = await syncModelsToCodex(10100, config, null, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => {
+        refreshed++;
+        return {
+          added: 2,
+          path: "/tmp/opencodex-catalog.json",
+          catalogExists: true,
+          catalogWritten: true,
+          cacheSynced: true,
+          comboOmissions: [],
+        };
+      },
+      injectCodexConfig: async () => {
+        injectCalls++;
+        return { success: true, message: "external provider preserved" };
+      },
+      currentExternalCodexModelProvider: () => "custom",
+    }, { catalogEvenWhenNotInjected: true });
+
+    expect(refreshed).toBe(1);
+    expect(injectCalls).toBe(0);
+    expect(readFileSync(journalPath)).toEqual(journalBytes);
+    expect(result).toMatchObject({
+      status: "catalog-only",
+      ok: true,
+      added: 2,
+      catalogExists: true,
+      catalogWritten: true,
+      cacheSynced: true,
+    });
+    expect(String(result.message)).toContain("journal untouched");
   });
 
   /**
@@ -212,7 +366,7 @@ describe("GUI/CLI Codex sync backend", () => {
     } finally {
       rmSync(raceRoot, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("surfaces combo catalog omissions in sync result and CLI stderr (#484)", async () => {
     const logs: string[] = [];
@@ -280,6 +434,7 @@ describe("GUI/CLI Codex sync backend", () => {
 
   test("keeps injection fallback behavior when catalog refresh throws", async () => {
     let injectedCatalogPath: string | null | undefined = "unset";
+    let injectionCalls = 0;
 
     const result = await syncModelsToCodex(undefined, config, null, {
       admitCodexWrite: admittedSync,
@@ -287,12 +442,14 @@ describe("GUI/CLI Codex sync backend", () => {
         throw new Error("catalog boom");
       },
       injectCodexConfig: async (_port, _config, options) => {
+        injectionCalls++;
         injectedCatalogPath = options.catalogPath;
         return { success: true, message: "injected fallback" };
       },
       currentExternalCodexModelProvider: () => null,
     });
 
+    expect(injectionCalls).toBe(2);
     expect(injectedCatalogPath).toBeUndefined();
     expect(result.ok).toBe(true);
     expect(result.catalogPath).toBeNull();

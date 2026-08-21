@@ -1,9 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { SERVER_BUDGET_MS } from "./helpers/test-budget";
 import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { saveConfig } from "../src/config";
+import { getConfigPath, saveConfig } from "../src/config";
 import { startServer } from "../src/server";
 import type { OcxConfig } from "../src/types";
 import { serveGuiFile, serveSessionBootstrap } from "../src/server/gui-static";
@@ -30,6 +30,19 @@ import {
   verifyLocalAttestationProof,
 } from "../src/lib/local-management-attestation";
 import {
+  LOCAL_MANAGEMENT_CAPABILITY_HEADER,
+  LOCAL_MANAGEMENT_CAPABILITY_EXPIRES_AT_HEADER,
+  LOCAL_MANAGEMENT_CAPABILITY_TTL_MS,
+  LOCAL_MANAGEMENT_EXPECTED_PID_HEADER,
+  LOCAL_MANAGEMENT_NONCE_HEADER,
+  LOCAL_MANAGEMENT_READ_PATHS,
+  createLocalManagementReadCapability,
+} from "../src/lib/local-management-capability";
+import {
+  CODEX_APP_SERVER_STATE_PATH,
+  CODEX_RESTART_PATH,
+} from "../src/lib/codex-restart-contract";
+import {
   SYSTEM_RESTART_CAPABILITY_HEADER,
   SYSTEM_RESTART_EXPECTED_PID_HEADER,
   SYSTEM_RESTART_METHOD,
@@ -37,6 +50,18 @@ import {
   SYSTEM_RESTART_PATH,
   createSystemRestartCapability,
 } from "../src/lib/system-restart-contract";
+import {
+  LOCAL_PROVIDER_RELOAD_CAPABILITY_HEADER,
+  LOCAL_PROVIDER_RELOAD_CAPABILITY_TTL_MS,
+  LOCAL_PROVIDER_RELOAD_EXPECTED_PID_HEADER,
+  LOCAL_PROVIDER_RELOAD_EXPIRES_AT_HEADER,
+  LOCAL_PROVIDER_RELOAD_METHOD,
+  LOCAL_PROVIDER_RELOAD_NAME_HEADER,
+  LOCAL_PROVIDER_RELOAD_NONCE_HEADER,
+  LOCAL_PROVIDER_RELOAD_PATH,
+  createLocalProviderReloadCapability,
+  verifyLocalProviderReloadCapability,
+} from "../src/lib/local-provider-reload-contract";
 import { setSystemRestartIoForTests } from "../src/server/management/system-restart";
 
 const previousHome = process.env.OPENCODEX_HOME;
@@ -209,6 +234,243 @@ describe("management and data-plane credential separation", () => {
     }
   });
 
+  test("a local-read capability authorizes only its exact GET path", async () => {
+    const secret = "A".repeat(43);
+    const nonce = "B".repeat(43);
+    const unavailable = { available: false, reason: "injected unavailable state" } as const;
+    const server = startServer(0, {
+      localAttestationSecret: secret,
+      managementAuthState: unavailable,
+    });
+    const headersFor = (path: string, port = server.port, requestNonce = nonce) => {
+      const expiresAt = Date.now() + LOCAL_MANAGEMENT_CAPABILITY_TTL_MS;
+      return {
+        [LOCAL_MANAGEMENT_EXPECTED_PID_HEADER]: String(process.pid),
+        [LOCAL_MANAGEMENT_NONCE_HEADER]: requestNonce,
+        [LOCAL_MANAGEMENT_CAPABILITY_EXPIRES_AT_HEADER]: String(expiresAt),
+        [LOCAL_MANAGEMENT_CAPABILITY_HEADER]: createLocalManagementReadCapability(
+          secret,
+          requestNonce,
+          "GET",
+          path,
+          process.pid,
+          port,
+          expiresAt,
+        )!,
+      };
+    };
+    try {
+      const memoryHeaders = headersFor(LOCAL_MANAGEMENT_READ_PATHS.systemMemory);
+      const memory = await fetch(new URL(LOCAL_MANAGEMENT_READ_PATHS.systemMemory, server.url), {
+        headers: memoryHeaders,
+      });
+      expect(memory.status).toBe(200);
+      const memoryBody = await memory.json() as { pid?: number; bunVersion?: string };
+      expect(memoryBody.pid).toBe(process.pid);
+      expect(memoryBody.bunVersion).toBe(Bun.version);
+
+      const replay = await fetch(new URL(LOCAL_MANAGEMENT_READ_PATHS.systemMemory, server.url), {
+        headers: memoryHeaders,
+      });
+      expect(replay.status).toBe(503);
+
+      const memoryCapabilityOnAccounts = await fetch(
+        new URL(LOCAL_MANAGEMENT_READ_PATHS.codexAccounts, server.url),
+        {
+          headers: headersFor(
+            LOCAL_MANAGEMENT_READ_PATHS.systemMemory,
+            server.port,
+            "C".repeat(43),
+          ),
+        },
+      );
+      expect(memoryCapabilityOnAccounts.status).toBe(503);
+
+      const accountHeaders = headersFor(LOCAL_MANAGEMENT_READ_PATHS.codexAccounts);
+      const accounts = await fetch(new URL(LOCAL_MANAGEMENT_READ_PATHS.codexAccounts, server.url), {
+        headers: accountHeaders,
+      });
+      expect(accounts.status).toBe(200);
+
+      const query = await fetch(
+        new URL(`${LOCAL_MANAGEMENT_READ_PATHS.codexAccounts}?include=all`, server.url),
+        {
+          headers: headersFor(
+            LOCAL_MANAGEMENT_READ_PATHS.codexAccounts,
+            server.port,
+            "E".repeat(43),
+          ),
+        },
+      );
+      expect(query.status).toBe(503);
+
+      const mutation = await fetch(new URL(LOCAL_MANAGEMENT_READ_PATHS.codexAccounts, server.url), {
+        method: "POST",
+        headers: {
+          ...headersFor(
+            LOCAL_MANAGEMENT_READ_PATHS.codexAccounts,
+            server.port,
+            "F".repeat(43),
+          ),
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      expect(mutation.status).toBe(503);
+
+      const foreignRoute = await fetch(new URL("/api/config", server.url), {
+        headers: headersFor(
+          LOCAL_MANAGEMENT_READ_PATHS.codexAccounts,
+          server.port,
+          "G".repeat(43),
+        ),
+      });
+      expect(foreignRoute.status).toBe(503);
+
+      const wrongPort = await fetch(new URL(LOCAL_MANAGEMENT_READ_PATHS.systemMemory, server.url), {
+        headers: headersFor(
+          LOCAL_MANAGEMENT_READ_PATHS.systemMemory,
+          server.port + 1,
+          "H".repeat(43),
+        ),
+      });
+      expect(wrongPort.status).toBe(503);
+
+      const principalHeaders = headersFor(
+        LOCAL_MANAGEMENT_READ_PATHS.systemMemory,
+        server.port,
+        "I".repeat(43),
+      );
+      const request = new Request(new URL(LOCAL_MANAGEMENT_READ_PATHS.systemMemory, server.url), {
+        headers: principalHeaders,
+      });
+      const local = { attestationSecret: secret, pid: process.pid, port: server.port };
+      expect(requireManagementAuth(request, unavailable, remoteConfig(), local)).toBeNull();
+      expect(managementPrincipal(request, unavailable, remoteConfig(), local))
+        .toBe("local-read-capability");
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("a provider-reload capability is one-shot and exact to its operation", () => {
+    const secret = "A".repeat(43);
+    const nonce = "J".repeat(43);
+    const expiresAt = Date.now() + LOCAL_PROVIDER_RELOAD_CAPABILITY_TTL_MS;
+    const unavailable = { available: false, reason: "injected unavailable state" } as const;
+    const local = { attestationSecret: secret, pid: process.pid, port: 10100 };
+    const headers = {
+      [LOCAL_PROVIDER_RELOAD_EXPECTED_PID_HEADER]: String(process.pid),
+      [LOCAL_PROVIDER_RELOAD_NONCE_HEADER]: nonce,
+      [LOCAL_PROVIDER_RELOAD_EXPIRES_AT_HEADER]: String(expiresAt),
+      [LOCAL_PROVIDER_RELOAD_NAME_HEADER]: "xai",
+      "content-length": "0",
+      [LOCAL_PROVIDER_RELOAD_CAPABILITY_HEADER]: createLocalProviderReloadCapability(
+        secret,
+        nonce,
+        LOCAL_PROVIDER_RELOAD_METHOD,
+        LOCAL_PROVIDER_RELOAD_PATH,
+        "xai",
+        process.pid,
+        local.port,
+        expiresAt,
+      )!,
+    };
+
+    const request = new Request(`http://127.0.0.1:${local.port}${LOCAL_PROVIDER_RELOAD_PATH}`, {
+      method: LOCAL_PROVIDER_RELOAD_METHOD,
+      headers,
+    });
+    expect(requireManagementAuth(request, unavailable, remoteConfig(), local)).toBeNull();
+    expect(managementPrincipal(request, unavailable, remoteConfig(), local))
+      .toBe("local-provider-reload-capability");
+
+    const replay = new Request(request.url, { method: LOCAL_PROVIDER_RELOAD_METHOD, headers });
+    expect(requireManagementAuth(replay, unavailable, remoteConfig(), local)?.status).toBe(503);
+    const wrongName = new Request(request.url, {
+      method: LOCAL_PROVIDER_RELOAD_METHOD,
+      headers: { ...headers, [LOCAL_PROVIDER_RELOAD_NAME_HEADER]: "openai" },
+    });
+    expect(requireManagementAuth(wrongName, unavailable, remoteConfig(), local)?.status).toBe(503);
+    const query = new Request(`${request.url}?name=xai`, { method: LOCAL_PROVIDER_RELOAD_METHOD, headers });
+    expect(requireManagementAuth(query, unavailable, remoteConfig(), local)?.status).toBe(503);
+    const body = new Request(request.url, {
+      method: LOCAL_PROVIDER_RELOAD_METHOD,
+      headers: { ...headers, "content-length": "2" },
+      body: "{}",
+    });
+    expect(requireManagementAuth(body, unavailable, remoteConfig(), local)?.status).toBe(503);
+  });
+
+  test("provider-reload capability binds method path process endpoint and TTL", () => {
+    const secret = "A".repeat(43);
+    const nonce = "K".repeat(43);
+    const now = 1_800_000_000_000;
+    const pid = 4242;
+    const port = 10100;
+    const name = "xai";
+    const validExpiry = now + LOCAL_PROVIDER_RELOAD_CAPABILITY_TTL_MS;
+    const capability = createLocalProviderReloadCapability(
+      secret,
+      nonce,
+      LOCAL_PROVIDER_RELOAD_METHOD,
+      LOCAL_PROVIDER_RELOAD_PATH,
+      name,
+      pid,
+      port,
+      validExpiry,
+    )!;
+    const verify = (
+      method = LOCAL_PROVIDER_RELOAD_METHOD,
+      path = LOCAL_PROVIDER_RELOAD_PATH,
+      selectedName = name,
+      selectedPid = pid,
+      selectedPort = port,
+      expiresAt = validExpiry,
+      candidate = capability,
+    ) => verifyLocalProviderReloadCapability(
+      secret,
+      nonce,
+      method,
+      path,
+      selectedName,
+      selectedPid,
+      selectedPort,
+      expiresAt,
+      candidate,
+      now,
+    );
+
+    expect(verify()).toBe(true);
+    expect(verify("GET")).toBe(false);
+    expect(verify(LOCAL_PROVIDER_RELOAD_METHOD, "/api/providers")).toBe(false);
+    expect(verify(LOCAL_PROVIDER_RELOAD_METHOD, LOCAL_PROVIDER_RELOAD_PATH, "openai")).toBe(false);
+    expect(verify(LOCAL_PROVIDER_RELOAD_METHOD, LOCAL_PROVIDER_RELOAD_PATH, name, pid + 1)).toBe(false);
+    expect(verify(LOCAL_PROVIDER_RELOAD_METHOD, LOCAL_PROVIDER_RELOAD_PATH, name, pid, port + 1)).toBe(false);
+    expect(verify(LOCAL_PROVIDER_RELOAD_METHOD, LOCAL_PROVIDER_RELOAD_PATH, name, pid, port, now, capability)).toBe(false);
+
+    const tooLate = now + LOCAL_PROVIDER_RELOAD_CAPABILITY_TTL_MS + 1;
+    const tooLateCapability = createLocalProviderReloadCapability(
+      secret,
+      nonce,
+      LOCAL_PROVIDER_RELOAD_METHOD,
+      LOCAL_PROVIDER_RELOAD_PATH,
+      name,
+      pid,
+      port,
+      tooLate,
+    )!;
+    expect(verify(
+      LOCAL_PROVIDER_RELOAD_METHOD,
+      LOCAL_PROVIDER_RELOAD_PATH,
+      name,
+      pid,
+      port,
+      tooLate,
+      tooLateCapability,
+    )).toBe(false);
+  });
+
   test("management-token temp cleanup forgets successful ACL memos and retains failed removals", () => {
     const temporary = join(testHome, ".admin-token.tmp");
     const previousUsername = process.env.USERNAME;
@@ -324,6 +586,50 @@ describe("management and data-plane credential separation", () => {
     }
   });
 
+
+  test("config salvage does not weaken the management auth boundary (#1785)", async () => {
+    // Salvage keeps a config loading after dropping an invalid entry. That must not turn into
+    // a way to reach the management plane: the credential separation is enforced before route
+    // dispatch, and a partially-salvaged config has to behave exactly like a clean one.
+    const salvageable = remoteConfig() as Record<string, unknown>;
+    salvageable.routingProfiles = {
+      good: { candidates: [{ provider: "test", model: "gpt-test" }] },
+      bad:  { candidates: [{ provider: "not-configured", model: "gpt-test" }] },
+    };
+    writeFileSync(getConfigPath(), JSON.stringify(salvageable, null, 2), { mode: 0o600 });
+
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const server = startServer(0);
+    try {
+      const anonymous = await fetch(new URL("/api/config", server.url));
+      expect(anonymous.status).toBe(401);
+
+      const withDataToken = await fetch(new URL("/api/config", server.url), {
+        headers: { "x-opencodex-api-key": "data-secret" },
+      });
+      expect(withDataToken.status).toBe(401);
+
+      const withWrongAdminToken = await fetch(new URL("/api/config", server.url), {
+        headers: { "x-opencodex-api-key": "not-the-admin-secret" },
+      });
+      expect(withWrongAdminToken.status).toBe(401);
+
+      const withAdminToken = await fetch(new URL("/api/config", server.url), {
+        headers: { "x-opencodex-api-key": "admin-secret" },
+      });
+      expect(withAdminToken.status).toBe(200);
+
+      // The salvaged config is what the authorized caller sees: the provider survives and only
+      // the invalid profile is gone. A fallback here would hand back built-in defaults, which a
+      // later write would persist over the operator's providers.
+      const body = await withAdminToken.json() as Record<string, any>;
+      expect(Object.keys(body.providers ?? {})).toContain("test");
+      expect(Object.keys(body.routingProfiles ?? {})).not.toContain("bad");
+    } finally {
+      await server.stop(true);
+      errorSpy.mockRestore();
+    }
+  });
   test("a management token that matches the data environment token closes only the management plane", async () => {
     process.env.OPENCODEX_ADMIN_AUTH_TOKEN = "data-secret";
     saveConfig(remoteConfig());
@@ -778,6 +1084,54 @@ describe("management and data-plane credential separation", () => {
         headers: { "x-opencodex-api-key": "env-admin-secret" },
       });
       expect(management.status).toBe(200);
+    } finally {
+      await server.stop(true);
+    }
+  });
+});
+
+describe("codex app-server restart routes ride the management gate", () => {
+  // The service itself is unit-tested with injected seams
+  // (tests/codex-app-server-restart-service.test.ts). These cases exist for one
+  // reason: the route terminates the user's Codex app-servers, so it must be
+  // unreachable without management credentials and from a foreign origin.
+  test("both routes reject an unauthenticated caller and a cross-origin caller", async () => {
+    const server = startServer(0);
+    try {
+      const stateUrl = new URL(CODEX_APP_SERVER_STATE_PATH, server.url);
+      const restartUrl = new URL(CODEX_RESTART_PATH, server.url);
+
+      const anonymousState = await fetch(stateUrl, { method: "GET" });
+      expect(anonymousState.status).toBe(401);
+
+      const anonymousRestart = await fetch(restartUrl, { method: "POST" });
+      expect(anonymousRestart.status).toBe(401);
+
+      // An admin token authenticates, but the shared management-origin gate runs
+      // ahead of every route, so a foreign Origin is refused before dispatch.
+      const foreignOrigin = await fetch(restartUrl, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer admin-secret",
+          Origin: "https://evil.example",
+        },
+      });
+      expect(foreignOrigin.status).toBe(403);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("the data-plane token does not authorize the restart route", async () => {
+    // The data token is handed to Codex itself. It must never be able to restart
+    // the app-servers it belongs to.
+    const server = startServer(0);
+    try {
+      const response = await fetch(new URL(CODEX_RESTART_PATH, server.url), {
+        method: "POST",
+        headers: { Authorization: "Bearer data-secret" },
+      });
+      expect(response.status).toBe(401);
     } finally {
       await server.stop(true);
     }

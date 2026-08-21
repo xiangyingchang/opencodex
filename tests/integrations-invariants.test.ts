@@ -66,9 +66,9 @@ afterEach(() => {
 });
 
 describe("the client registries cannot drift apart", () => {
-  test("every list of clients holds exactly the same six ids", async () => {
+  test("every list of clients holds exactly the same ten ids", async () => {
     /*
-     * Five lists name the same six clients, and two of them are maintained by
+     * Five lists name the same ten clients, and two of them are maintained by
      * hand: the GUI cannot import the backend registry, because that would
      * pull node:os and node:path into the browser bundle. A client added
      * server-side renders no row until someone remembers the tuple, and the
@@ -76,14 +76,34 @@ describe("the client registries cannot drift apart", () => {
      */
     const gui = await import("../gui/src/components/apikeys-workspace/client-config-clients");
     const guiIntegrations = await import("../gui/src/pages/integrations/integration-api");
+    const guiRouting = await import("../gui/src/app-routing");
 
     const expected = [...EXPORT_CLIENT_IDS].sort();
-    expect(expected).toHaveLength(6);
+    expect(expected).toHaveLength(10);
 
     expect([...INTEGRATION_CLIENT_IDS].sort()).toEqual(expected);
     expect([...gui.CLIENTS].sort()).toEqual(expected);
     expect(Object.keys(gui.CLIENT_LABEL_KEYS).sort()).toEqual(expected);
     expect([...guiIntegrations.FILE_INTEGRATION_CLIENTS].sort()).toEqual(expected);
+    // The Integrations tab strip needs a registered hash per file client, or
+    // App normalization strips the route and the tab can never render. The
+    // remaining per-page Record maps are enforced by the GUI typecheck
+    // (Record<FileIntegrationClientId, TKey> is exhaustive).
+    const routedFileClients = guiRouting.INTEGRATION_TAB_HASHES
+      .filter(hash => /^integrations\/[a-z-]+$/.test(hash))
+      .map(hash => hash.split("/")[1]!)
+      .filter(id => (expected as string[]).includes(id))
+      .sort();
+    expect(routedFileClients).toEqual(expected);
+  });
+
+  test("source preservation and cross-process locking are registry capabilities", () => {
+    expect(INTEGRATION_CLIENTS.omp.sourcePreservingYaml?.path).toEqual(["providers", "opencodex"]);
+    expect(INTEGRATION_CLIENTS.dsh.sourcePreservingYaml?.path).toEqual([
+      "llm-pi-ai", "providers", "opencodex",
+    ]);
+    expect(INTEGRATION_CLIENT_IDS.filter(id => INTEGRATION_CLIENTS[id].writerLock)).toEqual(["dsh"]);
+    expect(INTEGRATION_CLIENTS.dsh.writerLock).toEqual({ suffix: ".lock" });
   });
 });
 
@@ -125,10 +145,14 @@ describe("every client survives a full lifecycle", () => {
   const SEED: Record<IntegrationClientId, string> = {
     opencode: '{\n  "provider": {\n    "mine": { "npm": "keep-me" }\n  }\n}\n',
     pi: '{\n  "providers": {\n    "mine": { "api": "http://keep-me" }\n  }\n}\n',
+    omp: "providers:\n  mine:\n    api: http://keep-me\n",
     hermes: "providers:\n  mine:\n    api: http://keep-me\n",
     openclaw: '{\n  models: {\n    providers: {\n      mine: { api: "http://keep-me" },\n    },\n  },\n}\n',
     kimi: '[providers.mine]\napi = "http://keep-me"\n',
     gajae: "providers:\n  mine:\n    api: http://keep-me\n",
+    dsh: "llm-pi-ai:\n  providers:\n    mine:\n      api: openai-completions\n",
+    mcode: "custom_provider:\n  mine:\n    name: Keep Me\n",
+    zcode: '{\n  "provider": {\n    "builtin:zai-start-plan": { "name": "Keep Me", "kind": "anthropic" }\n  }\n}\n',
   };
 
   for (const clientId of INTEGRATION_CLIENT_IDS) {
@@ -675,7 +699,7 @@ describe("the store's own root stays tidy", () => {
 describe("the CLI names every client it supports", () => {
   test("export help and the top-level list are not stuck on opencode and Pi", () => {
     /*
-     * The command has accepted six clients since WP1, but its help said two.
+     * The command has accepted several clients since WP1, but its help said two.
      * A user reading it concluded the feature did not support their client —
      * the one failure mode a help string has.
      *

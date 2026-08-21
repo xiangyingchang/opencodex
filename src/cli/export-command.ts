@@ -1,8 +1,8 @@
 /**
  * `ocx export --client <id>` — print a client config for the live proxy.
  *
- * Six clients, four formats: opencode and Pi are JSON, Hermes and Gajae YAML,
- * OpenClaw JSON5, Kimi TOML.
+ * Eight clients, four formats: OpenCode and Pi are JSON; OMP, Hermes, Gajae and
+ * MiniMax Code are YAML; OpenClaw is JSON5; Kimi is TOML.
  *
  * Two consumers, one payload (devlog 260731_client_config_export/020):
  *
@@ -62,7 +62,11 @@ export interface ExportCommandDeps extends RuntimeApiDeps {
  * `/api/models` row plus the modality list Pi consumes. The launcher's row type predates
  * the Pi exporter and stops at the fields OpenCode needs.
  */
-type ExportProxyModelRow = OpencodeProxyModelRow & { inputModalities?: string[] };
+type ExportProxyModelRow = OpencodeProxyModelRow & {
+  inputModalities?: string[];
+  reasoningEfforts?: string[];
+  defaultReasoningEffort?: string;
+};
 
 /** Same authoritativeness rule the serializers apply, for the degraded-count line. */
 function hasContextLimit(model: ExportModel): boolean {
@@ -83,12 +87,21 @@ export function exportModelsFromProxyRows(
   rows: readonly ExportProxyModelRow[],
   config: OcxConfig,
 ): ExportModel[] {
-  const modalities = new Map<string, string[]>();
+  const metadata = new Map<string, Pick<ExportModel, "inputModalities" | "reasoningEfforts" | "defaultReasoningEffort">>();
   for (const row of rows) {
     const namespaced = row.namespaced?.trim();
-    if (namespaced && Array.isArray(row.inputModalities) && row.inputModalities.length > 0) {
-      if (!modalities.has(namespaced)) modalities.set(namespaced, [...row.inputModalities]);
-    }
+    if (!namespaced || metadata.has(namespaced)) continue;
+    metadata.set(namespaced, {
+      ...(Array.isArray(row.inputModalities) && row.inputModalities.length > 0
+        ? { inputModalities: [...row.inputModalities] }
+        : {}),
+      ...(Array.isArray(row.reasoningEfforts) && row.reasoningEfforts.length > 0
+        ? { reasoningEfforts: [...row.reasoningEfforts] }
+        : {}),
+      ...(typeof row.defaultReasoningEffort === "string" && row.defaultReasoningEffort.length > 0
+        ? { defaultReasoningEffort: row.defaultReasoningEffort }
+        : {}),
+    });
   }
   return opencodeCatalogFromProxyRows(rows, config).map(entry => {
     const model: ExportModel = {
@@ -99,8 +112,7 @@ export function exportModelsFromProxyRows(
     if (entry.native) model.native = true;
     if (entry.displayName) model.displayName = entry.displayName;
     if (entry.contextWindow !== undefined) model.contextWindow = entry.contextWindow;
-    const input = modalities.get(entry.namespaced);
-    if (input) model.inputModalities = input;
+    Object.assign(model, metadata.get(entry.namespaced));
     return model;
   });
 }
@@ -179,13 +191,13 @@ export async function handleExportCommand(argv: string[], deps: ExportCommandDep
 
     // Every serializer already ends with exactly one newline.
     if (out !== undefined) writeExport(out, text, force);
-    // stderr, so `--json` stdout stays byte-exact for a redirect.
+    // stderr, so `--json` stdout stays a standalone JSON document.
     if (out !== undefined && wantsJson) console.error(`Wrote ${out}`);
 
     const degraded = models.filter(model => !hasContextLimit(model)).length;
-    // `--json` keeps emitting the DOCUMENT at the top level: a script that
-    // pipes it into a config file must not have to unwrap an envelope we added
-    // for our own convenience. Format metadata rides in the human lines below.
+    // `--json` keeps emitting the DOCUMENT at the top level as JSON for scripts;
+    // `--out` is the path that writes the selected client's native format.
+    // Format metadata rides in the human lines below.
     printData(clientConfig, wantsJson, [
       text.trimEnd(),
       "",

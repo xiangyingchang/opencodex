@@ -2,7 +2,11 @@
 import { spawn } from "node:child_process";
 import { currentExternalCodexModelProvider, restoreNativeCodex, restoreNativeCodexAsync, shouldInjectApiAuthHeader } from "../codex/inject";
 import { stripGrokConfig } from "../grok/inject";
-import { resolveCodexHistoryJobTarget, runCodexHistoryJob } from "../codex/history-job";
+import {
+  describeHistoryJobFailure,
+  resolveCodexHistoryJobTarget,
+  runCodexHistoryJob,
+} from "../codex/history-job";
 import { reconcileJournal } from "../codex/journal";
 import {
   codexAutoStartEnabled,
@@ -21,6 +25,7 @@ import {
 } from "../config";
 import { collectStatus } from "./status";
 import { dispatchInternalCliCommand, type InternalCliCommand } from "./internal-dispatch";
+
 import {
   discoverStableProxyForRestart,
   isProxyReplacement,
@@ -31,73 +36,61 @@ import {
 } from "./tray-proxy";
 import { requestBoundSystemRestart } from "./system-restart-client";
 import { installCrashGuards } from "../lib/crash-guard";
-import { hasHelpFlag, printSubcommandUsage, printUsage, printVersion } from "./help";
+import { hasHelpFlag, printSubcommandUsage } from "./help";
+import { dispatchCommand } from "./dispatch";
 import { findAvailablePort, isAddrInUse, PortUnavailableError, shouldPersistSelectedPort, waitForPortAvailable } from "../server/ports";
 import { findLiveProxy, probeHostname, type LiveProxy } from "../server/proxy-liveness";
 import { createReadinessGate } from "../server/readiness";
-import { parseReadyArgs, runReady, type ReadyArgs } from "./ready";
-import { stopProxy } from "../lib/process-control";
+import { runReady, type ReadyArgs } from "./ready";
+import { runCli } from "./root";
+import { ProxyOwnershipRefusedError, stopProxy } from "../lib/process-control";
 import { loadServiceTokenFromFile } from "../lib/service-secrets";
 import { diagnoseService, isServiceOwnershipError, serviceCommand, serviceEnvironmentOwnedHere, serviceStartableFromTray, serviceStatusSummary, stopServiceIfInstalled, uninstallServiceIfInstalled } from "../service";
 import { startupHealthSummary } from "../codex/autostart-health";
 import { drainAndShutdown, isRecyclingForExit, startServer } from "../server";
-import { injectSystemEnv, revertSystemEnv } from "../server/system-env";
+import { injectSystemEnv, reconcileShellHook, revertSystemEnv, uninstallShellHook } from "../server/system-env";
 import { buildDesktop3pRegistry } from "../claude/desktop-3p";
-import { installShellHook, uninstallShellHook } from "../server/system-env";
 import { startTokenGuardian } from "../oauth/token-guardian";
 import { startHistoryMigrationGuardian } from "../codex/history-migration-guardian";
-import { maybeAutoRestoreCodexShim } from "./codex-shim-autorestore";
 import { maybeShowStarPrompt } from "./star-prompt";
 import { scheduleCatalogPrewarm } from "./catalog-prewarm";
 import { maybeShowUpdatePrompt } from "../update/notify";
 import { syncModelsToCodex } from "../codex/sync";
-import { setIntegrationEnabled, shouldSyncCodexOnStart, shouldSyncGrokOnStart, syncCodexOnStartIfEnabled } from "../codex/desired-state";
-import { normalizeUpdateChannel, runGuiUpdateWorker } from "../update/job";
 import { collectOrcaCodexHomeDiagnostic } from "../codex/home";
+import { setIntegrationEnabled, shouldSyncCodexOnStart, shouldSyncGrokOnStart, syncCodexOnStartIfEnabled } from "../codex/desired-state";
+import { inspectNativeCodexOwnership } from "../integrations/native/ownership-preflight";
+
+/**
+ * A failed shell-hook reconcile is not cosmetic: a stale hook keeps sourcing
+ * `claude-env.sh` from every new interactive shell, pointing at a proxy or a CLI that may no
+ * longer exist. `reconcileShellHook` already reports `state: "failed"`, but both call sites
+ * discarded it, so the one outcome the user has to act on was the one they never saw.
+ */
+function reportShellHookFailure(result: { state: "installed" | "absent" | "failed"; reason?: string }): void {
+  if (result.state !== "failed") return;
+  console.warn(`   Claude shell hook not reconciled${result.reason ? `: ${result.reason}` : ""}`);
+  console.warn("   Check ~/.zshrc for the '# opencodex claude-env hook' block.");
+}
+
+
 import { removeOwnedConfigState } from "../lib/config-ownership";
 import { withProcessRuntimeProvenance } from "../lib/bun-runtime";
+import { selfLaunchArgv } from "../lib/self-launch-argv";
 import { initializeNodeLauncherContext } from "./launcher-context";
 import { createLocalAttestationSecret } from "../lib/local-management-attestation";
 import { MEMORY_DRAIN_RESTART_MS, REPLACEMENT_READY_TIMEOUT_MS } from "../lib/system-restart-contract";
 
 initializeNodeLauncherContext();
-const args = process.argv.slice(2);
-const command = args[0];
 
-if (command === "--version" || command === "-v" || command === "version") {
-  printVersion();
-  process.exit(0);
-}
-
-if (command === undefined || command === "help" || command === "--help" || command === "-h") {
-  if (command === "help" && args[1]) printSubcommandUsage(args[1]);
-  else printUsage();
-  process.exit(0);
-}
-
-if (command !== undefined && command !== "help" && hasHelpFlag(args.slice(1))) {
-  printSubcommandUsage(command);
-  process.exit(0);
-}
-
-// P1: pre-parse `ocx ready` and reject invalid arguments with exit 64 BEFORE
-// maybeAutoRestoreCodexShim (or any discovery/probe/filesystem-capable global
-// preflight) runs. `ready --help` / `help ready` already exited above, so this
-// only sees ready args without a help flag. Valid args are stashed so the
-// switch dispatch can call runReady without a second parse.
-let readyArgs: ReadyArgs | undefined;
-if (command === "ready") {
-  const parsed = parseReadyArgs(args.slice(1));
-  if (!parsed.ok) {
-    console.error("Usage: ocx ready [--json] [--wait [--timeout <seconds>]]");
-    console.error("  --timeout requires --wait; <seconds> must be a positive integer (1..300).");
-    console.error("  Default wait timeout is 45 seconds.");
-    process.exit(parsed.code);
-  }
-  readyArgs = parsed.args;
-}
-
-maybeAutoRestoreCodexShim(command, args);
+// Head: version/help early exits, `ready` pre-parse (exit 64 before any
+// preflight), and the bounded Codex-shim auto-restore preflight live in
+// src/cli/root.ts (Phase 1 of the CLI deepening). runCli exits for
+// version/help and returns the dispatchable head otherwise; the switch below
+// owns command dispatch.
+const head = await runCli(process.argv.slice(2));
+const args = head.args;
+const command = head.command;
+const readyArgs = head.readyArgs;
 
 function parsePortOption(): number | undefined {
   if (args.length === 1) return undefined;
@@ -145,11 +138,11 @@ function grokSyncFailureMessage(err: unknown): string {
 
 /** Argv for detached `start`, optionally hard-pinning the listen port. */
 function startArgv(port?: number): string[] {
-  const args = [process.argv[1], "start"];
+  const args = ["start"];
   if (typeof port === "number" && Number.isFinite(port) && port > 0 && port <= 65535) {
     args.push("--port", String(Math.trunc(port)));
   }
-  return args;
+  return selfLaunchArgv(args);
 }
 
 async function chooseListenPort(requestedPort?: number): Promise<number> {
@@ -215,6 +208,22 @@ async function chooseListenPort(requestedPort?: number): Promise<number> {
   }
 }
 
+async function findProxyOwnerBeforeJournalRecovery(
+  options: { probeConfiguredPort?: boolean } = {},
+): Promise<{ live: LiveProxy | null; pidSnapshot: number | null }> {
+  const pidSnapshot = readPidFileValue();
+  const hasRuntimeOwner = readRuntimePort() !== null;
+  const shouldProbe = pidSnapshot !== null || hasRuntimeOwner || options.probeConfiguredPort === true;
+  const live = shouldProbe ? await findLiveProxy() : null;
+  if (live) return { live, pidSnapshot };
+
+  // The probe established that the snapshotted owner is stale. Compare before
+  // deleting so a concurrent start that rewrote the PID file keeps its state.
+  removePidIfValueIs(pidSnapshot);
+  if (!currentExternalCodexModelProvider()) reconcileJournal();
+  return { live: null, pidSnapshot };
+}
+
 async function handleStart(options: { block?: boolean } = {}) {
   // Native (WinSW) service mode has no batch wrapper to read the service token file
   // into the environment, so the app loads it here before the server binds. The server
@@ -222,15 +231,21 @@ async function handleStart(options: { block?: boolean } = {}) {
   const serviceToken = loadServiceTokenFromFile(process.env);
   if (serviceToken) process.env.OPENCODEX_API_AUTH_TOKEN = serviceToken;
   const requestedPort = parsePortOption();
-  if (!currentExternalCodexModelProvider()) reconcileJournal();
-  const existingPid = readPid();
-  if (existingPid) {
-    const live = await findLiveProxy();
-    if (live) {
-      console.error(`⚠️  Proxy already running (PID ${live.pid ?? existingPid}, port ${live.port}). Use 'ocx stop' first.`);
-      process.exit(1);
+  const owner = await findProxyOwnerBeforeJournalRecovery();
+  if (owner.live) {
+    // Service-wrapper context (opencodex-service.cmd `:loop`): a healthy proxy from
+    // ANY source means the requested port is already served. Exit 0 so the wrapper's
+    // `if %ERRORLEVEL% NEQ 0` retry loop terminates instead of respawning every 5s
+    // against a listener it can never claim (observed as an endless
+    // "Proxy already running" service.log loop).
+    // Only the exact "1" sentinel takes this path — the same check syncCleanup
+    // uses — so an env value like "0" or "false" cannot bypass the conflict error.
+    if (process.env.OCX_SERVICE === "1") {
+      console.log(`Proxy already running (PID ${owner.live.pid ?? owner.pidSnapshot ?? "unknown"}, port ${owner.live.port}); service wrapper staying out of the way.`);
+      process.exit(0);
     }
-    removePid(existingPid);
+    console.error(`⚠️  Proxy already running (PID ${owner.live.pid ?? owner.pidSnapshot ?? "unknown"}, port ${owner.live.port}). Use 'ocx stop' first.`);
+    process.exit(1);
   }
 
   // Interactive-only update prompt. Must run BEFORE we bind a port / write a
@@ -308,7 +323,19 @@ async function handleStart(options: { block?: boolean } = {}) {
     removePid(process.pid);
     removeRuntimePort(process.pid);
     const preserveRouting = process.env.OCX_SERVICE === "1";
-    if (!recycling && !preserveRouting && !currentExternalCodexModelProvider()) {
+    const nativeOwnership = !recycling && !preserveRouting && !currentExternalCodexModelProvider()
+      ? (() => {
+          try {
+            return inspectNativeCodexOwnership();
+          } catch (error) {
+            return {
+              ownership: "unknown" as const,
+              reason: error instanceof Error ? error.message : String(error),
+            };
+          }
+        })()
+      : null;
+    if (nativeOwnership?.ownership === "owned") {
       try {
         const restored = restoreNativeCodex();
         if (!restored.success) {
@@ -319,6 +346,8 @@ async function handleStart(options: { block?: boolean } = {}) {
         cleanupSucceeded = false;
         console.error(`⚠️  Native Codex restore failed during shutdown: ${error instanceof Error ? error.message : String(error)}`);
       }
+    } else if (nativeOwnership) {
+      console.warn(`⚠️  Native Codex restore skipped during shutdown: ${nativeOwnership.reason}`);
     }
     // Same ownership rule as `ocx stop`: if the installed service belongs to another home, the
     // Grok fence is shared state we must not remove — that service keeps running and would be
@@ -367,9 +396,10 @@ async function handleStart(options: { block?: boolean } = {}) {
 
   // System-wide env injection AFTER signal handlers are registered (crash safety:
   // syncCleanup reverts even if injection itself or subsequent startup steps fail).
-  await injectSystemEnv(port, config).catch(() => {});
-  // Auto-install .zshrc hook (idempotent — skips if already present).
-  installShellHook();
+  const systemEnv = await injectSystemEnv(port, config).catch(() => ({ injected: false }));
+  // The hook is useful only for an installed Claude Code CLI. Reconcile instead of
+  // appending unconditionally so stale OpenCodex-owned hooks are removed as well.
+  reportShellHookFailure(reconcileShellHook(systemEnv.injected));
 
   await maybeShowStarPrompt(); // once-only Yes/No GitHub-star prompt on first interactive start
   // Post-startup sync drives the readiness gate AND the #1046 stale app-server
@@ -438,13 +468,13 @@ function detachedStartEnvironment(): NodeJS.ProcessEnv {
 }
 
 async function handleEnsure(options: { existingIsSuccess?: boolean } = {}): Promise<boolean> {
-  if (!currentExternalCodexModelProvider()) reconcileJournal();
+  const owner = await findProxyOwnerBeforeJournalRecovery({ probeConfiguredPort: true });
   const config = loadConfig();
   if (!codexAutoStartEnabled(config)) {
     console.log("Codex autostart is disabled.");
     return false;
   }
-  const live = await findLiveProxy();
+  const live = owner.live;
   if (live) {
     if (options.existingIsSuccess === false) {
       console.error("Proxy appeared while restart was confirming absence; no start was attempted.");
@@ -456,7 +486,8 @@ async function handleEnsure(options: { existingIsSuccess?: boolean } = {}): Prom
       });
       if (synced?.status === "skipped") console.log("   Codex integration OFF; startup left Codex native.");
       // Ensure env file exists for already-running proxy (may have been deleted or pre-dates this feature).
-      await injectSystemEnv(live.port, config).catch(() => {});
+      const systemEnv = await injectSystemEnv(live.port, config).catch(() => ({ injected: false }));
+      reportShellHookFailure(reconcileShellHook(systemEnv.injected));
       // Refresh the Grok Build fence too (same contract as start). live.hostname is the
       // hostname the running proxy actually bound — config.hostname may have drifted.
       try {
@@ -675,6 +706,10 @@ async function handleStop() {
       // exact teardown the refusal exists to prevent.
       const detail = err instanceof Error ? err.message : String(err);
       if (detail) console.error(`   ${detail}`);
+      if (err instanceof ProxyOwnershipRefusedError) {
+        ownershipBlocked = true;
+        console.error("   Skipping shared teardown (native Codex restore, Grok config): the foreign proxy is still running.");
+      }
     }
   } else {
     // Snapshot the stale on-disk state BEFORE the async probe: a concurrent `ocx start`
@@ -693,6 +728,10 @@ async function handleStop() {
         console.error(`❌ Failed to stop proxy (PID ${live.pid}).`);
         const detail = err instanceof Error ? err.message : String(err);
         if (detail) console.error(`   ${detail}`);
+        if (err instanceof ProxyOwnershipRefusedError) {
+          ownershipBlocked = true;
+          console.error("   Skipping shared teardown (native Codex restore, Grok config): the foreign proxy is still running.");
+        }
       }
     } else if (!stoppedService) {
       console.log("No running proxy found.");
@@ -903,7 +942,7 @@ async function handleRecoverHistory() {
     : { rows: 0, files: 0, failed: true as const };
   if (r.failed) {
     console.error(
-      "⚠️  Recovery SKIPPED: the Codex history DB is locked (Codex app/IDE open?). Close it and rerun this command.",
+      `⚠️  Recovery SKIPPED: ${describeHistoryJobFailure(outcome, "recover-legacy")}`,
     );
     process.exit(1);
   }
@@ -917,9 +956,41 @@ async function handleRecoverHistory() {
  * and exits with the returned code; it performs no parsing and no I/O of its
  * own. The full behavior is unit-testable without spawning a subprocess.
  */
-async function handleReady(args: ReadyArgs): Promise<never> {
-  process.exit(await runReady(args));
+async function handleReady(args: ReadyArgs): Promise<number> {
+  return runReady(args);
 }
+
+process.exit(await dispatchCommand(head, {
+  args,
+  command,
+  head,
+  loadConfig,
+  findLiveProxy,
+  probeHostname,
+  waitForProxy,
+  startArgv,
+  spawnDetached: argv => {
+    const child = spawn(process.execPath, argv, {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env: withProcessRuntimeProvenance(process.env),
+    });
+    child.unref();
+  },
+  handleStart,
+  handleStop,
+  handleEnsure,
+  handleTrayProxyStart,
+  handleTrayProxyRestart,
+  handleRestartStartWhenStopped,
+  handleProxyRestart,
+  handleUninstall,
+  handleStatus,
+  handleRecoverHistory,
+  handleReady,
+  serviceCommand,
+}));
 
 switch (command) {
   case "init":
@@ -949,15 +1020,16 @@ switch (command) {
       const live = await findLiveProxy();
       if (!live) {
         console.error("No running proxy found. Run 'ocx start' — it injects opencodex automatically.");
-        process.exit(1);
+        throw new Error("No running proxy found");
       }
       const desired = setIntegrationEnabled("codex", true);
       if (!desired.ok) {
-        process.exitCode = desired.reason === "conflict" ? 2 : 1;
-        console.error(`Codex desired state was not saved (${desired.reason}).`);
+        const reason = (desired as { readonly reason?: string }).reason ?? "invalid";
+        process.exitCode = reason === "conflict" ? 2 : 1;
+        console.error(`Codex desired state was not saved (${reason}).`);
         break;
       }
-      const synced = await syncModelsToCodex(live.port);
+      const synced = await syncModelsToCodex(live!.port);
       if (synced.status === "skipped") {
         process.exitCode = 2;
         console.error("Codex integration is OFF; restore back did not change Codex. Retry after the competing integration change finishes.");
@@ -974,21 +1046,22 @@ switch (command) {
     }
     const desired = setIntegrationEnabled("codex", false);
     if (!desired.ok) {
-      process.exitCode = desired.reason === "conflict" ? 2 : 1;
+      const reason = (desired as { readonly reason?: string }).reason ?? "invalid";
+      process.exitCode = reason === "conflict" ? 2 : 1;
       if (restoreJson) {
         // Machine-readable contract: every restore --json outcome emits one
         // schema-complete envelope on stdout, including pre-machinery failures.
         const { skippedRestoreEnvelope } = await import("../codex/inject");
-        console.log(JSON.stringify(skippedRestoreEnvelope(false, `Codex desired state was not saved (${desired.reason}).`)));
+        console.log(JSON.stringify(skippedRestoreEnvelope(false, `Codex desired state was not saved (${reason}).`)));
       } else {
-        console.error(`Codex desired state was not saved (${desired.reason}).`);
+        console.error(`Codex desired state was not saved (${reason}).`);
       }
       break;
     }
     // A repeated OFF on an already-clean home is a policy no-op. Do not enter
     // restore's native-profile machinery merely to prove there is nothing to
     // restore: those locks live in CODEX_HOME and a skip must create nothing.
-    if (desired.status === "unchanged") {
+    if (desired.ok && (desired as { readonly status: string }).status === "unchanged") {
       const { classifyNativeRoutedResidue } = await import("../codex/native-residue");
       if (classifyNativeRoutedResidue().kind === "clean") {
         const alreadyOff = "Codex integration is already OFF and native; no Codex files changed.";
@@ -1005,7 +1078,7 @@ switch (command) {
     try {
       r = await restoreNativeCodexAsync({ revalidateDesiredState: true });
     } catch (err) {
-      r = { success: false, message: err instanceof Error ? err.message : String(err) };
+      r = { success: false, message: String(err) };
     }
     if (restoreJson) {
       // Spawned callers need the artifact-level result to distinguish a busy
@@ -1107,7 +1180,7 @@ switch (command) {
     const invalidated = withCatalogWriteSerialization(owningCodexHome, permit =>
       invalidateCodexModelsCacheWithPermit(permit, owningCodexHome));
     // Only warn/restart when models_cache was actually rewritten from a readable catalog.
-    if (invalidated.kind === "completed" && invalidated.value) {
+    if (invalidated.kind === "completed" && (invalidated as { value: boolean }).value === true) {
       const { afterCatalogWriteHandleAppServers } = await import("../codex/app-server-processes");
       afterCatalogWriteHandleAppServers({ restart: restartCodex, log: console });
     }
@@ -1245,16 +1318,13 @@ switch (command) {
   case "__gui-update-worker": {
     const jobId = args[1];
     if (!jobId) process.exit(1);
-    const channel = normalizeUpdateChannel(args[2]);
-    await runGuiUpdateWorker(jobId, channel, args[3] === "restart");
+    const { normalizeUpdateChannel, runGuiUpdateWorker } = await import("../update/job");
+    await runGuiUpdateWorker(jobId, normalizeUpdateChannel(args[2]), args[3] === "restart");
     break;
   }
-  case "restart": {
-    // The running proxy owns its drain and replacement through /api/system/restart.
-    // If nothing is live, restart degrades to the documented `ensure` start behavior.
+  case "restart":
     await handleProxyRestart(handleRestartStartWhenStopped);
     break;
-  }
   case "health": {
     const healthArgs = args.slice(1);
     const wantsHealthJson = healthArgs.includes("--json");
@@ -1262,19 +1332,19 @@ switch (command) {
     if (wantsHealthJson) {
       console.log(JSON.stringify({ ok: !!live, pid: live?.pid ?? null, port: live?.port ?? null }));
     } else {
-      console.log(live ? `Proxy healthy (PID ${live.pid}, port ${live.port})` : "Proxy not healthy");
+      console.log(live ? `Proxy healthy (PID ${live?.pid}, port ${live?.port})` : "Proxy not healthy");
     }
-    process.exit(live ? 0 : 1);
+    process.exitCode = live ? 0 : 1;
+    break;
   }
   case "ready":
-    // Fail-closed impossible-state guard: readyArgs is populated by the
-    // preparse block before maybeAutoRestoreCodexShim, so reaching here
-    // without it means dispatch diverged. Refuse with code 64 and perform
-    // NO I/O (no discovery/probe). process.exit is `never`, narrowing below.
-    if (!readyArgs) process.exit(64);
-    await handleReady(readyArgs);
+    if (!readyArgs) {
+      process.exitCode = 64;
+      break;
+    }
+    await handleReady(readyArgs!);
     break;
-    case "provider": {
+  case "provider": {
     const { handleProviderCommand } = await import("./provider");
     await handleProviderCommand(args.slice(1));
     break;
@@ -1325,7 +1395,7 @@ switch (command) {
   case "storage":
   case "memory": {
     const { handleObserveCommand } = await import("./observe");
-    process.exitCode = await handleObserveCommand([command, ...args.slice(1)]);
+    process.exitCode = await handleObserveCommand([command ?? "observe", ...args.slice(1)]);
     break;
   }
   case "access": {
@@ -1377,7 +1447,6 @@ switch (command) {
   }
   case "claude": {
     const { cmdClaude } = await import("./claude");
-    // "ocx claude desktop" → write Desktop 3P config
     if (args[1] === "desktop") {
       const { handleClaudeDesktopCommand } = await import("./claude-desktop");
       const exitCode = await handleClaudeDesktopCommand(args.slice(2));
@@ -1395,14 +1464,13 @@ switch (command) {
     const { cmdOpencode } = await import("./opencode");
     process.exit(await cmdOpencode(args.slice(1)));
   }
-    case "help":
+  case "help":
   case "--help":
   case "-h":
   case undefined:
-    printUsage();
+    console.error("Use `ocx --help` for usage.");
     break;
   default:
     console.error(`Unknown command: ${command}`);
-    printUsage();
     process.exit(1);
 }
