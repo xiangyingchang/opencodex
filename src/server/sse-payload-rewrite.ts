@@ -139,6 +139,7 @@ export function relaySseWithBlockRewrite(
   const encoder = new TextEncoder();
   let buffer = "";
   let bufferBytes = 0;
+  const queuedOutputBytes: number[] = [];
   // Relays have several independent teardown paths; disposal is exactly once.
   let disposed = false;
   let cancelled = false;
@@ -172,19 +173,42 @@ export function relaySseWithBlockRewrite(
     bufferBytes = nextBytes;
   };
 
+  const releaseQueuedOutput = (): void => {
+    for (const bytes of queuedOutputBytes) {
+      translatorBudget.releaseRetained(bytes, { kind: "live_transient" });
+    }
+    queuedOutputBytes.length = 0;
+  };
+
   const enqueueText = (
     controller: ReadableStreamDefaultController<Uint8Array>,
     text: string,
   ): void => {
-    const bytes = encoder.encode(text).byteLength;
+    const encoded = encoder.encode(text);
+    const bytes = encoded.byteLength;
     const reservation = translatorBudget.reserveTransient(bytes, { kind: "live_transient" });
+    let committed = false;
     try {
-      const encoded = encoder.encode(text);
       reservation.commitRetained();
+      committed = true;
+      const desiredBefore = controller.desiredSize;
       controller.enqueue(encoded);
-      translatorBudget.releaseRetained(bytes, { kind: "live_transient" });
+      const desiredAfter = controller.desiredSize;
+      if (
+        desiredBefore !== null &&
+        desiredAfter !== null &&
+        desiredAfter < desiredBefore
+      ) {
+        queuedOutputBytes.push(bytes);
+      } else {
+        translatorBudget.releaseRetained(bytes, { kind: "live_transient" });
+      }
     } catch (error) {
-      reservation.release();
+      if (committed) {
+        translatorBudget.releaseRetained(bytes, { kind: "live_transient" });
+      } else {
+        reservation.release();
+      }
       throw error;
     }
   };
@@ -224,6 +248,7 @@ export function relaySseWithBlockRewrite(
 
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
+      releaseQueuedOutput();
       try {
         // A network chunk is not an SSE-event boundary. Bun may not issue a
         // second pull after a fulfilled pull enqueues nothing, so keep reading
@@ -248,6 +273,7 @@ export function relaySseWithBlockRewrite(
         }
       } catch (error) {
         releaseBuffer();
+        releaseQueuedOutput();
         disposeRewrite();
         try { await reader.cancel(error); } catch { /* already closed */ }
         controller.error(error);
@@ -256,6 +282,7 @@ export function relaySseWithBlockRewrite(
     cancel(reason) {
       cancelled = true;
       releaseBuffer();
+      releaseQueuedOutput();
       disposeRewrite();
       reader.cancel(reason).catch(() => {});
     },

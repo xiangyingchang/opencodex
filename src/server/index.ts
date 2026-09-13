@@ -63,7 +63,9 @@ import { codexAccountNamespaceEntries, isMainCodexAccountTarget } from "../codex
 import { MAIN_CODEX_ACCOUNT_ID } from "../codex/main-account";
 import {
   availableAccountGatedNativeModels,
+  isCodexModelEntitlementSnapshotCurrent,
   resolveCodexModelEntitlements,
+  type CodexModelEntitlementSnapshot,
 } from "../codex/model-entitlements";
 export {
   clearThreadAccountMap,
@@ -970,7 +972,7 @@ const config = runModelRenameStartupMigration(runAlibabaRegionStartupMigration(r
           return withCors(formatErrorResponse(403, "origin_rejected", "cross-origin data-plane request blocked"), req, policy);
         }
         let goModels;
-        let modelEntitlements;
+        let modelEntitlements: CodexModelEntitlementSnapshot;
         try {
           [goModels, modelEntitlements] = await Promise.all([
             fetchAllModels(config),
@@ -985,6 +987,14 @@ const config = runModelRenameStartupMigration(runAlibabaRegionStartupMigration(r
           }
           throw error;
         }
+        const modelEntitlementsForProjection: CodexModelEntitlementSnapshot =
+          isCodexModelEntitlementSnapshotCurrent(modelEntitlements)
+            ? modelEntitlements
+            : {
+              modelsByAccount: new Map(),
+              confirmedAccountIds: new Set(),
+              credentialIdentities: new Map(),
+            };
         const { accountBoundNativeOpenAiSlugsBySelector, applyNativeVisibility, buildCatalogEntries, configuredNativeAliasSlugs, desktopAllowlistSuppressedNativeSlugs, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeContextLimits, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, orderForSubagents, filterCatalogVisibleModels, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../codex/catalog");
         const { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } = await import("../codex/catalog/native-models");
         const includeNativeOpenAi = shouldIncludeNativeOpenAi(config);
@@ -994,10 +1004,10 @@ const config = runModelRenameStartupMigration(runAlibabaRegionStartupMigration(r
           config.providers[OPENAI_CODEX_PROVIDER_ID],
         ) === "direct" ? new Set([MAIN_CODEX_ACCOUNT_ID]) : undefined;
         const availableBareGatedNativeSlugs = availableAccountGatedNativeModels(
-          modelEntitlements,
+          modelEntitlementsForProjection,
           bareEligibleAccountIds,
         );
-        const availableAccountGatedNativeSlugs = availableAccountGatedNativeModels(modelEntitlements);
+        const availableAccountGatedNativeSlugs = availableAccountGatedNativeModels(modelEntitlementsForProjection);
         const availableBareNativeSlugs = NATIVE_OPENAI_MODELS.filter(slug => (
           !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableBareGatedNativeSlugs.has(slug)
         ));
@@ -1024,8 +1034,8 @@ const config = runModelRenameStartupMigration(runAlibabaRegionStartupMigration(r
           ? new Map([...accountBoundNativeOpenAiSlugsBySelector(config)].map(([selector, slugs]) => {
             const target = accountTargets.get(selector);
             const accountId = target && isMainCodexAccountTarget(target) ? MAIN_CODEX_ACCOUNT_ID : target;
-            const entitled = accountId ? modelEntitlements.modelsByAccount.get(accountId) : undefined;
-            const confirmed = accountId ? modelEntitlements.confirmedAccountIds.has(accountId) : false;
+            const entitled = accountId ? modelEntitlementsForProjection.modelsByAccount.get(accountId) : undefined;
+            const confirmed = accountId ? modelEntitlementsForProjection.confirmedAccountIds.has(accountId) : false;
             return [selector, slugs.filter(slug => (
               !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || (confirmed && entitled?.has(slug) === true)
             ))] as const;

@@ -8,6 +8,7 @@ import { startServer } from "../src/server";
 import type { OcxConfig } from "../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
 import { ManagementRequest } from "./helpers/management-auth";
+import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
 
 // Full-suite Windows load: startServer + discovery GETs exceed the default 5s budget
 // (same flake class as 810fa115 / claude-management-api).
@@ -371,7 +372,10 @@ test("Codex discovery exposes the observed native as a selector row plus one glo
     }],
   }), "utf8");
   writeFileSync(join(isolatedCodexHome!.path, "auth.json"), JSON.stringify({
-    tokens: { access_token: "main-token", account_id: "main-account" },
+    tokens: {
+      access_token: fakeChatGptJwt({ exp: Math.floor(Date.now() / 1000) + 3_600 }),
+      account_id: "main-account",
+    },
   }), "utf8");
 
   const { resetCatalogRuntimeStateForTests } = await import("../src/codex/catalog");

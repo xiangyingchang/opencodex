@@ -94,11 +94,13 @@ export function relaySseEagerBounded(
   hooks: EagerRelayHooks,
   opts?: EagerRelayOptions,
 ): ReadableStream<Uint8Array> {
-  const maxQueueBytes = opts?.maxQueueBytes ?? DEFAULT_MAX_QUEUE_BYTES;
+  const configuredMaxQueueBytes = opts?.maxQueueBytes ?? DEFAULT_MAX_QUEUE_BYTES;
+  const maxQueueBytes = Number.isFinite(configuredMaxQueueBytes)
+    ? Math.max(1, Math.floor(configuredMaxQueueBytes))
+    : DEFAULT_MAX_QUEUE_BYTES;
   const drainMs = opts?.postCancelDrainMs ?? DEFAULT_DRAIN_MS;
   const drainBytes = opts?.postCancelDrainBytes ?? DEFAULT_DRAIN_BYTES;
   const now = opts?.now ?? Date.now;
-
   const reader = body.getReader();
   const terminalBoundary = createSseTerminalOutputBoundary();
   const activeRewrite: SseBlockRewrite | undefined = hooks.rewriteBlocks
@@ -161,7 +163,11 @@ export function relaySseEagerBounded(
     frameBufferBytes = 0;
     return rewriteEncoder!.encode(tail);
   };
-  let queuedBytes = 0;
+  const currentQueuedBytes = () => {
+    const desiredSize = controllerRef?.desiredSize;
+    if (desiredSize === null || desiredSize === undefined) return 0;
+    return Math.max(0, maxQueueBytes - desiredSize);
+  };
   let cancelled = false;
   let done = false;
   const terminalSentinel = new TextEncoder().encode("data: [DONE]\n\n");
@@ -194,6 +200,54 @@ export function relaySseEagerBounded(
     (drainTimer as { unref?: () => void }).unref?.();
   };
 
+  const waitForQueueCapacity = (): Promise<void> | undefined => {
+    if (currentQueuedBytes() < maxQueueBytes || cancelled || upstream.signal.aborted) return;
+    return (async () => {
+      while (currentQueuedBytes() >= maxQueueBytes && !cancelled && !upstream.signal.aborted) {
+        await paused();
+      }
+    })();
+  };
+  const enqueueChunk = (value: Uint8Array, offset: number): number => {
+    const controller = controllerRef;
+    if (!controller) return value.byteLength;
+    const remainingCap = maxQueueBytes - currentQueuedBytes();
+    const chunkBytes = Math.min(value.byteLength - offset, remainingCap);
+    if (chunkBytes <= 0) return offset;
+    const chunk = offset === 0 && chunkBytes === value.byteLength
+      ? value
+      : value.subarray(offset, offset + chunkBytes);
+    try {
+      controller.enqueue(chunk);
+    } catch (error) {
+      wakeUp();
+      throw error;
+    }
+    // The byte-length queuing strategy makes desiredSize the authoritative
+    // retained-byte count; no per-chunk ledger is needed here.
+    return offset + chunk.byteLength;
+  };
+  const enqueueRemaining = async (value: Uint8Array, initialOffset: number): Promise<boolean> => {
+    let offset = initialOffset;
+    while (offset < value.byteLength) {
+      const wait = waitForQueueCapacity();
+      if (wait) await wait;
+      if (cancelled || upstream.signal.aborted) return false;
+      offset = enqueueChunk(value, offset);
+    }
+    return true;
+  };
+  /** Enqueue output while counting only bytes retained by the returned stream. */
+  const enqueueBounded = (value: Uint8Array): boolean | Promise<boolean> => {
+    let offset = 0;
+    while (offset < value.byteLength) {
+      if (cancelled || upstream.signal.aborted) return false;
+      if (currentQueuedBytes() >= maxQueueBytes) return enqueueRemaining(value, offset);
+      offset = enqueueChunk(value, offset);
+    }
+    return true;
+  };
+
   const producer = async () => {
     let syntheticKind: "incomplete" | "failed" | null = null;
     // reader.read() is not intrinsically tied to the upstream AbortController
@@ -209,6 +263,11 @@ export function relaySseEagerBounded(
     else upstream.signal.addEventListener("abort", wakeParkedRead, { once: true });
     try {
       for (;;) {
+        if (!cancelled) {
+          const wait = waitForQueueCapacity();
+          if (wait) await wait;
+        }
+        if (upstream.signal.aborted) break;
         const result = await reader.read();
         const { done: upstreamDone, value } = result;
         // A chunk that already settled is INSPECTED before abort is honored. A read
@@ -225,12 +284,16 @@ export function relaySseEagerBounded(
             const rewritten = rewriteOutbound(boundedTail);
             const tail = joinUint8Arrays(rewritten, flushRewriteTail());
             if (tail.byteLength > 0 && !cancelled) {
-              queuedBytes += tail.byteLength;
-              try { controllerRef?.enqueue(tail); } catch { /* client already gone */ }
+              try {
+                const pending = enqueueBounded(tail);
+                if (pending instanceof Promise) await pending;
+              } catch { /* client already gone */ }
             }
           } else if (boundedTail.byteLength > 0 && !cancelled) {
-            queuedBytes += boundedTail.byteLength;
-            try { controllerRef?.enqueue(boundedTail); } catch { /* client already gone */ }
+            try {
+              const pending = enqueueBounded(boundedTail);
+              if (pending instanceof Promise) await pending;
+            } catch { /* client already gone */ }
           }
           if (!hooks.sawTerminal() && !cancelled && !upstream.signal.aborted) {
             syntheticKind = "incomplete";
@@ -249,9 +312,9 @@ export function relaySseEagerBounded(
         const terminalBounded = terminalBoundary.feed(value);
         const outbound = activeRewrite ? rewriteOutbound(terminalBounded) : terminalBounded;
         if (outbound.byteLength > 0) {
-          queuedBytes += outbound.byteLength;
           try {
-            controllerRef?.enqueue(outbound);
+            const pending = enqueueBounded(outbound);
+            if (pending instanceof Promise) await pending;
           } catch {
             // Controller already torn down (client went away without cancel()).
             cancelled = true;
@@ -265,14 +328,13 @@ export function relaySseEagerBounded(
           // gateway keeps its HTTP connection alive. Add the conventional
           // sentinel and stop the single-reader relay at that protocol boundary.
           if (!terminalBoundary.doneSeen()) {
-            queuedBytes += terminalSentinel.byteLength;
-            try { controllerRef?.enqueue(terminalSentinel); } catch { /* client already gone */ }
+            try {
+              const pending = enqueueBounded(terminalSentinel);
+              if (pending instanceof Promise) await pending;
+            } catch { /* client already gone */ }
           }
           reader.cancel("Responses terminal event received").catch(() => {});
           break;
-        }
-        while (queuedBytes > maxQueueBytes && !cancelled && !upstream.signal.aborted) {
-          await paused();
         }
       }
     } catch (err) {
@@ -288,8 +350,10 @@ export function relaySseEagerBounded(
         );
         if (!hooks.sawTerminal() && !cancelled && !upstream.signal.aborted) {
           syntheticKind = "failed";
-          queuedBytes += tail.byteLength;
-          try { controllerRef?.enqueue(tail); } catch { /* client already torn down */ }
+          try {
+            const pending = enqueueBounded(tail);
+            if (pending instanceof Promise) await pending;
+          } catch { /* client already torn down */ }
           try { controllerRef?.close(); } catch { /* client already torn down */ }
         }
       }
@@ -328,10 +392,8 @@ export function relaySseEagerBounded(
       void producer();
     },
     pull() {
-      // The client consumed from the queue; approximate accounting: reset on
-      // pull below cap. desiredSize reflects internal queue in chunks, not
-      // bytes, so we track bytes ourselves and drain optimistically.
-      queuedBytes = 0;
+      // desiredSize already reflects bytes consumed from the byte-length queue;
+      // pull only wakes a producer waiting for capacity.
       wakeUp();
     },
     cancel() {
@@ -340,6 +402,9 @@ export function relaySseEagerBounded(
       armDrainTimer();
       wakeUp();
     },
+  }, {
+    highWaterMark: maxQueueBytes,
+    size: chunk => chunk?.byteLength ?? 0,
   });
 }
 

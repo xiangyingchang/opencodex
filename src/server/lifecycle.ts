@@ -31,6 +31,7 @@ import { releaseNativeMainStartupLifecycle } from "../codex/native-profile-start
 
 export const MAX_ACTIVE_TURNS = 256;
 const turnGate = createAdmissionGate("active_turns", MAX_ACTIVE_TURNS);
+export type ActiveTurnAdmissionGate = Pick<typeof turnGate, "tryAcquire">;
 export interface ActiveTurnLease extends AdmissionLease {
   bindAbortController(ac: AbortController): void;
   beginCodexAccountSelection(): CodexAccountSelectionAdmission;
@@ -51,6 +52,7 @@ let recyclingForExit = false;
 let _serverRef: ReturnType<typeof Bun.serve> | undefined;
 let serverStopFlights = new WeakMap<ReturnType<typeof Bun.serve>, Promise<void>>();
 let serverStartupReleaseFlights = new WeakMap<ReturnType<typeof Bun.serve>, Promise<void>>();
+let shutdownFlight: Promise<void> | undefined;
 let releaseServerStartupLifecycleImpl: typeof releaseNativeMainStartupLifecycle = releaseNativeMainStartupLifecycle;
 
 export function setServerRef(server: ReturnType<typeof Bun.serve> | undefined): void { _serverRef = server; }
@@ -123,6 +125,79 @@ export function waitForTemporaryDrains(): Promise<void> {
   return new Promise(resolve => temporaryDrainWaiters.add(resolve));
 }
 
+export interface ShutdownPhase {
+  readonly name: string;
+  readonly run: () => void | Promise<void>;
+}
+
+export interface ShutdownPhaseRunResult {
+  readonly timedOut: boolean;
+  readonly timedOutPhases: string[];
+  readonly detachedPhases: string[];
+  readonly failedPhases: string[];
+}
+
+type ShutdownPhaseOutcome = "completed" | "timed-out" | "failed";
+
+function startShutdownPhase(phase: ShutdownPhase): Promise<void> {
+  return Promise.resolve().then(() => phase.run());
+}
+
+/**
+ * Run ordered shutdown phases against one absolute deadline. Once the deadline
+ * is exhausted, later phases are still started best-effort but are deliberately
+ * detached; a stuck flush or worker cannot hold the process past its budget.
+ */
+export async function runShutdownPhasesUntil(
+  phases: readonly ShutdownPhase[],
+  deadlineAt: number,
+  now: () => number = Date.now,
+): Promise<ShutdownPhaseRunResult> {
+  const timedOutPhases: string[] = [];
+  const detachedPhases: string[] = [];
+  const failedPhases: string[] = [];
+  let timedOut = false;
+
+  for (const phase of phases) {
+    const task = startShutdownPhase(phase);
+    const remainingMs = Math.max(0, deadlineAt - now());
+    if (remainingMs === 0 || timedOut) {
+      timedOut = true;
+      detachedPhases.push(phase.name);
+      void task.catch(() => {});
+      continue;
+    }
+
+    const outcome = await new Promise<ShutdownPhaseOutcome>(resolve => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (value: ShutdownPhaseOutcome) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        resolve(value);
+      };
+      timer = setTimeout(() => finish("timed-out"), remainingMs);
+      if (typeof timer === "object" && timer !== null && "unref" in timer) {
+        (timer as { unref?: () => void }).unref?.();
+      }
+      task.then(
+        () => finish("completed"),
+        () => finish("failed"),
+      );
+    });
+
+    if (outcome === "timed-out") {
+      timedOut = true;
+      timedOutPhases.push(phase.name);
+    } else if (outcome === "failed") {
+      failedPhases.push(phase.name);
+    }
+  }
+
+  return { timedOut, timedOutPhases, detachedPhases, failedPhases };
+}
+
 /** Wait for scoped drains without allowing them to outlive the shutdown deadline. */
 async function waitForTemporaryDrainsUntil(deadlineMs: number): Promise<boolean> {
   if (temporaryDrainCount() === 0) return true;
@@ -131,14 +206,19 @@ async function waitForTemporaryDrainsUntil(deadlineMs: number): Promise<boolean>
   return new Promise<boolean>((resolve) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const waiter = () => finish(true);
     const finish = (drained: boolean) => {
       if (settled) return;
       settled = true;
-      if (timer) clearTimeout(timer);
+      temporaryDrainWaiters.delete(waiter);
+      if (timer !== undefined) clearTimeout(timer);
       resolve(drained);
     };
+    temporaryDrainWaiters.add(waiter);
     timer = setTimeout(() => finish(false), remainingMs);
-    void waitForTemporaryDrains().then(() => finish(true));
+    if (typeof timer === "object" && timer !== null && "unref" in timer) {
+      (timer as { unref?: () => void }).unref?.();
+    }
   });
 }
 
@@ -153,13 +233,14 @@ export function resetLifecycleDrainStateForTests(): void {
   for (const resolve of temporaryDrainWaiters) resolve();
   temporaryDrainWaiters.clear();
   shutdownDraining = false;
+  shutdownFlight = undefined;
   serverStopFlights = new WeakMap<ReturnType<typeof Bun.serve>, Promise<void>>();
   serverStartupReleaseFlights = new WeakMap<ReturnType<typeof Bun.serve>, Promise<void>>();
   releaseServerStartupLifecycleImpl = releaseNativeMainStartupLifecycle;
 }
-export function tryAdmitTurn(): ActiveTurnLease | null {
+export function tryAdmitTurn(gate: ActiveTurnAdmissionGate = turnGate): ActiveTurnLease | null {
   if (isDraining()) return null;
-  const gateLease = turnGate.tryAcquire();
+  const gateLease = gate.tryAcquire();
   if (!gateLease) return null;
   const controllers = new Set<AbortController>();
   let active = true;
@@ -306,26 +387,25 @@ export function getServerListenPort(): number | undefined {
  *   caller sees the same result before a replacement binds the port. Swallowing it would let
  *   `drainAndShutdown` report success while a socket is still held.
  *
- * `always` runs after the listeners regardless of their outcome, and its own failure joins the
- * reported set rather than replacing it.
+ * `always` is started as an independent best-effort cleanup alongside the listeners, and its own
+ * failure joins the reported set rather than replacing it.
  */
 export async function runListenerShutdown(
   steps: Array<() => Promise<void>>,
   always: () => Promise<void>,
 ): Promise<void> {
-  const failures: unknown[] = [];
-  for (const step of steps) {
-    try {
-      await step();
-    } catch (error) {
-      failures.push(error);
-    }
-  }
-  try {
-    await always();
-  } catch (error) {
-    failures.push(error);
-  }
+  // Start every listener cleanup and the unconditional cleanup in its own
+  // promise. A stuck first listener must not prevent later sockets or lifecycle
+  // ownership from being released. allSettled preserves every rejection for the
+  // same failure-propagation contract as the former ordered loop.
+  const started = [
+    ...steps.map(step => Promise.resolve().then(step)),
+    Promise.resolve().then(always),
+  ];
+  const settled = await Promise.allSettled(started);
+  const failures = settled
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map(result => result.reason);
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) throw new AggregateError(failures, "listener shutdown failed");
 }
@@ -404,95 +484,158 @@ export function trackStreamLifetime(
   });
 }
 
-export async function drainAndShutdown(
+export function drainAndShutdown(
+  server: ReturnType<typeof Bun.serve> | undefined,
+  timeoutMs: number,
+): Promise<void> {
+  if (shutdownFlight) return shutdownFlight;
+  shutdownFlight = drainAndShutdownImpl(server, timeoutMs);
+  return shutdownFlight;
+}
+
+async function drainAndShutdownImpl(
   server: ReturnType<typeof Bun.serve> | undefined,
   timeoutMs: number,
 ): Promise<void> {
   const s = server ?? _serverRef;
-  // One absolute budget covers both a pre-existing scoped profile drain and
-  // ordinary in-flight turns. A stuck scoped owner must not pin shutdown forever.
-  const deadline = Date.now() + Math.max(0, timeoutMs);
+  // One absolute budget covers the entire shutdown chain. Non-finite input is
+  // fail-closed instead of accidentally creating an unbounded timer.
+  const boundedTimeoutMs = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : 0;
+  const deadline = Date.now() + boundedTimeoutMs;
   beginShutdownDrain();
+
   const temporaryDrainsSettled = await waitForTemporaryDrainsUntil(deadline);
   if (!temporaryDrainsSettled) {
     console.warn("Temporary drain lease did not settle before the shutdown deadline; forcing shutdown");
   }
-  beginBackgroundShellShutdown();
   try {
-    while (admittedTurns.size > 0 && Date.now() < deadline) {
-      await Bun.sleep(100);
-    }
-    if (admittedTurns.size > 0) {
-      console.warn(`⚠️  Aborting ${admittedTurns.size} in-flight turn(s) after ${timeoutMs}ms deadline`);
-      abortAndReleaseAllTurns(new Error("server shutdown"));
-    }
+    beginBackgroundShellShutdown();
+  } catch {
+    console.warn("[cursor] background shell shutdown signal failed");
+  }
 
-    const shellDrain = await Promise.allSettled([terminateAllBackgroundShells()]);
-    const shellResult = shellDrain[0]!;
-    if (shellResult.status === "rejected") {
-      console.warn("[cursor] background shell drain failed", { rejected: 1 });
-    } else if (shellResult.value.unresolved > 0 || shellResult.value.killFailures > 0) {
-      console.warn("[cursor] background shell drain incomplete", shellResult.value);
-    }
+  const phaseResult = await runShutdownPhasesUntil(
+    [
+      {
+        name: "active turns",
+        run: async () => {
+          while (admittedTurns.size > 0) {
+            const remainingMs = deadline - Date.now();
+            if (remainingMs <= 0) break;
+            await Bun.sleep(Math.min(100, remainingMs));
+          }
+          if (admittedTurns.size > 0) {
+            console.warn(`⚠️  Aborting ${admittedTurns.size} in-flight turn(s) after ${boundedTimeoutMs}ms deadline`);
+            abortAndReleaseAllTurns(new Error("server shutdown"));
+          }
+        },
+      },
+      {
+        name: "background shell drain",
+        run: async () => {
+          const shellDrain = await Promise.allSettled([terminateAllBackgroundShells()]);
+          const shellResult = shellDrain[0]!;
+          if (shellResult.status === "rejected") {
+            console.warn("[cursor] background shell drain failed", { rejected: 1 });
+          } else if (shellResult.value.unresolved > 0 || shellResult.value.killFailures > 0) {
+            console.warn("[cursor] background shell drain incomplete", shellResult.value);
+          }
+        },
+      },
+      {
+        name: "response/replay state flush",
+        run: async () => {
+          // Start both flushes even if one throws synchronously; allSettled keeps
+          // one subsystem from preventing the other from being attempted.
+          const stateFlush = await Promise.allSettled([
+            Promise.resolve().then(() => flushResponseState()),
+            Promise.resolve().then(() => flushAntigravityReplay()),
+          ]);
+          if (stateFlush[0]?.status === "rejected") {
+            console.warn("[responses] state flush during shutdown failed");
+          }
+          if (stateFlush[1]?.status === "rejected") {
+            console.warn("[antigravity] replay flush during shutdown failed");
+          }
+        },
+      },
+      {
+        name: "storage scheduler stop",
+        run: () => {
+          stopStorageCleanupScheduler();
+        },
+      },
+      {
+        name: "optional shutdown hooks",
+        run: () => {
+          // Optional subsystems tear themselves down through hooks registered at
+          // activation. A process that never activated one runs nothing here.
+          runOptionalShutdownHooks();
+        },
+      },
+      {
+        name: "state-store sweeper stop",
+        run: () => {
+          stopStateStoreSweeper();
+        },
+      },
+      {
+        name: "queued storage spawn cancellation",
+        run: () => {
+          cancelQueuedStorageWorkerSpawns();
+        },
+      },
+      {
+        name: "storage job abort",
+        run: async () => {
+          const shutdownJoins = await Promise.allSettled([
+            Promise.resolve().then(() => abortStorageCleanupPolicyJobAsync()),
+            Promise.resolve().then(() => abortRestoreTrashJobAsync()),
+          ]);
+          for (const result of shutdownJoins) {
+            if (result.status === "rejected") {
+              console.warn("[storage] worker abort during shutdown failed", { rejected: 1 });
+            }
+          }
+        },
+      },
+      {
+        name: "storage worker join",
+        run: async () => {
+          try {
+            await drainStorageWorkers();
+          } catch {
+            console.warn("[storage] worker drain during shutdown failed");
+          }
+        },
+      },
+      {
+        name: "storage sink detach",
+        run: () => {
+          setStorageCleanupPolicyLiveSink(null);
+          setStorageCleanupPolicyJobLiveApply(null);
+        },
+      },
+      {
+        name: "listener stop",
+        run: () => stopServerListener(s),
+      },
+      {
+        name: "startup lifecycle release",
+        run: () => releaseServerStartupLifecycle(s),
+      },
+    ],
+    deadline,
+  );
 
-    // Debounced replay-state snapshots may still be pending; flush so the last completed turn's
-    // previous_response_id chain and antigravity thought signatures survive the restart this
-    // shutdown is usually part of.
-    const stateFlush = await Promise.allSettled([flushResponseState(), flushAntigravityReplay()]);
-    if (stateFlush[0]?.status === "rejected") {
-      console.warn("[responses] state flush during shutdown failed");
-    }
-    if (stateFlush[1]?.status === "rejected") {
-      console.warn("[antigravity] replay flush during shutdown failed");
-    }
-
-    // Tear down opt-in storage policy timers / worker / live-config sink so they cannot fire after stop.
-    // Await worker thread exit: on Windows, a still-exiting Bun Worker under
-    // `bun test --isolate` panics the whole process at the next realm reclaim.
-    // Abort each job independently so one wedged join cannot skip the other,
-    // then drain leftovers; failures must not prevent `server.stop`.
-    stopStorageCleanupScheduler();
-    // Optional subsystems (Compatibility Lab today, anything added later) tear themselves
-    // down through hooks registered at activation. A process that never activated one runs
-    // nothing here and never loads its module graph.
-    runOptionalShutdownHooks();
-    stopStateStoreSweeper();
-    // The overlay reconciler is owner-scoped: the startServer stop override
-    // releases THIS server's lease through runListenerShutdown →
-    // userCostOverlayReconciler.stop(), which also recomputes disk-only
-    // preservation for any remaining owners. A process-wide stop here would
-    // kill reconciliation for every other server in the process, so drain
-    // must not call stopUserCostOverlayReconciler().
-    cancelQueuedStorageWorkerSpawns();
-    const shutdownJoins = await Promise.allSettled([
-      abortStorageCleanupPolicyJobAsync(),
-      abortRestoreTrashJobAsync(),
-    ]);
-    for (const result of shutdownJoins) {
-      if (result.status === "rejected") {
-        console.warn(
-          "[storage] worker abort during shutdown failed:",
-          result.reason instanceof Error ? result.reason.message : result.reason,
-        );
-      }
-    }
-    try {
-      await drainStorageWorkers();
-    } catch (err) {
-      console.warn(
-        "[storage] worker drain during shutdown failed:",
-        err instanceof Error ? err.message : err,
-      );
-    }
-    setStorageCleanupPolicyLiveSink(null);
-    setStorageCleanupPolicyJobLiveApply(null);
-  } finally {
-    try {
-      await stopServerListener(s);
-    } finally {
-      await releaseServerStartupLifecycle(s);
-      // shutdownDraining is a process-lifetime latch. A stopped server must
-      // never resume admission merely because shutdown cleanup returned.
-    }
+  if (phaseResult.timedOutPhases.length > 0) {
+    console.warn("[shutdown] deadline reached during", phaseResult.timedOutPhases);
+  }
+  if (phaseResult.detachedPhases.length > 0) {
+    console.warn("[shutdown] best-effort phases detached after deadline", phaseResult.detachedPhases);
+  }
+  if (phaseResult.failedPhases.length > 0) {
+    console.warn("[shutdown] phases failed", phaseResult.failedPhases);
+    throw new Error(`shutdown cleanup phases failed: ${phaseResult.failedPhases.join(", ")}`);
   }
 }

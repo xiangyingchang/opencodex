@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { relaySseWithFailedTail, relayWithAbort } from "../src/server";
 import { relaySseEagerBounded, type EagerRelayHooks } from "../src/server/relay-eager";
-import { MAX_TAIL_ERROR_MESSAGE_CHARS } from "../src/server/relay";
 import { TranslatorBudgetExceededError } from "../src/lib/translator-budget";
 
 const encoder = new TextEncoder();
@@ -127,7 +126,7 @@ describe("relaySseWithFailedTail", () => {
     expect(parsed.type).toBe("response.failed");
     expect(parsed.response.status).toBe("failed");
     expect(parsed.response.error.code).toBe("upstream_reset");
-    expect(parsed.response.error.message).toContain("socket connection was closed unexpectedly");
+    expect(parsed.response.error.message).toBe("Upstream response stream terminated unexpectedly");
     // Stream CLOSED (drain returned) rather than erroring, and the upstream fetch was aborted.
     expect(upstream.signal.aborted).toBe(true);
   });
@@ -138,6 +137,57 @@ describe("relaySseWithFailedTail", () => {
     const out = await drain(relaySseWithFailedTail(src, upstream));
     expect(out).toContain("event: response.failed\ndata: ");
     expect(out.endsWith("data: [DONE]\n\n")).toBe(true);
+  });
+
+  test("does not expose raw upstream error text in a failed tail", async () => {
+    const upstream = new AbortController();
+    const sensitiveMessage = "fetch https://native.example/responses?token=not-for-client Authorization=Bearer-not-for-client body=private";
+    const out = await drain(relaySseWithFailedTail(
+      sourceStream([], { failAfter: true, error: new Error(sensitiveMessage) }),
+      upstream,
+    ));
+
+    expect(out).not.toContain("token=not-for-client");
+    expect(out).not.toContain("Bearer-not-for-client");
+    expect(out).not.toContain("body=private");
+    expect(failedMessage(out)).toBe("Upstream response stream terminated unexpectedly");
+  });
+
+  test("clean EOF before a Responses terminal emits a failed tail when enabled", async () => {
+    const upstream = new AbortController();
+    const out = await drain(relaySseWithFailedTail(
+      sourceStream([`event: response.created
+data: {"type":"response.created"}
+
+`]),
+      upstream,
+      undefined,
+      undefined,
+      true,
+    ));
+
+    expect(out).toContain("response.created");
+    expect(out).toContain(`event: response.failed
+data: `);
+    expect(out).toContain('"code":"upstream_eof"');
+    expect(out.endsWith(`data: [DONE]
+
+`)).toBe(true);
+    expect(upstream.signal.aborted).toBe(true);
+  });
+
+  test("client cancellation does not call the upstream-error diagnostic", async () => {
+    const upstream = new AbortController();
+    const errors: unknown[] = [];
+    const src = new ReadableStream<Uint8Array>({
+      pull() { /* remain pending until the downstream cancels */ },
+    });
+    const relayed = relaySseWithFailedTail(src, upstream, undefined, error => errors.push(error));
+
+    await relayed.getReader().cancel(new DOMException("client closed", "AbortError"));
+
+    expect(errors).toHaveLength(0);
+    expect(upstream.signal.aborted).toBe(true);
   });
 
   test("translator overflow failed tail preserves translation_buffer_limit", async () => {
@@ -198,10 +248,8 @@ describe("relaySseWithFailedTail", () => {
       ));
 
       expect(encoder.encode(eager)).toEqual(encoder.encode(legacy));
-      if (message.length > MAX_TAIL_ERROR_MESSAGE_CHARS) {
-        expect(failedMessage(eager).length).toBe(MAX_TAIL_ERROR_MESSAGE_CHARS);
-        expect(failedMessage(legacy)).not.toContain("uncapped-suffix");
-      }
+      expect(failedMessage(eager)).toBe("Upstream response stream terminated unexpectedly");
+      expect(failedMessage(legacy)).toBe("Upstream response stream terminated unexpectedly");
     }
   });
 });

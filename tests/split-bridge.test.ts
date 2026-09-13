@@ -65,7 +65,12 @@ describe("Provider Split Bridge", () => {
   test("routes native requests to nativeBaseUrl and keeps the gateway untouched", async () => {
     const upstreamBody = new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.enqueue(new TextEncoder().encode("data: native\n\n"));
+        controller.enqueue(new TextEncoder().encode(
+          `event: response.completed
+data: {"type":"response.completed"}
+
+`,
+        ));
         controller.close();
       },
     });
@@ -87,6 +92,7 @@ describe("Provider Split Bridge", () => {
 
     expect(calls).toHaveLength(1);
     expect(calls[0]?.url).toBe("https://native.example/responses?stream=true");
+    expect((calls[0]?.init?.headers as Headers).get("accept-encoding")).toBe("identity");
     expect((calls[0]?.init?.headers as Headers).has("x-opencodex-bridge-admission")).toBe(false);
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/event-stream");
@@ -96,7 +102,7 @@ describe("Provider Split Bridge", () => {
     expect(response.headers.get("openai-request-id")).toBe("openai-native");
     expect(response.headers.get("x-ratelimit-remaining-tokens")).toBe("42");
     expect(response.headers.has("x-upstream-secret")).toBe(false);
-    expect(await response.text()).toBe("data: native\n\n");
+    expect(await response.text()).toContain("response.completed");
   });
 
   test("delegates exact account models through the gateway and keeps API-key models on gateway policy", async () => {
@@ -290,6 +296,134 @@ describe("Provider Split Bridge", () => {
     expect(gatewayResponse.status).toBe(503);
     expect(await errorCode(gatewayResponse)).toBe("gateway_unavailable");
     expect(gateway.calls).toHaveLength(1);
+  });
+
+  test("retries a native pre-stream ECONNRESET on a fresh connection without retrying the gateway", async () => {
+    let nativeAttempts = 0;
+    const native = makeBridge(async () => {
+      nativeAttempts++;
+      if (nativeAttempts === 1) {
+        throw Object.assign(new Error("socket reset"), { code: "ECONNRESET" });
+      }
+      return jsonResponse({ ok: true });
+    });
+
+    const nativeResponse = await native.handler(postRequest("gpt-5.6-luna"));
+
+    expect(nativeResponse.status).toBe(200);
+    expect(await nativeResponse.json()).toEqual({ ok: true });
+    expect(native.calls).toHaveLength(2);
+    const firstInit = native.calls[0]?.init;
+    const recoveryInit = native.calls[1]?.init;
+    expect((recoveryInit?.headers as Headers).get("connection")).toBe("close");
+    expect(recoveryInit?.keepalive).toBe(false);
+    expect(recoveryInit?.signal).toBe(firstInit?.signal);
+    expect(recoveryInit?.body).toBe(firstInit?.body);
+
+    const gateway = makeBridge(async () => {
+      throw Object.assign(new Error("gateway socket reset"), { code: "ECONNRESET" });
+    });
+    const gatewayResponse = await gateway.handler(postRequest("deepseek/deepseek-v4-flash"));
+
+    expect(gatewayResponse.status).toBe(503);
+    expect(await errorCode(gatewayResponse)).toBe("gateway_unavailable");
+    expect(gateway.calls).toHaveLength(1);
+  });
+
+  test("requests identity encoding for native SSE and converts a mid-stream body error to a failed tail", async () => {
+    const encoder = new TextEncoder();
+    const sensitiveUpstreamError = "fetch https://native.example/responses?token=not-for-client body=private";
+    const { handler, calls } = makeBridge(async () => new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(
+            `event: response.created\ndata: {"type":"response.created"}\n\n`,
+          ));
+          queueMicrotask(() => controller.error(Object.assign(
+            new Error(sensitiveUpstreamError),
+            { code: "ECONNRESET" },
+          )));
+        },
+      }),
+      {
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream",
+          "content-encoding": "gzip",
+          "content-length": "999",
+        },
+      },
+    ));
+
+    const response = await handler(postRequest("gpt-5.6-luna", "/v1/responses", {}, { stream: true }));
+    const text = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect((calls[0]?.init?.headers as Headers).get("accept-encoding")).toBe("identity");
+    expect(response.headers.get("content-encoding")).toBeNull();
+    expect(response.headers.get("content-length")).toBeNull();
+    expect(text).toContain('"type":"response.failed"');
+    expect(text).toContain('"code":"upstream_reset"');
+    expect(text).not.toContain(sensitiveUpstreamError);
+    expect(text).toContain(`data: [DONE]\n\n`);
+
+    const health = await handler(new Request("http://127.0.0.1:10101/healthz"));
+    const healthBody = await health.json() as { admission?: { native?: { active?: number } } };
+    expect(healthBody.admission?.native?.active).toBe(0);
+  });
+
+  test("converts native SSE clean EOF without a terminal to a failed tail and releases admission", async () => {
+    const encoder = new TextEncoder();
+    const { handler } = makeBridge(async () => new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(
+            `event: response.created
+data: {"type":"response.created"}
+
+`,
+          ));
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ));
+
+    const response = await handler(postRequest("gpt-5.6-luna", "/v1/responses", {}, { stream: true }));
+    const text = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(text).toContain('"type":"response.failed"');
+    expect(text).toContain('"code":"upstream_eof"');
+    expect(text.endsWith(`data: [DONE]
+
+`)).toBe(true);
+
+    const health = await handler(new Request("http://127.0.0.1:10101/healthz"));
+    const healthBody = await health.json() as { admission?: { native?: { active?: number } } };
+    expect(healthBody.admission?.native?.active).toBe(0);
+  });
+
+  test("aborts the split native upstream controller after a protocol terminal", async () => {
+    const encoder = new TextEncoder();
+    const { handler, calls } = makeBridge(async () => new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(
+            `event: response.completed
+data: {"type":"response.completed"}
+
+`,
+          ));
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ));
+
+    const response = await handler(postRequest("gpt-5.6-luna", "/v1/responses", {}, { stream: true }));
+    expect(await response.text()).toContain("response.completed");
+    expect((calls[0]?.init?.signal as AbortSignal).aborted).toBe(true);
   });
 
   test("rejects a body that exceeds the configured bound before classification or fetch", async () => {

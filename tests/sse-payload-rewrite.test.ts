@@ -137,6 +137,43 @@ describe("SSE payload rewrite composition", () => {
     expect(budget.snapshot().currentBytes).toBe(0);
   });
 
+  test("keeps queued rewrite output charged until consumption and EOF", async () => {
+    const budget = createTestTranslatorBudget();
+    const upstream = streamFromText('event: source\ndata: {"type":"source"}\n\n');
+    const rewritten = relaySseWithBlockRewrite(
+      upstream,
+      block => [`${block}-one`, `${block}-two`, `${block}-three`],
+      budget,
+    );
+    const reader = rewritten.getReader();
+
+    expect((await reader.read()).done).toBe(false);
+    // The default ReadableStream HWM is one chunk: the first output was
+    // delivered to the pending reader, while the other two remain queued.
+    expect(budget.snapshot().currentBytes).toBeGreaterThan(0);
+
+    expect((await reader.read()).done).toBe(false);
+    expect((await reader.read()).done).toBe(false);
+    expect((await reader.read()).done).toBe(true);
+    expect(budget.snapshot().currentBytes).toBe(0);
+  });
+
+  test("releases all queued rewrite output when the downstream reader cancels", async () => {
+    const budget = createTestTranslatorBudget();
+    const upstream = streamFromText('event: source\ndata: {"type":"source"}\n\n');
+    const rewritten = relaySseWithBlockRewrite(
+      upstream,
+      block => [`${block}-one`, `${block}-two`, `${block}-three`],
+      budget,
+    );
+    const reader = rewritten.getReader();
+
+    expect((await reader.read()).done).toBe(false);
+    expect(budget.snapshot().currentBytes).toBeGreaterThan(0);
+    await reader.cancel("test cancel");
+    expect(budget.snapshot().currentBytes).toBe(0);
+  });
+
   test("unterminated rewrite accumulation closes through a typed failed tail", async () => {
     const budget = createTestTranslatorBudget({ maxTurnBytes: 64 });
     const upstream = new AbortController();

@@ -1,25 +1,44 @@
-/** ChatGPT/Codex wire id observed for the account-native Daybreak Blue surface. */
+/** ChatGPT/Codex wire ids observed for account-native model surfaces. */
 export const NATIVE_DAYBREAK_BLUE_MODEL = "gpt-daybreak-blue-latest";
+export const NATIVE_GPT6_ASTRA_MODEL = "gpt-6-astra";
 
 /** Native ChatGPT/Codex ids whose availability is proven per authenticated account. */
 export const ACCOUNT_GATED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set([
   NATIVE_DAYBREAK_BLUE_MODEL,
+  NATIVE_GPT6_ASTRA_MODEL,
 ]);
 
 /**
  * Account-native aliases whose Codex capabilities track another pinned native row.
  *
- * This is catalog metadata inheritance only. Routing always preserves the requested
- * wire id for the separately billed API-key `daybreak-*-latest` surface, so the two never
- * collapse into each other.
+ * This is catalog metadata inheritance only. Each alias remains its own product identity;
+ * API-key routes preserve their requested wire id, and the ChatGPT/Codex route applies any
+ * separately verified wire normalization at the transport boundary.
  *
- * The ChatGPT/Codex surface is different: an account-gated request IS rewritten to its
- * canonical wire model before it leaves the process (`applyCodexAccountGatedWireNormalization`
- * in src/server/responses/core.ts), because the authenticated backend rejects the gated slug
- * on shards that do not carry it. The catalog keeps the product identity; only the wire moves.
+ * Daybreak currently has that normalization because the authenticated backend rejects its
+ * gated slug on some shards; Astra is intentionally left on its roster-advertised wire id
+ * until a corresponding transport observation exists. The catalog keeps the product identity;
+ * only the verified wire mapping moves.
  */
 const NATIVE_OPENAI_CAPABILITY_SOURCES: Readonly<Record<string, string>> = Object.freeze({
   [NATIVE_DAYBREAK_BLUE_MODEL]: "gpt-5.6-sol",
+  [NATIVE_GPT6_ASTRA_MODEL]: "gpt-5.6-sol",
+});
+
+export interface NativeOpenAiCapabilityPresentation {
+  readonly displayName: string;
+  readonly description: string;
+}
+
+const NATIVE_OPENAI_CAPABILITY_PRESENTATIONS: Readonly<Record<string, NativeOpenAiCapabilityPresentation>> = Object.freeze({
+  [NATIVE_DAYBREAK_BLUE_MODEL]: {
+    displayName: "Daybreak Blue",
+    description: "Frontier general-purpose model with safeguards for defensive cybersecurity work.",
+  },
+  [NATIVE_GPT6_ASTRA_MODEL]: {
+    displayName: "GPT-6-Astra",
+    description: "GPT-6-Astra (Codex OAuth passthrough).",
+  },
 });
 
 /**
@@ -47,15 +66,20 @@ export function nativeOpenAiCapabilitySourceSlug(slug: string): string {
   return NATIVE_OPENAI_CAPABILITY_SOURCES[slug] ?? slug;
 }
 
+export function nativeOpenAiCapabilityPresentation(
+  slug: string,
+): NativeOpenAiCapabilityPresentation | undefined {
+  return NATIVE_OPENAI_CAPABILITY_PRESENTATIONS[slug];
+}
+
 /**
  * Native OpenAI model ids that this release can route and restore with authoritative metadata.
  *
- * `gpt-daybreak-blue-latest` is entitlement-gated upstream: it is absent from codex-rs's
- * bundled catalog and reaches a client only through an authenticated `/models` response.
- * It is listed here by explicit owner decision so the capability template exists without waiting
- * for an observation, because opencodex injects `model_catalog_json` and codex-rs therefore builds
- * a `StaticModelsManager` whose refresh is a no-op — an entitled account had no way to
- * discover it on a clean install.
+ * The account-gated ids are entitlement-gated upstream: they are absent from codex-rs's bundled
+ * catalog and reach a client only through an authenticated `/models` response. They are listed
+ * here so the capability template exists without waiting for an observation, because opencodex
+ * injects `model_catalog_json` and codex-rs therefore builds a `StaticModelsManager` whose
+ * refresh is a no-op — an entitled account had no way to discover one on a clean install.
  *
  * Availability is not static: catalog sync and Pool routing require the account's authenticated
  * `/models` roster to contain the slug. An unconfirmed or unentitled account never receives the
@@ -66,7 +90,7 @@ export function nativeOpenAiCapabilitySourceSlug(slug: string): string {
 export const NATIVE_OPENAI_MODELS = [
   "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark",
   "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-  NATIVE_DAYBREAK_BLUE_MODEL,
+  NATIVE_DAYBREAK_BLUE_MODEL, NATIVE_GPT6_ASTRA_MODEL,
 ];
 
 export const SUPPORTED_NATIVE_OPENAI_SLUGS = new Set(NATIVE_OPENAI_MODELS);

@@ -43,6 +43,13 @@ proxy 默认监听 `10100` 端口，并提供 `POST /v1/responses`、`POST /v1/r
 模型和明确分类为第三方的模型也按其凭据策略发送到 10100。未知模型 fail closed，两个平面之间
 没有 fallback。
 
+账户受限的 native 模型在 selector catalog 中同样按 entitlement 隔离。注入模型、子代理模型、
+fallback 和 Claude Code selector 只有在已确认的 main/Pool 账户 roster 包含该精确 slug 后才会
+暴露它；静态 documented additions 不得绕过这项检查。roster 缺失、过期或获取失败时一律
+fail-closed；缓存 roster 还必须匹配账户当前的 credential generation。对于 main 账户，该 identity
+绑定 account id 和 access-token fingerprint，过期 JWT 不视为 live；凭据被替换或缺失时同样
+fail-closed。
+
 缺省仍是 `"legacy-local"`，继续使用现有的 `10100` 注入路径。前台入口是
 `ocx split-bridge start`；macOS LaunchAgent 使用
 `ocx split-bridge install|load|status|stop|uninstall|repair` 管理。生命周期命令要求显式设置
@@ -54,12 +61,26 @@ token 值；sync 或 status 不会隐式执行生命周期命令。可用 `ocx s
 `installed/loaded/matchesPlist` 证据，以及互相独立的 `bridge-unavailable`、`gateway-unavailable`、`configuration-invalid` 和
 `transport-unverified` readiness 状态。健康 `/healthz` 只证明 liveness，不证明 completion 可用。
 
+`gatewayAdmissionConfigured` 以 bridge 的 `/capabilities` 响应为准，而不是 gateway 的 `/healthz`。
+Gateway health 只证明自身可达性；bridge capabilities 才证明 transport readiness 和 admission 状态。
+缺少 bridge capability 证据时会 fail closed 为 `configuration-invalid`。
+
 native route 与 gateway route 不共用路径拼接规则。使用规范 native base
 `https://chatgpt.com/backend-api/codex` 时，`/v1/responses` 会变成
 `/backend-api/codex/responses`，`/v1/responses/compact` 会变成
 `/backend-api/codex/responses/compact`；10100 gateway 仍保留 `/v1/...` 路径和 query。第一阶段对
 10101 的 WebSocket upgrade 返回 `426`，`error.type = "upgrade_required"`，随后由 Codex fallback
 到 HTTP；这不宣称 native upstream WebSocket 支持。
+
+如果 `official-native` HTTP 请求在上游 Response 建立前发生连接 reset，bridge 会在同一个有界请求预算内
+重放已序列化的 request body；恢复尝试使用 `Connection: close` 和 `keepalive: false`。一旦 Response 或
+response body 已经开始，就绝不 replay。对于 native SSE，bridge 请求 `Accept-Encoding: identity`，并从
+返回给客户端的响应中移除 `content-encoding`、`content-length` 和 hop-by-hop framing headers，避免 Bun
+二次解码或使用过期的 body framing。如果已建立的 SSE body 后续读取失败，bridge 会追加有界的
+`response.failed` 与 `data: [DONE]` 尾帧后关闭；这只是失败表示，不是成功 completion，也不构成 replay。
+失败尾帧只能使用固定的安全错误类别/code，不得序列化原始 upstream error 文本。没有合法 Responses
+terminal event 的 clean EOF 也使用同一失败尾帧策略；客户端主动 cancel 不得被记录为 upstream body
+failure。gateway、账户限定、search 和 image 分支保持一次上游调用语义。
 
 裸官方请求 body 使用与 `openai-responses` adapter 相同的 forward normalization contract：发送到
 native upstream 前会规范化 `previous_response_id`、不支持的 `metadata`/`max_output_tokens`、

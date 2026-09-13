@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { fetchWithTransientRetry, isTransientUpstreamStatus } from "../src/lib/upstream-retry";
+import {
+  UpstreamRetryEvidenceError,
+  fetchWithTransientRetry,
+  isTransientUpstreamStatus,
+} from "../src/lib/upstream-retry";
 
 function bodyResponse(status: number, headers?: Record<string, string>): Response {
   // ReadableStream body so cancel() is observable.
@@ -37,6 +41,85 @@ describe("fetchWithTransientRetry", () => {
     expect(res.body).not.toBeNull();
   });
 
+  test("shares attempts across connection resets and transient responses", async () => {
+    let calls = 0;
+    const res = await fetchWithTransientRetry(async () => {
+      const positionInRound = calls++ % 3;
+      if (positionInRound < 2) {
+        throw Object.assign(
+          new Error("The socket connection was closed unexpectedly."),
+          { code: "ECONNRESET" },
+        );
+      }
+      return bodyResponse(502);
+    }, { attempts: 3, slowAttemptMs: 60_000 });
+    expect(calls).toBe(3);
+    expect(res.status).toBe(502);
+  });
+
+  test("does not re-arm the budget after a transient response before resets", async () => {
+    let calls = 0;
+    await expect(fetchWithTransientRetry(async () => {
+      calls++;
+      if (calls === 1) return bodyResponse(502);
+      throw Object.assign(
+        new Error("The socket connection was closed unexpectedly."),
+        { code: "ECONNRESET" },
+      );
+    }, { attempts: 3, slowAttemptMs: 60_000 })).rejects.toMatchObject({
+      name: "UpstreamRetryEvidenceError",
+      transientStatuses: [502],
+    });
+    expect(calls).toBe(3);
+  });
+
+  test("flattens nested evidence after 5xx then reset then refusal", async () => {
+    let calls = 0;
+    const failure = await fetchWithTransientRetry(async () => {
+      calls++;
+      if (calls === 1) return bodyResponse(502);
+      if (calls === 2) throw Object.assign(new Error("reset"), { code: "ECONNRESET" });
+      throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+    }, { attempts: 3, slowAttemptMs: 60_000 }).catch(error => error);
+    expect(calls).toBe(3);
+    expect(failure).toBeInstanceOf(UpstreamRetryEvidenceError);
+    const evidence = failure as UpstreamRetryEvidenceError;
+    expect(evidence.transientStatuses).toEqual([502]);
+    expect(evidence.resetSeen).toBe(true);
+    expect(evidence.cause).not.toBeInstanceOf(UpstreamRetryEvidenceError);
+    expect((evidence.cause as Error & { code?: string }).code).toBe("ECONNREFUSED");
+  });
+
+  test("preserves reset evidence across a successful reset retry before a later refusal", async () => {
+    let calls = 0;
+    const failure = await fetchWithTransientRetry(async () => {
+      calls++;
+      if (calls === 1) throw Object.assign(new Error("reset"), { code: "ECONNRESET" });
+      if (calls === 2) return bodyResponse(502);
+      throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+    }, { attempts: 3, slowAttemptMs: 60_000 }).catch(error => error);
+    expect(calls).toBe(3);
+    expect(failure).toBeInstanceOf(UpstreamRetryEvidenceError);
+    const evidence = failure as UpstreamRetryEvidenceError;
+    expect(evidence.transientStatuses).toEqual([502]);
+    expect(evidence.resetSeen).toBe(true);
+    expect((evidence.cause as Error & { code?: string }).code).toBe("ECONNREFUSED");
+  });
+
+  test("wraps the terminal connection reset with accumulated evidence", async () => {
+    let calls = 0;
+    const failure = await fetchWithTransientRetry(async () => {
+      calls++;
+      throw Object.assign(new Error("reset"), { code: "ECONNRESET" });
+    }, { attempts: 2, slowAttemptMs: 60_000 }).catch(error => error);
+    expect(calls).toBe(2);
+    expect(failure).toBeInstanceOf(UpstreamRetryEvidenceError);
+    const evidence = failure as UpstreamRetryEvidenceError;
+    expect(evidence.transientStatuses).toEqual([]);
+    expect(evidence.resetSeen).toBe(true);
+    expect((evidence.cause as Error & { code?: string }).code).toBe("ECONNRESET");
+  });
+
   test("does not retry non-transient statuses", async () => {
     let calls = 0;
     const res = await fetchWithTransientRetry(async () => { calls++; return bodyResponse(400); }, { slowAttemptMs: 60_000 });
@@ -66,6 +149,31 @@ describe("fetchWithTransientRetry", () => {
     }, { abortSignal: ac.signal, slowAttemptMs: 60_000 });
     expect(calls).toBe(1);
     expect(res.status).toBe(502);
+  });
+
+  test("waits for bounded response-body cancellation before the next retry", async () => {
+    let cancelSettled = false;
+    const first = new Response(new ReadableStream({
+      cancel() {
+        return new Promise<void>(resolve => {
+          setTimeout(() => {
+            cancelSettled = true;
+            resolve();
+          }, 20);
+        });
+      },
+    }), { status: 503, headers: { "retry-after": "0" } });
+    let calls = 0;
+
+    const result = await fetchWithTransientRetry(async () => {
+      calls += 1;
+      if (calls === 1) return first;
+      expect(cancelSettled).toBe(true);
+      return bodyResponse(200);
+    }, { attempts: 2, slowAttemptMs: 60_000 });
+
+    expect(result.status).toBe(200);
+    expect(calls).toBe(2);
   });
 
   test("does not retry a slow failed attempt (slow-502 incident shape)", async () => {

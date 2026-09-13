@@ -2,7 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyNativeVisibility, augmentRoutedModelsWithMetadata, augmentRoutedModelsWithRegistryOpenAiApiRows, buildCatalogEntries, buildComboCatalogOmission, catalogModelSlug, clampCatalogModelsToCodexSupport, clampEntryToCodexSupportedEfforts, clampedDefaultEffort, CODEX_ACCOUNT_BOUND_CATALOG_KIND, CODEX_NATIVE_ALIAS_CATALOG_KIND, comboCatalogOmissionReason, deriveComboCatalogModel, exactComboCatalogSlugs, filterCatalogVisibleModels, filterSupportedNativeSlugs, gatherRoutedModels as gatherRoutedModelsDirect, isDatedVariantId, isMediaGenerationModelId, loadBundledCodexCatalog, materializeBundledCodexCatalog, mergeCatalogEntriesForSync, NATIVE_DAYBREAK_BLUE_MODEL, NATIVE_OPENAI_MODELS, nativeDefaultReasoningEffort, nativeInputModalities, nativeOpenAiCapabilitySourceSlug, nativeOpenAiContextWindow, nativeReasoningEfforts, normalizeRoutedCatalogEntry, resetCatalogRuntimeStateForTests, resetOpenAiApiCatalogWarningStateForTests, resolveComboCatalogMember, shouldExposeRoutedModel, upstreamNativeEntry } from "../src/codex/catalog";
+import { applyNativeVisibility, augmentRoutedModelsWithMetadata, augmentRoutedModelsWithRegistryOpenAiApiRows, buildCatalogEntries, buildComboCatalogOmission, catalogModelSlug, clampCatalogModelsToCodexSupport, clampEntryToCodexSupportedEfforts, clampedDefaultEffort, CODEX_ACCOUNT_BOUND_CATALOG_KIND, CODEX_NATIVE_ALIAS_CATALOG_KIND, comboCatalogOmissionReason, deriveComboCatalogModel, exactComboCatalogSlugs, filterCatalogVisibleModels, filterSupportedNativeSlugs, gatherRoutedModels as gatherRoutedModelsDirect, isDatedVariantId, isMediaGenerationModelId, loadBundledCodexCatalog, materializeBundledCodexCatalog, mergeCatalogEntriesForSync, NATIVE_DAYBREAK_BLUE_MODEL, NATIVE_GPT6_ASTRA_MODEL, NATIVE_OPENAI_MODELS, nativeDefaultReasoningEffort, nativeInputModalities, nativeOpenAiCapabilitySourceSlug, nativeOpenAiContextWindow, nativeReasoningEfforts, normalizeRoutedCatalogEntry, resetCatalogRuntimeStateForTests, resetOpenAiApiCatalogWarningStateForTests, resolveComboCatalogMember, shouldExposeRoutedModel, upstreamNativeEntry } from "../src/codex/catalog";
 import {
   CODEX_CUSTOM_MODEL_CATALOG_KIND,
   CODEX_PROVIDER_MODEL_CATALOG_KIND,
@@ -27,6 +27,10 @@ import {
   type ProviderModelDiscoveryStatus,
 } from "../src/codex/model-cache";
 import type { OcxConfig } from "../src/types";
+import { listCatalogNativeSlugs } from "../src/codex/catalog";
+import {
+  resetCodexModelEntitlementCacheForTests,
+} from "../src/codex/model-entitlements";
 import { COMBO_NAMESPACE } from "../src/combos";
 import type { NormalizedComboConfig } from "../src/combos/types";
 import { enrichProviderFromRegistry } from "../src/providers/derive";
@@ -56,7 +60,15 @@ const gatherRoutedModels: typeof gatherRoutedModelsDirect = (config, options) =>
 afterEach(() => {
   globalThis.fetch = originalFetch;
   clearModelCache();
+  resetCodexModelEntitlementCacheForTests();
   resetOpenAiApiCatalogWarningStateForTests();
+});
+
+describe("selector native catalog entitlement projection", () => {
+  test("hides account-gated Astra without a confirmed account roster", () => {
+    resetCodexModelEntitlementCacheForTests();
+    expect(listCatalogNativeSlugs()).not.toContain(NATIVE_GPT6_ASTRA_MODEL);
+  });
 });
 
 function normalizedCombo(
@@ -2794,6 +2806,68 @@ describe("Codex catalog routed normalization", () => {
     expect(nativeOpenAiContextWindow("gpt-5.4", 272_000)).toBe(272_000);
   });
 
+  test("GPT-6-Astra inherits Sol capabilities while remaining account-gated", () => {
+    expect(NATIVE_GPT6_ASTRA_MODEL).toBe("gpt-6-astra");
+    expect(nativeOpenAiCapabilitySourceSlug(NATIVE_GPT6_ASTRA_MODEL)).toBe("gpt-5.6-sol");
+    expect(nativeOpenAiContextWindow(NATIVE_GPT6_ASTRA_MODEL)).toBe(272_000);
+    expect(nativeOpenAiContextWindow(NATIVE_GPT6_ASTRA_MODEL, 1_000_000)).toBe(872_000);
+    expect(nativeInputModalities(NATIVE_GPT6_ASTRA_MODEL)).toEqual(["text", "image"]);
+    expect(nativeReasoningEfforts(NATIVE_GPT6_ASTRA_MODEL))
+      .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+    expect(nativeDefaultReasoningEffort(NATIVE_GPT6_ASTRA_MODEL)).toBe("low");
+
+    const source = upstreamNativeEntry(NATIVE_GPT6_ASTRA_MODEL);
+    expect(source).toMatchObject({
+      slug: NATIVE_GPT6_ASTRA_MODEL,
+      display_name: "GPT-6-Astra",
+      context_window: 372_000,
+      max_context_window: 372_000,
+      comp_hash: "3000",
+      tool_mode: "code_mode_only",
+      use_responses_lite: true,
+      supports_parallel_tool_calls: true,
+      supports_search_tool: true,
+      multi_agent_version: "v2",
+    });
+    expect(source).not.toHaveProperty("availability_nux");
+    expect(source?.base_instructions).toContain("powered by the gpt-6-astra");
+    expect((source?.model_messages as { instructions_template?: string })?.instructions_template)
+      .toContain("powered by the gpt-6-astra");
+
+    const projected = buildCatalogEntries(
+      nativeTemplate(),
+      [NATIVE_GPT6_ASTRA_MODEL],
+      [],
+      undefined,
+      false,
+      "default",
+      new Set(),
+      ["main"],
+      new Set(),
+      new Set(),
+      undefined,
+      [NATIVE_GPT6_ASTRA_MODEL],
+      new Map([["main", [NATIVE_GPT6_ASTRA_MODEL]]]),
+    );
+    const bare = projected.find(entry => entry.slug === NATIVE_GPT6_ASTRA_MODEL);
+    const account = projected.find(entry => entry.slug === `main/${NATIVE_GPT6_ASTRA_MODEL}`);
+    expect(bare).toMatchObject({
+      display_name: "GPT-6-Astra",
+      context_window: 272_000,
+      max_context_window: 272_000,
+      use_responses_lite: true,
+      supports_parallel_tool_calls: true,
+    });
+    expect(account).toMatchObject({
+      slug: `main/${NATIVE_GPT6_ASTRA_MODEL}`,
+      display_name: "main / 6 Astra",
+      opencodex_catalog_kind: CODEX_ACCOUNT_BOUND_CATALOG_KIND,
+    });
+    expect(projected.filter(entry => entry.slug === NATIVE_GPT6_ASTRA_MODEL)).toHaveLength(1);
+    expect(projected.filter(entry => entry.slug === `main/${NATIVE_GPT6_ASTRA_MODEL}`)).toHaveLength(1);
+    expect(projected.some(entry => entry.slug === "astra-latest")).toBe(false);
+  });
+
   // Owner decision (devlog 260816_.../011 §4-bis): Daybreak Blue is now a GLOBALLY
   // allowlisted native, so a bare row IS expected. It still inherits Sol's capability
   // shape, and the overlap between NATIVE_OPENAI_MODELS and
@@ -4608,6 +4682,7 @@ describe("Codex catalog routed normalization", () => {
     enrichProviderFromRegistry("deepseek", provider);
 
     expect(provider.modelSupportsReasoningSummaries).toEqual({
+      "deepseek-flash": true,
       "deepseek-v4-flash": false,
       "deepseek-v4-pro": true,
     });

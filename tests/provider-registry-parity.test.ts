@@ -132,16 +132,21 @@ describe("provider registry parity", () => {
     // does not honor `low` (the vendor maps it to `high`), so Pro must not offer it.
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEfforts?.["deepseek-v4-pro"]).toEqual(["low", "high", "max"]);
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEfforts?.["deepseek-v4-flash"]).toEqual(["low", "high", "max"]);
+    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEfforts?.["deepseek-flash"]).toEqual(["low", "high", "max"]);
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-pro"]?.low).toBe("low");
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-pro"]?.xhigh).toBe("high");
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-pro"]?.max).toBe("max");
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-flash"]?.low).toBe("low");
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-flash"]?.xhigh).toBe("high");
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-flash"]?.max).toBe("max");
-    expect(KEY_LOGIN_PROVIDERS.deepseek.preserveReasoningContentModels).toEqual(["deepseek-v4-pro", "deepseek-v4-flash"]);
+    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-flash"]?.low).toBe("low");
+    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-flash"]?.xhigh).toBe("high");
+    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-flash"]?.max).toBe("max");
+    // 2026-09 Flash rename: the new id leads; the pre-rename shim keeps its coverage.
+    expect(KEY_LOGIN_PROVIDERS.deepseek.preserveReasoningContentModels).toEqual(["deepseek-v4-pro", "deepseek-flash", "deepseek-v4-flash"]);
     // Issue #88: every DeepSeek API model is text-only input — the vision sidecar covers them.
     expect(KEY_LOGIN_PROVIDERS.deepseek.noVisionModels).toEqual([
-      "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro", "deepseek-v4-flash",
+      "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro", "deepseek-flash", "deepseek-v4-flash",
     ]);
   });
 
@@ -250,8 +255,9 @@ describe("provider registry parity", () => {
     expect(deepseek).toMatchObject({
       adapter: "openai-chat",
       baseUrl: "https://api.deepseek.com",
-      defaultModel: "deepseek-v4-flash",
+      defaultModel: "deepseek-flash",
       modelContextWindows: {
+        "deepseek-flash": 1_048_576,
         "deepseek-v4-flash": 1_048_576,
         "deepseek-v4-pro": 1_048_576,
       },
@@ -1085,6 +1091,7 @@ describe("free-provider directory isolation", () => {
     const cases: Array<{ provider: string; model: string; flash: boolean }> = [
       { provider: "deepseek", model: "deepseek-v4-pro", flash: false },
       { provider: "deepseek", model: "deepseek-v4-flash", flash: true },
+      { provider: "deepseek", model: "deepseek-flash", flash: true },
       { provider: "opencode-go", model: "deepseek-v4-pro", flash: false },
       { provider: "opencode-go", model: "deepseek-v4-flash", flash: true },
       { provider: "orcarouter", model: "deepseek/deepseek-v4-pro", flash: false },

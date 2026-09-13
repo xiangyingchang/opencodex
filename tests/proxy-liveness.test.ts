@@ -453,8 +453,8 @@ describe("createReadinessGate", () => {
     expect(gate.getStatus()).toBe("failed");
     // JSON.stringify of a method-only object returns "{}", so it cannot prove
     // the absence of closure-held diagnostic fields. Assert the own-property
-    // surface directly: exactly the three control methods and no data field.
-    expect(Object.keys(gate).sort()).toEqual(["getStatus", "markFailed", "markReady"]);
+    // surface directly: exactly the four control methods and no data field.
+    expect(Object.keys(gate).sort()).toEqual(["beginRecovery", "getStatus", "markFailed", "markReady"]);
     // The only readable value is the fixed sanitized enum.
     expect(["pending", "ready", "failed"]).toContain(gate.getStatus());
   });

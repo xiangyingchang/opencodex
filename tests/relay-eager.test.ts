@@ -5,7 +5,7 @@
  * via the injectable clock/short drain windows.
  */
 import { describe, expect, test } from "bun:test";
-import { createSseInspector, MAX_TAIL_ERROR_MESSAGE_CHARS } from "../src/server/relay";
+import { createSseInspector } from "../src/server/relay";
 import { relaySseEagerBounded, type EagerRelayHooks } from "../src/server/relay-eager";
 import { createTranslatorBudget } from "../src/lib/translator-budget";
 import type { RequestLogContext } from "../src/server/request-log";
@@ -467,6 +467,52 @@ describe("relaySseEagerBounded — bounded queue", () => {
     expect(total).toBe(36);
   });
 
+  test("(b2) does not read beyond the byte cap before the client consumes a queued chunk", async () => {
+    const { hooks } = makeHooks();
+    let inspected = 0;
+    hooks.inspectChunk = () => { inspected += 1; };
+    const up = controlledUpstream();
+    const relayed = relaySseEagerBounded(up.stream, new AbortController(), hooks, {
+      maxQueueBytes: 8,
+    });
+    const reader = relayed.getReader();
+    const firstRead = reader.read();
+    const chunk = enc.encode("data: 1234\n\n");
+    up.push(chunk);
+    up.push(chunk);
+    up.push(chunk);
+    up.close();
+
+    const first = await firstRead;
+    expect(first.done).toBe(false);
+    expect(first.value?.byteLength ?? 0).toBeLessThanOrEqual(8);
+    await settle(10);
+    expect(inspected).toBe(2);
+    let delivered = first.value?.byteLength ?? 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      expect(value.byteLength).toBeLessThanOrEqual(8);
+      delivered += value.byteLength;
+    }
+    expect(delivered).toBe(chunk.byteLength * 3);
+    expect(inspected).toBe(3);
+  });
+
+  test("(b3) non-finite maxQueueBytes falls back to a safe default", async () => {
+    const { hooks } = makeHooks();
+    const up = controlledUpstream();
+    const relayed = relaySseEagerBounded(up.stream, new AbortController(), hooks, {
+      maxQueueBytes: Number.NaN,
+    });
+    const reader = relayed.getReader();
+    const firstRead = reader.read();
+    up.push(sse(DELTA));
+    up.close();
+    expect((await firstRead).done).toBe(false);
+    await reader.cancel("test cancel");
+  });
+
   test("(f) cancel while paused wakes the gate — onDone fires, no deadlock", async () => {
     const { hooks, rec } = makeHooks();
     const up = controlledUpstream();
@@ -614,7 +660,7 @@ describe("relaySseEagerBounded — error paths", () => {
     expect(out.startsWith(new TextDecoder().decode(sse(DELTA)))).toBe(true);
     expect(out).toContain(`\n\n${FAILED_EVENT_MARKER}`);
     expect(out.endsWith("data: [DONE]\n\n")).toBe(true);
-    expect(failedPayload(out).response.error.message).toContain("socket reset");
+    expect(failedPayload(out).response.error.message).toBe("Upstream response stream terminated unexpectedly");
     // The synthetic tail is client-only; only the upstream DELTA reached inspection.
     expect(inspectedChunks).toBe(1);
     expect(rec.synthetics).toEqual(["failed"]);
@@ -682,7 +728,7 @@ describe("relaySseEagerBounded — error paths", () => {
     up.fail(new Error(`reset-${"x".repeat(4_096)}-uncapped-suffix`));
 
     const parsed = failedPayload(await readAll(relayed));
-    expect(parsed.response.error.message.length).toBe(MAX_TAIL_ERROR_MESSAGE_CHARS);
+    expect(parsed.response.error.message).toBe("Upstream response stream terminated unexpectedly");
     expect(parsed.response.error.message).not.toContain("uncapped-suffix");
   });
 
@@ -763,12 +809,12 @@ describe("relaySseEagerBounded — error paths", () => {
     const pendingRead = reader.read();
     let cancelPromise: Promise<void> | null = null;
     const evil = new Error("re-entrant");
-    Object.defineProperty(evil, "message", {
+    Object.defineProperty(evil, "code", {
       get() {
-        // User-defined accessor runs inside buildFailedTailPayload — it must
+        // The safety classification accessor is still user-controlled; it must
         // not be able to sneak past the eligibility guard.
         cancelPromise ??= reader.cancel();
-        return "re-entrant cancel";
+        return "ECONNRESET";
       },
     });
     up.fail(evil);
@@ -787,10 +833,10 @@ describe("relaySseEagerBounded — error paths", () => {
     const upstreamAc = new AbortController();
     const relayed = relaySseEagerBounded(up.stream, upstreamAc, hooks);
     const evil = new Error("re-entrant");
-    Object.defineProperty(evil, "message", {
+    Object.defineProperty(evil, "code", {
       get() {
-        upstreamAc.abort(new Error("shutdown during serialization"));
-        return "re-entrant abort";
+        upstreamAc.abort(new Error("shutdown during classification"));
+        return "ECONNRESET";
       },
     });
     up.fail(evil);

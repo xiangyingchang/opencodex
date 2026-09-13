@@ -16,6 +16,8 @@ import {
   type SplitAdmissionBranch,
 } from "./server/split-admission";
 import type { AdmissionLease } from "./lib/admission";
+import { applyUpstreamRecoveryInit, fetchWithResetRetry } from "./lib/upstream-retry";
+import { relaySseWithFailedTail } from "./server/relay";
 import {
   assertProviderSplitCatalogDisjoint,
   classifyProviderSplitModel,
@@ -198,6 +200,12 @@ function requestHeaders(
     const value = incoming.get(name);
     if (value !== null) selected.set(name, value);
   }
+  if (decision.channel === "official-native") {
+    // Streaming responses must not enter Bun's transparent decompressor. A truncated
+    // gzip/zstd block otherwise becomes a ZlibError and the client reports only an
+    // opaque "error decoding response body" transport failure.
+    selected.set("accept-encoding", "identity");
+  }
   if (decision.channel === "third-party-gateway" || accountGateway) {
     // Never inherit the incoming value: only the bridge's configured secret can pass.
     selected.set(SPLIT_BRIDGE_ADMISSION_HEADER, gatewayAdmissionToken);
@@ -242,6 +250,7 @@ function releaseAdmissionAfterBody(
   body: ReadableStream<Uint8Array>,
   lease: AdmissionLease,
   signal: AbortSignal,
+  onRelease?: () => void,
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   let released = false;
@@ -253,6 +262,7 @@ function releaseAdmissionAfterBody(
     released = true;
     cleanupSignal();
     lease.release();
+    onRelease?.();
   };
   const cancelUpstream = (reason: unknown): void => {
     try {
@@ -297,6 +307,19 @@ interface SplitRelayFailure {
   readonly message: string;
 }
 
+function nativeBodyTransportCode(error: unknown): "ECONNRESET" | "EPIPE" | "ZlibError" | "EOF" | "other" {
+  const code = error instanceof Error ? (error as Error & { code?: unknown }).code : undefined;
+  if (code === "ECONNRESET" || code === "EPIPE" || code === "ZlibError" || code === "EOF") return code;
+  return "other";
+}
+
+function logNativeSseBodyError(error: unknown): void {
+  // Keep the diagnostic useful without recording provider body text, credentials, or URLs.
+  console.warn(
+    `[split-bridge] official-native SSE body failed after response headers (transport=${nativeBodyTransportCode(error)})`,
+  );
+}
+
 /** Relay a bounded split request without releasing its lease before the body is consumed. */
 async function relaySplitUpstream(
   fetchImpl: NonNullable<SplitBridgeOptions["fetch"]>,
@@ -306,18 +329,47 @@ async function relaySplitUpstream(
   body: string,
   lease: AdmissionLease,
   failure: SplitRelayFailure,
+  retryConnectionReset = false,
 ): Promise<Response> {
+  const upstreamAbort = retryConnectionReset ? new AbortController() : undefined;
+  const onRequestAbort = () => {
+    if (upstreamAbort && !upstreamAbort.signal.aborted) upstreamAbort.abort(request.signal.reason);
+  };
+  if (upstreamAbort) {
+    if (request.signal.aborted) onRequestAbort();
+    else request.signal.addEventListener("abort", onRequestAbort, { once: true });
+  }
+  const cleanupUpstreamAbort = () => {
+    if (upstreamAbort) request.signal.removeEventListener("abort", onRequestAbort);
+  };
   try {
-    const upstream = await fetchImpl(target, {
+    const init: RequestInit = {
       method: "POST",
       headers,
       body,
-      signal: request.signal,
-    });
-    const responseBody = upstream.body
-      ? releaseAdmissionAfterBody(upstream.body, lease, request.signal)
+      signal: upstreamAbort?.signal ?? request.signal,
+    };
+    const upstream = retryConnectionReset
+      ? await fetchWithResetRetry(
+        recovery => fetchImpl(target, applyUpstreamRecoveryInit(init, recovery)),
+        { abortSignal: upstreamAbort!.signal, label: "split-bridge native" },
+      )
+      : await fetchImpl(target, init);
+    const isNativeSse = retryConnectionReset
+      && upstream.headers.get("content-type")?.toLowerCase().includes("text/event-stream") === true;
+    const abortNativeUpstream = (reason?: unknown): void => {
+      if (upstreamAbort && !upstreamAbort.signal.aborted) upstreamAbort.abort(reason);
+    };
+    const upstreamBody = upstream.body && isNativeSse
+      ? relaySseWithFailedTail(upstream.body, upstreamAbort!, abortNativeUpstream, logNativeSseBodyError, true)
+      : upstream.body;
+    const responseBody = upstreamBody
+      ? releaseAdmissionAfterBody(upstreamBody, lease, request.signal, cleanupUpstreamAbort)
       : null;
-    if (!responseBody) lease.release();
+    if (!responseBody) {
+      cleanupUpstreamAbort();
+      lease.release();
+    }
     try {
       return new Response(responseBody, {
         status: upstream.status,
@@ -329,6 +381,7 @@ async function relaySplitUpstream(
       throw error;
     }
   } catch (error) {
+    cleanupUpstreamAbort();
     lease.release();
     if (request.signal.aborted) throw error;
     return errorResponse(failure.status, failure.code, failure.message);
@@ -541,6 +594,7 @@ export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBrid
       isGateway
         ? { status: 503, code: "gateway_unavailable", message: "Third-party gateway unavailable" }
         : { status: 502, code: "native_upstream_unavailable", message: "Native upstream unavailable" },
+      decision.channel === "official-native",
     );
   };
 }

@@ -10,6 +10,7 @@ import {
   rmSync,
   symlinkSync,
   truncateSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -669,6 +670,13 @@ test("a referenced rollout with native first and latest metadata is clean", () =
   expect(classifyNativeRoutedResidue()).toEqual({ kind: "clean" });
 });
 
+test("native-only metadata with a mismatched thread id is not routed residue", () => {
+  createHistoryDatabase("openai");
+  writeFileSync(pathInCodexHome("rollout.jsonl"), sessionMeta("thread-2", "openai") + "\n");
+
+  expect(classifyNativeRoutedResidue()).toEqual({ kind: "clean" });
+});
+
 test("a routed rollout without a trailing newline is residue", () => {
   createHistoryDatabase("openai");
   writeFileSync(pathInCodexHome("rollout.jsonl"), sessionMeta("thread-1", "opencodex"));
@@ -922,4 +930,52 @@ test("a missing coordinator with only the generated profile refuses initializati
     kind: "legacy-ambiguous",
     message: "A missing coordinator row cannot be initialized while native Codex routing residue exists.",
   });
+});
+
+
+test("a checkpointed WAL-mode history database without sidecars is classified safely", () => {
+  const dbPath = pathInCodexHome("state_5.sqlite");
+  const walPath = `${dbPath}-wal`;
+  const shmPath = `${dbPath}-shm`;
+
+  const db = new Database(dbPath);
+  db.exec("PRAGMA journal_mode=WAL");
+  db.exec(`CREATE TABLE threads (
+    id TEXT PRIMARY KEY,
+    rollout_path TEXT NOT NULL,
+    model_provider TEXT NOT NULL,
+    source TEXT NOT NULL,
+    first_user_message TEXT NOT NULL,
+    has_user_event INTEGER NOT NULL DEFAULT 0
+  )`);
+  writeFileSync(
+    pathInCodexHome("rollout.jsonl"),
+    sessionMeta("thread-1", "openai") + "\n" + sessionMeta("thread-1", "openai") + "\n",
+  );
+  db.query(`
+    INSERT INTO threads (id, rollout_path, model_provider, source, first_user_message, has_user_event)
+    VALUES (?, ?, ?, 'cli', 'checkpointed history', 1)
+  `).run("thread-1", pathInCodexHome("rollout.jsonl"), "openai");
+  expect(db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode).toBe("wal");
+  db.close();
+
+  const sqliteHeader = readFileSync(dbPath);
+  expect(sqliteHeader[18]).toBe(2);
+  expect(sqliteHeader[19]).toBe(2);
+
+  for (const p of [walPath, shmPath]) {
+    try { unlinkSync(p); } catch { /* absent is fine */ }
+  }
+
+  expect(lstatSync(walPath, { throwIfNoEntry: false })).toBeUndefined();
+  expect(lstatSync(shmPath, { throwIfNoEntry: false })).toBeUndefined();
+  expect(lstatSync(dbPath, { throwIfNoEntry: false })?.isFile()).toBe(true);
+
+  const result = classifyNativeRoutedResidue();
+  expect(result.kind).not.toBe("indeterminate");
+  expect(result).toEqual({ kind: "clean" });
+
+  for (const p of [dbPath, walPath, shmPath]) {
+    try { unlinkSync(p); } catch { /* cleanup */ }
+  }
 });

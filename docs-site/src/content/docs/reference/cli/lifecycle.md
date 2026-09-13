@@ -153,7 +153,10 @@ command exits 0 only when healthy and 1 otherwise, making it suitable for servic
 Check post-sync readiness through the unauthenticated `GET /readyz` endpoint. It returns `200` when
 ready, or `503` with `Retry-After: 1` for `pending` and terminal `failed`. Its sanitized HTTP identity
 is `{service, version, uptime, pid, port, status}`. Old proxies without `/readyz` fail closed as
-`unreachable`; `/healthz` is separate liveness, not readiness. The command performs one probe by
+`unreachable`; `/healthz` is separate liveness, not readiness.
+`ocx ready` can remain `failed` when local Codex history coordination cannot be safely observed
+(for example, when the history database is corrupt or an atomic write is in progress); checkpointed
+WAL databases are inspected through an immutable read-only snapshot. The command performs one probe by
 default; `--wait` polls until ready or timeout, but exits immediately when it observes the terminal `failed` state. The
 default timeout is 45 seconds; `--timeout <seconds>` requires `--wait` and accepts positive integer seconds from 1–300.
 CLI JSON emits `{ready, status, pid, port}`, where `status` is `ready`, `pending`, `failed`, or

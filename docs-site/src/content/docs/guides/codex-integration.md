@@ -45,6 +45,13 @@ native upstream. Account-qualified rows retain their exact selector and delegate
 classified third-party models also use 10100 under their configured credential policy. Unknown models
 fail closed; there is no cross-plane fallback.
 
+Account-gated native models are entitlement-scoped in selector catalogs as well. The injection-model,
+sub-agent model, fallback, and Claude Code selectors expose a gated native slug only after a confirmed
+authenticated main/Pool account roster contains that exact slug. Static documented additions never
+bypass this check. The cached roster must still match the account's current credential generation; for the
+main account that identity binds the account id and access-token fingerprint, and an expired JWT is not
+live. A replaced or missing credential is fail-closed. A missing, expired, or failed roster is fail-closed.
+
 The default remains `"legacy-local"`, which preserves the existing `10100` injection. Use
 `ocx split-bridge start` for the foreground process, or
 `ocx split-bridge install|load|status|stop|uninstall|repair` for the dedicated macOS LaunchAgent.
@@ -57,12 +64,30 @@ and LaunchAgent `installed/loaded/matchesPlist` evidence, plus the distinct `bri
 `gateway-unavailable`, `configuration-invalid`, and `transport-unverified` readiness states. A healthy
 `/healthz` alone is liveness, not completion readiness.
 
+`gatewayAdmissionConfigured` is derived from the bridge `/capabilities` endpoint,
+not from the gateway `/healthz` response. The gateway health check reports only
+its own reachability; the bridge `/capabilities` response is the authority for
+transport readiness and admission state. Missing bridge capability evidence fails
+closed as `configuration-invalid`.
+
 The native route is not the same as the gateway route. With the canonical native base
 `https://chatgpt.com/backend-api/codex`, `/v1/responses` becomes `/backend-api/codex/responses` and
 `/v1/responses/compact` becomes `/backend-api/codex/responses/compact`; the 10100 gateway keeps its
 `/v1/...` paths and query strings. A WebSocket upgrade to 10101 returns `426` with
 `error.type = "upgrade_required"`, then Codex falls back to HTTP. This phase does not claim native
 upstream WebSocket support.
+
+If an `official-native` HTTP request is reset before an upstream response is established, the bridge retries
+that serialized request body within one bounded request budget; the recovery attempt uses `Connection: close`
+and `keepalive: false`. Once a response or response body has started, it is never replayed. For native SSE,
+the bridge requests `Accept-Encoding: identity` and removes `content-encoding`, `content-length`, and hop-by-hop
+framing headers from the client response so Bun cannot double-decode or apply stale body framing. If the
+established SSE body later fails, the bridge emits a bounded `response.failed` plus `data: [DONE]` tail and
+closes; this is a failure representation, not a successful completion or a replay. The failure tail uses only
+fixed safe error categories/codes and never serializes raw upstream error text. A clean EOF without a valid
+Responses terminal event follows the same failure-tail policy, while client cancellation is not logged as an
+upstream body failure. Gateway,
+account-qualified, search, and image branches retain one-upstream-call semantics.
 
 Bare official request bodies use the same forward normalization contract as the `openai-responses` adapter:
 `previous_response_id`, unsupported `metadata`/`max_output_tokens`, proxy reasoning/compaction envelopes,

@@ -22,7 +22,12 @@
  */
 import { loadConfig, mutatePersistedConfig } from "../config";
 import type { OcxClientIntegrationsConfig, OcxConfig, CodexRoutingMode } from "../types";
-import { runStartupReadinessSync, type ReadinessGate, type SyncOutcomeLike } from "../server/readiness";
+import {
+  runStartupReadinessSync,
+  type ReadinessGate,
+  type ReadinessRetryOptions,
+  type SyncOutcomeLike,
+} from "../server/readiness";
 
 /** Clients whose durable intent this module owns. */
 export type DurableIntentClientId = keyof OcxClientIntegrationsConfig;
@@ -67,7 +72,7 @@ export interface CodexStartupSyncOutcome {
   ok?: boolean;
   warning?: string;
 }
-export type CodexStartupSync = (port: number) => Promise<SyncOutcomeLike | undefined>;
+export type CodexStartupSync = (port: number, signal?: AbortSignal) => Promise<SyncOutcomeLike | undefined>;
 
 export type CodexDesiredStateResult =
   | { readonly ok: true; readonly status: "committed" | "unchanged"; readonly enabled: boolean }
@@ -211,6 +216,7 @@ export async function syncCodexOnStartIfEnabled(
   config: Pick<OcxConfig, "clientIntegrations" | "codexRoutingMode">,
   sync: CodexStartupSync = defaultStartupSync,
   readinessGate?: ReadinessGate,
+  readinessOptions: ReadinessRetryOptions = {},
 ): Promise<{ ran: boolean; catalogWritten: boolean; cacheSynced: boolean }> {
   if (!shouldSyncCodexOnStart(config)) {
     // The user explicitly turned Codex off: there is nothing to sync, so the
@@ -225,17 +231,11 @@ export async function syncCodexOnStartIfEnabled(
   // gate observes the real outcome so /readyz reflects the sync state exactly as
   // the PR contract defines (ready only on ok=true with no warning).
   const outcome = readinessGate
-    ? await runStartupReadinessSync(readinessGate, async () => {
-      const result = await sync(port);
+    ? await runStartupReadinessSync(readinessGate, async signal => {
+      const result = await sync(port, signal);
       if (!result) return null;
-      // Split mode has a separate bridge lifecycle. A catalog write is the
-      // useful startup proof for the main process even when bridge-owned
-      // configuration is not reported as a clean apply by the sync callback.
-      if (desiredCodexRoutingMode(config) === "split" && result.catalogWritten) {
-        return { ok: true, catalogWritten: result.catalogWritten, cacheSynced: result.cacheSynced };
-      }
       return result;
-    })
+    }, readinessOptions)
     : await sync(port).catch(() => undefined);
   return {
     ran: true,

@@ -84,13 +84,16 @@ export function relayWithAbort(
 
 export function buildFailedTailPayload(err: unknown): string {
   const translatorOverflow = isTranslatorBudgetExceededError(err);
-  const message = (translatorOverflow
+  const errorCode = err instanceof Error ? (err as Error & { code?: unknown }).code : undefined;
+  const cleanEof = errorCode === "EOF";
+  const message = translatorOverflow
     ? "upstream translation buffer exceeded the safe limit"
-    : `Upstream stream terminated unexpectedly: ${err instanceof Error ? err.message : String(err)}`)
-    .slice(0, MAX_TAIL_ERROR_MESSAGE_CHARS);
+    : cleanEof
+      ? "Upstream response stream ended before a terminal event"
+      : "Upstream response stream terminated unexpectedly";
   const failure = {
     type: "upstream_error",
-    code: translatorOverflow ? "translation_buffer_limit" : "upstream_reset",
+    code: translatorOverflow ? "translation_buffer_limit" : cleanEof ? "upstream_eof" : "upstream_reset",
     message,
   };
   return JSON.stringify({
@@ -179,6 +182,8 @@ export function relaySseWithFailedTail(
   body: ReadableStream<Uint8Array>,
   upstream: AbortController,
   onClientGone?: (reason?: unknown) => void,
+  onUpstreamError?: (error: unknown) => void,
+  failOnCleanEof = false,
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const encoder = new TextEncoder();
@@ -217,9 +222,32 @@ export function relaySseWithFailedTail(
         for (;;) {
           const { done, value } = await reader.read();
           if (done) {
+            if (closed) return;
             const tail = terminalBoundary.finish();
             if (tail.byteLength > 0) controller.enqueue(tail);
+            const terminalSeen = terminalBoundary.terminalSeen();
             terminalBoundary.dispose();
+            if (failOnCleanEof && !terminalSeen) {
+              const eofError = Object.assign(
+                new Error("upstream SSE ended before a Responses terminal event"),
+                { code: "EOF" },
+              );
+              try { onUpstreamError?.(eofError); } catch { /* diagnostics must not break the failed tail */ }
+              const failureTail = [
+                "",
+                "",
+                "event: response.failed",
+                `data: ${buildFailedTailPayload(eofError)}`,
+                "",
+                "data: [DONE]",
+                "",
+                "",
+              ].join(String.fromCharCode(10));
+              controller.enqueue(encoder.encode(failureTail));
+              controller.close();
+              upstream.abort(eofError);
+              return;
+            }
             controller.close();
             return;
           }
@@ -237,6 +265,7 @@ export function relaySseWithFailedTail(
         }
         terminalBoundary.dispose();
         if (closed) return;
+        try { onUpstreamError?.(err); } catch { /* diagnostics must not break the failed tail */ }
         const payload = buildFailedTailPayload(err);
         try {
           if (partial.byteLength > 0) controller.enqueue(partial);
@@ -248,6 +277,7 @@ export function relaySseWithFailedTail(
       }
     },
     cancel(reason) {
+      closed = true;
       terminalBoundary.dispose();
       if (onClientGone) onClientGone(reason);
       else upstream.abort(reason);

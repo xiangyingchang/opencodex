@@ -12,8 +12,9 @@ import {
 } from "node:fs";
 import type { Stats } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
-import { Database } from "bun:sqlite";
+import { Database, constants } from "bun:sqlite";
 
 import { getConfigDir } from "../config";
 import { catalogHasRoutedEntries, parseCatalogJson } from "./catalog/parsing";
@@ -513,16 +514,26 @@ function classifyReferencedRollout(
   if (!first || !latest) {
     return indeterminate(surface, resolved.path, "referenced rollout has no session_meta metadata");
   }
-  let hasOpenCodexProvider = false;
-  for (const [position, payload] of [["first", first], ["latest", latest]] as const) {
-    if (payload.id !== reference.id) {
-      return indeterminate(surface, resolved.path, `${position} session_meta does not identify the referenced thread`);
-    }
+  const metadata = [
+    ["first", first],
+    ["latest", latest],
+  ] as const;
+  for (const [position, payload] of metadata) {
     if (typeof payload.model_provider !== "string" || !payload.model_provider) {
       return indeterminate(surface, resolved.path, `${position} session_meta has no provider metadata`);
     }
-    hasOpenCodexProvider = hasOpenCodexProvider || payload.model_provider === "opencodex";
   }
+  // A native-only Codex rollout can carry an inconsistent thread id in its
+  // session metadata without proving OpenCodex residue. Mixed or routed
+  // metadata remains fail-closed below, because accepting that state could
+  // hide an interrupted provider transition.
+  const nativeOnly = metadata.every(([, payload]) => payload.model_provider === "openai");
+  for (const [position, payload] of metadata) {
+    if (payload.id !== reference.id && !nativeOnly) {
+      return indeterminate(surface, resolved.path, `${position} session_meta does not identify the referenced thread`);
+    }
+  }
+  const hasOpenCodexProvider = metadata.some(([, payload]) => payload.model_provider === "opencodex");
   return hasOpenCodexProvider
     ? { kind: "residue", surface, path: resolved.path }
     : { kind: "clean" };
@@ -556,7 +567,8 @@ function classifyHistoryDatabase(path: string): NativeRoutedResidueResult {
   if (resolved.kind === "indeterminate") return indeterminate("history", path, resolved.reason);
   let database: Database | undefined;
   try {
-    database = new Database(resolved.path, { readonly: true });
+    const uri = pathToFileURL(resolved.path).href + "?immutable=1";
+    database = new Database(uri, constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI);
     database.exec("PRAGMA busy_timeout = 100");
     const rows = database.query<{ id: string; rollout_path: string; model_provider: string }, []>(`
       SELECT id, rollout_path, model_provider

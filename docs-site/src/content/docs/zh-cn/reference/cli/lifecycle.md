@@ -122,8 +122,9 @@ ocx status --json
 通过无需认证的 `GET /readyz` 端点检查同步后的就绪状态。就绪时返回 `200`；状态为 `pending` 或
 终态 `failed` 时返回 `503`，并带有 `Retry-After: 1`。HTTP 仅返回经脱敏的身份字段
 `{service, version, uptime, pid, port, status}`。不支持 `/readyz` 的旧代理会按 `unreachable` 失败关闭；
-`/healthz` 是独立的存活检查，不是就绪检查。默认只探测一次；`--wait` 会轮询到就绪或超时，但遇到终态
-`failed` 会立即退出。默认超时为 45 秒；`--timeout <seconds>` 必须与 `--wait` 一起使用，取值范围为 1–300 秒的正整数。CLI JSON
+`/healthz` 是独立的存活检查，不是就绪检查。即使 `/healthz` 存活，本地 Codex history coordination
+无法安全观测时（例如 history database 损坏或正在进行原子写入），`ocx ready` 仍可能是 `failed`；
+checkpointed WAL 数据库会通过 immutable read-only snapshot 检查。默认只探测一次；`--wait` 会轮询到就绪或超时，但遇到终态 `failed` 会立即退出。默认超时为 45 秒；`--timeout <seconds>` 必须与 `--wait` 一起使用，取值范围为 1–300 秒的正整数。CLI JSON
 输出 `{ready, status, pid, port}`，其中 `status` 为 `ready`、`pending`、`failed` 或
 `unreachable`。退出码：就绪为 0；未就绪、pending、failed、超时或无法连接为 1；参数无效为 64。
 

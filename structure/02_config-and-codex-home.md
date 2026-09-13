@@ -299,3 +299,34 @@ power loss can leave files behind. The target state, backup manifest, and failur
 are recorded in [`docs/协议文档.md`](../docs/协议文档.md). Readiness is gated on more than `/healthz`,
 including route/fallback capability, admission validation, catalog generation, injection proof and
 LaunchAgent lifecycle.
+
+## Immutable passive SQLite observation
+
+Residue classification (`src/codex/native-residue.ts`) opens Codex history databases as an
+immutable read-only snapshot. It uses a cross-platform file URI with `immutable=1` and
+`SQLITE_OPEN_READONLY | SQLITE_OPEN_URI` flags, matching the safe pattern documented and used by
+`src/storage/scanner.ts`. This ensures:
+
+- **No sidecar writes.** The open never creates `-wal` or `-shm` siblings, even for a
+  checkpointed WAL-mode database whose sidecars were removed after a clean Codex App close.
+- **Last-checkpointed snapshot.** The connection reads the last committed state without waiting
+  for a live WAL writer, which is the correct tradeoff for passive safety classification.
+- **Fail-closed.** A corrupt or unreadable database, a missing file, or an unexpected schema
+  returns `indeterminate` rather than `clean`. The unchanged-file stat check and per-row
+  rollout-reference validation remain in place.
+- **Native-only metadata tolerance.** A rollout whose first/latest metadata is entirely native
+  `openai` may have a stale thread id without proving OpenCodex residue; mixed or
+  `opencodex` metadata remains `indeterminate` on an id mismatch.
+
+The previous `{ readonly: true }` Bun SQLite constructor could still materialize WAL/SHM sidecars
+on the first open of a checkpointed database, producing a false `unable to open database file`
+indeterminate result. The immutable URI guarantees that classification never competes with the
+Codex App writer and never creates files under `CODEX_HOME`.
+
+[Decision Log]
+- 목적과 의도: Keep passive history inspection safe and correct on checkpointed WAL-mode databases without writing sidecar files.
+- 기존 구현 및 제약 조건: Bun's `new Database(path, { readonly: true })` failed on checkpointed WAL databases whose sidecars were absent, producing a false indeterminate result.
+- 검토한 주요 대안: Use `PRAGMA locking_mode=EXCLUSIVE`, checkpoint the database before opening, or adopt the immutable URI pattern already proven in `src/storage/scanner.ts`.
+- 선택한 방식: Use `pathToFileURL(resolved.path).href + "?immutable=1"` with `SQLITE_OPEN_READONLY | SQLITE_OPEN_URI` flags, matching the existing scanner pattern.
+- 다른 대안 대신 이 방식을 선택한 이유: The immutable URI prevents sidecar creation entirely at the SQLite level, requires no checkpoint coordination, and reuses an already-proven pattern.
+- 장점, 단점 및 영향: History classification works correctly on checkpointed WAL databases; the snapshot may lag a live writer by one checkpoint, which is acceptable for passive safety classification.

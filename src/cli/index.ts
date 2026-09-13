@@ -262,6 +262,7 @@ async function handleStart(options: { block?: boolean } = {}) {
   // post-startup sync settles. A second startServer in the same process would
   // get its own gate and could never reset/mutate this one.
   const readinessGate = createReadinessGate();
+  const startupReadinessAbortController = new AbortController();
   let server: ReturnType<typeof startServer>;
   const localAttestationSecret = createLocalAttestationSecret();
   for (let attempt = 0; ; attempt++) {
@@ -312,6 +313,7 @@ async function handleStart(options: { block?: boolean } = {}) {
   const syncCleanup = () => {
     if (cleaned) return cleanupSucceeded;
     cleaned = true;
+    startupReadinessAbortController.abort(new Error("proxy shutdown"));
     try { guardian.stop(); } catch { /* best-effort */ }
     try { historyGuardian?.stop(); } catch { /* best-effort */ }
     // Dashboard drain-and-restart (#563) must not tear down injection: the replacement
@@ -407,7 +409,13 @@ async function handleStart(options: { block?: boolean } = {}) {
   // (OFF → no sync) and reports whether anything was written; the readiness gate
   // observes the real sync outcome (ok/warning) so /readyz never advertises a
   // half-synced proxy as ready while /healthz stays live.
-  const startupSync = await syncCodexOnStartIfEnabled(port, config, undefined, readinessGate);
+  const startupSync = await syncCodexOnStartIfEnabled(
+    port,
+    config,
+    undefined,
+    readinessGate,
+    { signal: startupReadinessAbortController.signal },
+  );
   if (!startupSync.ran) console.log("   Codex integration OFF; startup left Codex native.");
   // #1046: one warning per startup, after BOTH writes. The server's cache
   // invalidation happens first and the catalog sync second, so the mtime is only

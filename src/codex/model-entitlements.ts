@@ -5,6 +5,7 @@ import { isSelectableCodexPoolAccount } from "./account-id";
 import { getValidCodexToken, readCodexAccountRecord } from "./account-store";
 import { getMainAccountToken, MAIN_CODEX_ACCOUNT_ID } from "./main-account";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "./catalog/native-models";
+import { decodeJwtPayload } from "../oauth/chatgpt";
 
 const CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models?client_version=0.0.0";
 const MODEL_ROSTER_TTL_MS = 5 * 60_000;
@@ -75,13 +76,27 @@ function boundedCacheSet(accountId: string, value: CachedAccountModels): void {
   evictClass(isDirect(accountId));
 }
 
+function mainCredentialIdentity(accessToken: string, chatgptAccountId: string): string {
+  return `main:${chatgptAccountId}:${createHash("sha256").update(accessToken).digest("hex")}`;
+}
+
+function isAccessTokenLive(accessToken: string, now = Date.now()): boolean {
+  const payload = decodeJwtPayload(accessToken);
+  const exp = payload?.exp;
+  if (typeof exp !== "number" || !Number.isFinite(exp)) return false;
+  const expiresAt = exp * 1000;
+  return Number.isFinite(expiresAt) && expiresAt > now;
+}
+
 function currentCredentialIdentity(accountId: string): string | undefined {
   if (accountId.startsWith(DIRECT_CALLER_ACCOUNT_PREFIX)) {
     return `direct:${accountId.slice(DIRECT_CALLER_ACCOUNT_PREFIX.length)}`;
   }
   if (accountId === MAIN_CODEX_ACCOUNT_ID) {
     const token = getMainAccountToken();
-    return token ? `main:${token.chatgptAccountId}` : undefined;
+    return token && isAccessTokenLive(token.accessToken)
+      ? mainCredentialIdentity(token.accessToken, token.chatgptAccountId)
+      : undefined;
   }
   const record = readCodexAccountRecord(accountId);
   if (!record?.credential || record.deletedAt != null) return undefined;
@@ -91,12 +106,12 @@ function currentCredentialIdentity(accountId: string): string | undefined {
 async function accountCredentialSnapshot(accountId: string): Promise<CodexModelEntitlementCredentialSnapshot | null> {
   if (accountId === MAIN_CODEX_ACCOUNT_ID) {
     const token = getMainAccountToken();
-    return token
+    return token && isAccessTokenLive(token.accessToken)
       ? {
         accountId,
         accessToken: token.accessToken,
         chatgptAccountId: token.chatgptAccountId,
-        credentialIdentity: `main:${token.chatgptAccountId}`,
+        credentialIdentity: mainCredentialIdentity(token.accessToken, token.chatgptAccountId),
       }
       : null;
   }
@@ -311,15 +326,21 @@ export function availableAccountGatedNativeModels(
 export function cachedAvailableAccountGatedNativeModels(
   now = Date.now(),
   eligibleAccountIds?: ReadonlySet<string>,
+  credentialIdentityForAccount: (accountId: string) => string | undefined = currentCredentialIdentity,
 ): ReadonlySet<string> {
   return new Set([...ACCOUNT_GATED_NATIVE_OPENAI_MODELS].filter(modelId => (
-    [...accountModelsCache].some(([accountId, entry]) => (
-      (!eligibleAccountIds || eligibleAccountIds.has(accountId))
-      && !accountId.startsWith(DIRECT_CALLER_ACCOUNT_PREFIX)
-      && entry.confirmed
-      && entry.expiresAt > now
-      && entry.models.has(modelId)
-    ))
+    [...accountModelsCache].some(([accountId, entry]) => {
+      if (
+        (eligibleAccountIds && !eligibleAccountIds.has(accountId))
+        || accountId.startsWith(DIRECT_CALLER_ACCOUNT_PREFIX)
+        || !entry.confirmed
+        || entry.expiresAt <= now
+      ) return false;
+      const currentIdentity = credentialIdentityForAccount(accountId);
+      return currentIdentity !== undefined
+        && entry.credentialIdentity === currentIdentity
+        && entry.models.has(modelId);
+    })
   )));
 }
 

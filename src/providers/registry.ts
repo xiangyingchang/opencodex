@@ -455,6 +455,13 @@ const THINKING_BUDGET_MODELS = [
 const OPENCODE_GO_THINKING_BUDGET_MODELS = ["qwen3.5-plus", "qwen3.6-plus", "qwen3.7-max", "qwen3.7-plus"];
 const DEEPSEEK_THINKING_MODELS = ["deepseek-v4-pro", "deepseek-v4-flash"];
 const OPENCODE_FREE_DEEPSEEK_MODELS = ["deepseek-v4-flash-free"];
+// 2026-09 rename: the direct DeepSeek provider (api.deepseek.com) leads with the new
+// `deepseek-flash` id; the pre-rename `deepseek-v4-flash` stays callable as a server-side
+// shim and keeps its validation + metadata coverage so saved configs and requests do not
+// regress. Aggregator blocks (opencode-go, Volcengine plans, ...) mirror their own upstream
+// id sets and keep using DEEPSEEK_THINKING_MODELS above.
+const DEEPSEEK_DIRECT_THINKING_MODELS = ["deepseek-v4-pro", "deepseek-flash"];
+const DEEPSEEK_DIRECT_METADATA_MODELS = [...DEEPSEEK_DIRECT_THINKING_MODELS, "deepseek-v4-flash"];
 /*
  * Zen free models that reject `image_url` upstream (#1043, and the reproducible
  * half of #1024).
@@ -1545,22 +1552,24 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     // verified 2026-08-08).
     jawcodeBundle: "deepseek",
     // deepseek-chat/deepseek-reasoner were deprecated upstream on 2026-07-24 15:59 UTC;
-    // official identifiers are now deepseek-v4-flash / deepseek-v4-pro. They stay in
-    // the list only as compatibility aliases so existing saved configs and requests
-    // keep validating and routing (they previously mapped to v4-flash; devlog
-    // _fin/260710_provider_hardening/002_research_cn.md). The current offerings are
-    // the V4 ids — defaultModel and the model-specific wiring above use them.
-    models: ["deepseek-chat", "deepseek-reasoner", ...DEEPSEEK_THINKING_MODELS],
-    defaultModel: "deepseek-v4-flash",
+    // the Flash id was renamed to `deepseek-flash` in 2026-09 (the old deepseek-v4-flash
+    // stays callable as a server-side shim). The retired aliases and the pre-rename flash
+    // id stay in the list so existing saved configs and requests keep validating and
+    // routing (devlog _fin/260710_provider_hardening/002_research_cn.md). Current
+    // offerings — defaultModel and the model-specific wiring below — lead with the new id.
+    models: ["deepseek-chat", "deepseek-reasoner", ...DEEPSEEK_DIRECT_METADATA_MODELS],
+    defaultModel: "deepseek-flash",
     // Display-only: the `deepseek/` prefix duplicates the model id for the V4 family, so relabel
-    // the picker row to the bare id. The routing slug `deepseek/deepseek-v4-flash` is unchanged -
-    // only the Codex model selector label drops the redundant provider prefix.
-    modelDisplayNames: { "deepseek-v4-flash": "deepseek-v4-flash", "deepseek-v4-pro": "deepseek-v4-pro" },
+    // the picker row to the bare id. Routing slugs (`deepseek/deepseek-flash`,
+    // `deepseek/deepseek-v4-flash`) are unchanged - only the Codex selector label drops the
+    // redundant provider prefix.
+    modelDisplayNames: { "deepseek-flash": "deepseek-flash", "deepseek-v4-flash": "deepseek-v4-flash", "deepseek-v4-pro": "deepseek-v4-pro" },
     // DeepSeek documents V4-Flash as a native Responses API model adapted for Codex. The
-    // API id is `deepseek-v4-flash`; `DeepSeek-V4-Flash-0731` is a release/version label.
-    // Official DeepSeek Codex setup (codex-deepseek-setup.sh) advertises 1,048,576
-    // for both V4 models; the older 1,000,000 figure was a rounded approximation.
-    modelContextWindows: { "deepseek-v4-flash": 1_048_576, "deepseek-v4-pro": 1_048_576 },
+    // current API id is `deepseek-flash` (renamed 2026-09 from `deepseek-v4-flash`);
+    // `DeepSeek-V4-Flash-0731` is a release/version label. Official DeepSeek Codex setup
+    // (codex-deepseek-setup.sh) advertises 1,048,576 for both V4 models; the older
+    // 1,000,000 figure was a rounded approximation.
+    modelContextWindows: { "deepseek-flash": 1_048_576, "deepseek-v4-flash": 1_048_576, "deepseek-v4-pro": 1_048_576 },
     // DeepSeek documents both V4 models as native Responses API models adapted for Codex
     // (model table marks Responses API ✓ for flash and pro; the /responses reference lists
     // both ids as accepted `model` values — verified 2026-08-13 with the V4 Pro GA,
@@ -1572,6 +1581,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
       // provider-wide Chat wire: DeepSeek serves Chat Completions natively too, so
       // translating them into Responses would add a hop onto our newest upstream path
       // for no gain.
+      "deepseek-flash": { wire: "openai-responses", inbound: ["responses"] },
       "deepseek-v4-flash": { wire: "openai-responses", inbound: ["responses"] },
       "deepseek-v4-pro": { wire: "openai-responses", inbound: ["responses"] },
     },
@@ -1588,7 +1598,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     // devlog/_fin/260807_deepseek_responses_streaming/000_plan.md.
     // Current official streams normally carry a real terminal; retain a narrow grace
     // repair for the historical shape that closes after a complete graph without one.
-    modelResponsesTerminalRepair: { "deepseek-v4-flash": { graceMs: 5_000 }, "deepseek-v4-pro": { graceMs: 5_000 } },
+    modelResponsesTerminalRepair: { "deepseek-flash": { graceMs: 5_000 }, "deepseek-v4-flash": { graceMs: 5_000 }, "deepseek-v4-pro": { graceMs: 5_000 } },
     // DeepSeek's Responses route emits bare UUID item ids, which leave Codex
     // clients stuck on an uncommitted turn (#938). Client-facing only — raw
     // continuation snapshots keep the upstream ids.
@@ -1620,14 +1630,14 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     - 대안 분석: Globally preserve reasoning_content for all OpenAI-compatible models; preserve it for legacy deepseek-reasoner too; mark only V4 thinking models in registry metadata.
     - 선택 근거: DeepSeek V4 thinking mode requires history replay, while older DeepSeek reasoner has different compatibility rules. A model-scoped registry flag fixes built-in and stale saved configs without broad provider regressions.
     */
-    modelReasoningEfforts: Object.fromEntries(DEEPSEEK_THINKING_MODELS.map(id => [id, deepseekThinkingEffortsFor(id)])),
-    modelReasoningEffortMap: Object.fromEntries(DEEPSEEK_THINKING_MODELS.map(id => [id, deepseekReasoningMapFor(id)])),
-    modelSupportsReasoningSummaries: Object.fromEntries(DEEPSEEK_THINKING_MODELS.map(id => [id, true])),
-    preserveReasoningContentModels: DEEPSEEK_THINKING_MODELS,
+    modelReasoningEfforts: Object.fromEntries(DEEPSEEK_DIRECT_METADATA_MODELS.map(id => [id, deepseekThinkingEffortsFor(id)])),
+    modelReasoningEffortMap: Object.fromEntries(DEEPSEEK_DIRECT_METADATA_MODELS.map(id => [id, deepseekReasoningMapFor(id)])),
+    modelSupportsReasoningSummaries: Object.fromEntries(DEEPSEEK_DIRECT_METADATA_MODELS.map(id => [id, true])),
+    preserveReasoningContentModels: DEEPSEEK_DIRECT_METADATA_MODELS,
     // Issue #88: every DeepSeek API model is text-only input (no image support upstream) — the
     // vision sidecar describes attached images for them, and the catalog advertises image input
     // on their behalf (same treatment as opencode-go's DeepSeek V4 entries above).
-    noVisionModels: ["deepseek-chat", "deepseek-reasoner", ...DEEPSEEK_THINKING_MODELS],
+    noVisionModels: ["deepseek-chat", "deepseek-reasoner", ...DEEPSEEK_DIRECT_METADATA_MODELS],
   },
   // llama-3.3-70b was deprecated by Cerebras on 2026-02-16. Evidence: devlog/_plan/260710_provider_hardening/003_research_aggregators.md.
   { id: "cerebras", label: "Cerebras", baseUrl: "https://api.cerebras.ai/v1", adapter: "openai-chat", authKind: "key", dashboardUrl: "https://cloud.cerebras.ai/platform/apikeys", defaultModel: "gpt-oss-120b" },

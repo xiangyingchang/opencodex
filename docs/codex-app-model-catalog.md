@@ -55,6 +55,14 @@ requires_openai_auth = true
 ChatGPT-account capability from the active provider; without this flag, fast-related UI can stay
 hidden even when the user has ChatGPT auth.
 
+Account-gated native models are also entitlement-scoped in OpenCodex's selector catalog. The
+injection-model, sub-agent model, fallback, and Claude Code selectors expose a gated native slug
+only after a confirmed authenticated main/Pool account roster contains that exact slug; static
+documented additions never bypass this check. The cached roster must still match the account's current
+credential generation; for the main account that identity binds the account id and access-token
+fingerprint, and an expired JWT is not live. A replaced or missing credential is fail-closed. A missing,
+expired, or failed roster is fail-closed.
+
 ## Catalog entry shape
 
 opencodex does not generate minimal JSON entries. It clones a native Codex model catalog entry and

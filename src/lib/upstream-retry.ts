@@ -250,6 +250,22 @@ export interface TransientRetryOptions extends ResetRetryOptions {
 export type UpstreamSendRecovery = "connection-reset" | "transient-5xx";
 type ReplayableFetch = (recovery?: UpstreamSendRecovery) => Promise<Response>;
 
+interface AttemptBudget {
+  readonly limit: number;
+  used: number;
+  resetSeen: boolean;
+}
+
+function hasAttemptRemaining(budget: AttemptBudget): boolean {
+  return budget.used < budget.limit;
+}
+
+function consumeAttempt(budget: AttemptBudget): boolean {
+  if (!hasAttemptRemaining(budget)) return false;
+  budget.used++;
+  return true;
+}
+
 /**
  * Rejection thrown by the upstream retry helpers when the terminal attempt
  * rejects after earlier attempts already produced credential-visible evidence:
@@ -263,23 +279,34 @@ type ReplayableFetch = (recovery?: UpstreamSendRecovery) => Promise<Response>;
  * inspectable. Extracted from PR #966 (Yuxin-Qiao) with attribution.
  */
 export class UpstreamRetryEvidenceError extends Error {
+  public readonly transientStatuses: readonly number[];
+  public readonly resetSeen: boolean;
+
   constructor(
-    public readonly transientStatuses: readonly number[],
+    transientStatuses: readonly number[],
     cause: unknown,
-    /** True when a connection-reset retry already reached the origin. */
-    public readonly resetSeen = false,
+    resetSeen = false,
   ) {
-    const detail = cause instanceof Error ? cause.message : String(cause);
-    const kinds: string[] = [];
-    if (transientStatuses.length > 0) kinds.push("transient 5xx response(s)");
-    if (resetSeen) kinds.push("a credential-visible connection reset");
+    const mergedStatuses = [...transientStatuses];
+    let mergedResetSeen = resetSeen;
+    let rootCause = cause;
+    while (rootCause instanceof UpstreamRetryEvidenceError) {
+      mergedStatuses.push(...rootCause.transientStatuses);
+      mergedResetSeen ||= rootCause.resetSeen;
+      rootCause = rootCause.cause;
+    }
     super(
-      kinds.length > 0
-        ? `upstream fetch failed after ${kinds.join(" and ")}: ${detail}`
-        : `upstream fetch failed: ${detail}`,
-      { cause },
+      mergedResetSeen || mergedStatuses.length > 0
+        ? `upstream fetch failed after ${[
+            ...(mergedStatuses.length > 0 ? ["transient 5xx response(s)"] : []),
+            ...(mergedResetSeen ? ["a credential-visible connection reset"] : []),
+          ].join(" and ")}: ${rootCause instanceof Error ? rootCause.message : String(rootCause)}`
+        : `upstream fetch failed: ${rootCause instanceof Error ? rootCause.message : String(rootCause)}`,
+      { cause: rootCause },
     );
     this.name = "UpstreamRetryEvidenceError";
+    this.transientStatuses = mergedStatuses;
+    this.resetSeen = mergedResetSeen;
   }
 }
 
@@ -304,6 +331,47 @@ export function applyUpstreamRecoveryInit<T extends RequestInit>(
   return { ...init, headers, keepalive: false };
 }
 
+async function fetchWithResetRetryUsingBudget(
+  doFetch: ReplayableFetch,
+  opts: ResetRetryOptions,
+  firstRecovery: UpstreamSendRecovery | undefined,
+  budget: AttemptBudget,
+): Promise<Response> {
+  let lastError: unknown;
+  let attempt = 0;
+  while (consumeAttempt(budget)) {
+    if (opts.abortSignal?.aborted) throw abortError(opts.abortSignal);
+    try {
+      return await doFetch(attempt === 0 ? firstRecovery : "connection-reset");
+    } catch (err) {
+      if (opts.abortSignal?.aborted) throw err;
+      if (!isConnectionResetError(err)) {
+        // A reset that already reached the origin is credential-visible
+        // evidence: keep it attached so the terminal rejection cannot be
+        // downgraded to the pre-connection neutral class (#914 review).
+        if (budget.resetSeen) throw new UpstreamRetryEvidenceError([], err, true);
+        throw err;
+      }
+      const hadResetBefore = budget.resetSeen;
+      budget.resetSeen = true;
+      if (!hasAttemptRemaining(budget)) {
+        if (hadResetBefore) throw new UpstreamRetryEvidenceError([], err, true);
+        throw err;
+      }
+      lastError = err;
+      console.warn(
+        `[upstream-retry] connection reset${opts.label ? ` (${opts.label})` : ""} — retrying (${budget.used + 1}/${budget.limit})`,
+      );
+      await sleepWithAbort(retryBackoffDelayMs(attempt, {
+        baseDelayMs: RESET_RETRY_BASE_DELAY_MS,
+        maxDelayMs: RESET_RETRY_MAX_DELAY_MS,
+      }), opts.abortSignal);
+      attempt++;
+    }
+  }
+  throw lastError ?? new Error("upstream fetch failed");
+}
+
 /**
  * Run `doFetch`, retrying only connection-reset-shaped rejections (see
  * isConnectionResetError) with jittered backoff. The caller's thunk must be replay-safe
@@ -315,34 +383,7 @@ export async function fetchWithResetRetry(
   firstRecovery?: UpstreamSendRecovery,
 ): Promise<Response> {
   const attempts = Math.max(1, opts.attempts ?? RESET_RETRY_MAX_ATTEMPTS);
-  let lastError: unknown;
-  let sawReset = false;
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    if (opts.abortSignal?.aborted) throw abortError(opts.abortSignal);
-    try {
-      return await doFetch(attempt === 0 ? firstRecovery : "connection-reset");
-    } catch (err) {
-      if (opts.abortSignal?.aborted) throw err;
-      if (!isConnectionResetError(err)) {
-        // A reset that already reached the origin is credential-visible
-        // evidence: keep it attached so the terminal rejection cannot be
-        // downgraded to the pre-connection neutral class (#914 review).
-        if (sawReset) throw new UpstreamRetryEvidenceError([], err, true);
-        throw err;
-      }
-      if (attempt === attempts - 1) throw err;
-      sawReset = true;
-      lastError = err;
-      console.warn(
-        `[upstream-retry] connection reset${opts.label ? ` (${opts.label})` : ""} — retrying (${attempt + 2}/${attempts})`,
-      );
-      await sleepWithAbort(retryBackoffDelayMs(attempt, {
-        baseDelayMs: RESET_RETRY_BASE_DELAY_MS,
-        maxDelayMs: RESET_RETRY_MAX_DELAY_MS,
-      }), opts.abortSignal);
-    }
-  }
-  throw lastError ?? new Error("upstream fetch failed");
+  return fetchWithResetRetryUsingBudget(doFetch, opts, firstRecovery, { limit: attempts, used: 0, resetSeen: false });
 }
 
 /**
@@ -352,40 +393,41 @@ export async function fetchWithResetRetry(
  * retry; every returned response (ok, non-transient, aborted, slow, exhausted) keeps
  * its body intact. Honors Retry-After via retryBackoffDelayMs.
  *
- * A failed attempt slower than the slow budget is returned as-is (slow-502 shape);
- * note `opts.attempts` is shared with the inner reset layer (no caller passes it today).
+ * A failed attempt slower than the slow budget is returned as-is (slow-502 shape). The
+ * request-level attempt budget is shared with the inner reset layer.
  */
 export async function fetchWithTransientRetry(
   doFetch: ReplayableFetch,
   opts: TransientRetryOptions = {},
 ): Promise<Response> {
   const attempts = Math.max(1, opts.attempts ?? TRANSIENT_RETRY_MAX_ATTEMPTS);
+  const budget: AttemptBudget = { limit: attempts, used: 0, resetSeen: false };
   const slowAttemptMs = opts.slowAttemptMs ?? TRANSIENT_RETRY_SLOW_ATTEMPT_MS;
   const transientStatuses: number[] = [];
   let attemptStart = Date.now();
-  let res = await fetchWithResetRetry(doFetch, opts);
-  for (let attempt = 0; attempt < attempts - 1; attempt++) {
+  let res = await fetchWithResetRetryUsingBudget(doFetch, opts, undefined, budget);
+  for (let attempt = 0; attempt < attempts - 1 && hasAttemptRemaining(budget); attempt++) {
     if (res.ok || !isTransientUpstreamStatus(res.status)) return res;
     if (opts.abortSignal?.aborted) return res;
     if (Date.now() - attemptStart > slowAttemptMs) return res;
     console.warn(
-      `[upstream-retry] transient ${res.status}${opts.label ? ` (${opts.label})` : ""} — retrying (${attempt + 2}/${attempts})`,
+      `[upstream-retry] transient ${res.status}${opts.label ? ` (${opts.label})` : ""} — retrying (${budget.used + 1}/${attempts})`,
     );
     const delay = retryBackoffDelayMs(attempt, {
       baseDelayMs: TRANSIENT_RETRY_BASE_DELAY_MS,
       maxDelayMs: TRANSIENT_RETRY_MAX_DELAY_MS,
       headers: res.headers,
     });
-    cancelResponseBodyBestEffort(res);
+    await releaseResponseBodyBestEffort(res.body, opts.abortSignal);
     await sleepWithAbort(delay, opts.abortSignal);
     attemptStart = Date.now();
     transientStatuses.push(res.status);
     try {
-      res = await fetchWithResetRetry(doFetch, opts, "transient-5xx");
+      res = await fetchWithResetRetryUsingBudget(doFetch, opts, "transient-5xx", budget);
     } catch (err) {
       // Keep the prior 5xx evidence attached: the origin already responded, so
       // this rejection is not pre-connection and must not classify as neutral.
-      throw new UpstreamRetryEvidenceError(transientStatuses, err);
+      throw new UpstreamRetryEvidenceError(transientStatuses, err, budget.resetSeen);
     }
   }
   return res;

@@ -270,8 +270,14 @@ export async function handleManagementAPI(
     const { stripGrokConfig } = await import("../grok/inject");
     const grok = stripGrokConfig();
     setTimeout(async () => {
-      await drainAndShutdown(undefined, config.shutdownTimeoutMs ?? 5000);
-      process.exit(0);
+      let shutdownOk = true;
+      try {
+        await drainAndShutdown(undefined, config.shutdownTimeoutMs ?? 5000);
+      } catch {
+        shutdownOk = false;
+        console.warn("[shutdown] management stop cleanup failed");
+      }
+      process.exit(shutdownOk ? 0 : 1);
     }, 200);
     const grokNote = grok.ok ? "" : ` Grok config cleanup failed: ${grok.message}`;
     return jsonResponse(restore.success
