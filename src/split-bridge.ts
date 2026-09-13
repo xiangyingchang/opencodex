@@ -11,6 +11,12 @@ import {
   SPLIT_BRIDGE_ADMISSION_HEADER,
 } from "./server/bridge-admission";
 import {
+  createSplitAdmissionGates,
+  splitAdmissionBranchForChannel,
+  type SplitAdmissionBranch,
+} from "./server/split-admission";
+import type { AdmissionLease } from "./lib/admission";
+import {
   assertProviderSplitCatalogDisjoint,
   classifyProviderSplitModel,
   type ProviderSplitCatalog,
@@ -22,6 +28,8 @@ const SPLIT_BRIDGE_IDLE_TIMEOUT_SECONDS = 255;
 const HEALTH_PATH = "/healthz";
 const CAPABILITIES_PATH = "/capabilities";
 const RESPONSE_PATHS = new Set(["/v1/responses", "/v1/responses/compact"]);
+const IMAGE_PATHS = new Set(["/v1/images/generations", "/v1/images/edits"]);
+const SEARCH_PATHS = new Set(["/v1/alpha/search"]);
 const REQUEST_METADATA_HEADERS = [
   "content-type",
   "accept",
@@ -84,6 +92,9 @@ export interface SplitBridgeOptions {
   readonly maxBodyBytes?: number;
   /** Secret shared only between the split bridge and the local third-party gateway. */
   readonly gatewayAdmissionToken: string;
+  /** Optional non-persistent per-domain active-stream limits; defaults are bounded and fixed. */
+  readonly nativeMaxActive?: number;
+  readonly gatewayMaxActive?: number;
   /** Listener port reported by the local health contract. */
   readonly port?: number;
 }
@@ -141,6 +152,9 @@ const UPSTREAM_ROUTE_SUFFIXES = {
   gateway: {
     "/v1/responses": "/responses",
     "/v1/responses/compact": "/responses/compact",
+    "/v1/images/generations": "/images/generations",
+    "/v1/images/edits": "/images/edits",
+    "/v1/alpha/search": "/alpha/search",
   },
 } as const;
 
@@ -192,12 +206,133 @@ function requestHeaders(
   return selected;
 }
 
+/**
+ * Hosted search is executed by 10100's ChatGPT relay, so it needs the same
+ * official auth/session context as a native request while still proving that
+ * it arrived through the split bridge.
+ */
+function searchRequestHeaders(incoming: Headers, gatewayAdmissionToken: string): Headers {
+  const selected = new Headers();
+  for (const name of [...OFFICIAL_SPLIT_FORWARD_HEADERS, ...REQUEST_METADATA_HEADERS]) {
+    const value = incoming.get(name);
+    if (value !== null) selected.set(name, value);
+  }
+  // Never inherit a caller-supplied admission value: only the bridge's configured
+  // secret can authorize the 10100 split-mode listener.
+  selected.set(SPLIT_BRIDGE_ADMISSION_HEADER, gatewayAdmissionToken);
+  return selected;
+}
+
 function responseHeaders(upstream: Headers): Headers {
   const selected = new Headers();
   for (const [name, value] of upstream) {
     if (SAFE_RESPONSE_HEADERS.has(name.toLowerCase())) selected.set(name, value);
   }
   return selected;
+}
+
+function splitBranchBusyResponse(branch: SplitAdmissionBranch): Response {
+  const response = errorResponse(503, "server_busy", `${branch} split branch capacity reached`);
+  response.headers.set("retry-after", "1");
+  return response;
+}
+
+/** Hold a split lease until the downstream consumes, cancels, or errors the upstream body. */
+function releaseAdmissionAfterBody(
+  body: ReadableStream<Uint8Array>,
+  lease: AdmissionLease,
+  signal: AbortSignal,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  let released = false;
+  const cleanupSignal = (): void => {
+    signal.removeEventListener("abort", onAbort);
+  };
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    cleanupSignal();
+    lease.release();
+  };
+  const cancelUpstream = (reason: unknown): void => {
+    try {
+      void reader.cancel(reason).catch(() => {});
+    } catch {
+      // A non-standard upstream reader may throw synchronously.
+    }
+  };
+  const onAbort = (): void => {
+    release();
+    cancelUpstream(signal.reason);
+  };
+  if (signal.aborted) onAbort();
+  else signal.addEventListener("abort", onAbort, { once: true });
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          release();
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (error) {
+        release();
+        cancelUpstream(error);
+        try { controller.error(error); } catch { /* downstream already closed */ }
+      }
+    },
+    cancel(reason) {
+      release();
+      cancelUpstream(reason);
+    },
+  });
+}
+
+interface SplitRelayFailure {
+  readonly status: number;
+  readonly code: string;
+  readonly message: string;
+}
+
+/** Relay a bounded split request without releasing its lease before the body is consumed. */
+async function relaySplitUpstream(
+  fetchImpl: NonNullable<SplitBridgeOptions["fetch"]>,
+  request: Request,
+  target: string,
+  headers: Headers,
+  body: string,
+  lease: AdmissionLease,
+  failure: SplitRelayFailure,
+): Promise<Response> {
+  try {
+    const upstream = await fetchImpl(target, {
+      method: "POST",
+      headers,
+      body,
+      signal: request.signal,
+    });
+    const responseBody = upstream.body
+      ? releaseAdmissionAfterBody(upstream.body, lease, request.signal)
+      : null;
+    if (!responseBody) lease.release();
+    try {
+      return new Response(responseBody, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: responseHeaders(upstream.headers),
+      });
+    } catch (error) {
+      if (responseBody) void responseBody.cancel(error).catch(() => {});
+      throw error;
+    }
+  } catch (error) {
+    lease.release();
+    if (request.signal.aborted) throw error;
+    return errorResponse(failure.status, failure.code, failure.message);
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -248,10 +383,12 @@ function canonicalBody(raw: string, body: Record<string, unknown>, decision: Pro
 /**
  * Build the isolated split data-plane handler. It has no listener or configuration
  * side effects; all network behavior is behind the injected fetch implementation.
- * This bounded slice intentionally covers only HTTP Responses/compact; WebSocket,
- * app-server, Images, search, and lifecycle remain outside this handler. Account-
- * qualified native rows delegate to 10100 so exact credential resolution stays in
- * the existing Responses implementation.
+ * This bounded slice covers HTTP Responses/compact, hosted search, and the
+ * standalone Images endpoints. WebSocket, app-server, and lifecycle remain
+ * outside this handler. Account-qualified native rows delegate to 10100 so
+ * exact credential resolution stays in the existing server implementations;
+ * search and Images use the gateway because 10100 owns their provider selection
+ * and credential resolution.
  */
 export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBridgeHandler {
   const nativeBase = parseBaseUrl(options.nativeBaseUrl, "nativeBaseUrl");
@@ -268,6 +405,10 @@ export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBrid
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) {
     throw new RangeError("maxBodyBytes must be a positive safe integer");
   }
+  const admissionGates = createSplitAdmissionGates({
+    native: options.nativeMaxActive,
+    gateway: options.gatewayMaxActive,
+  });
 
   return async (request: Request): Promise<Response> => {
     const incoming = new URL(request.url);
@@ -279,6 +420,10 @@ export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBrid
         service: "opencodex-split-bridge",
         pid: process.pid,
         port: options.port ?? 10101,
+        admission: {
+          native: admissionGates.native.metrics(),
+          gateway: admissionGates.gateway.metrics(),
+        },
       });
     }
     if (incoming.pathname === CAPABILITIES_PATH) {
@@ -290,10 +435,59 @@ export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBrid
           responsesHttp: true,
           responsesCompactHttp: true,
           responsesWebSocketFallback: true,
+          imagesHttp: true,
+          searchHttp: true,
         },
         catalogGeneration: options.catalog.generation,
         gatewayAdmissionConfigured: true,
       });
+    }
+    if (IMAGE_PATHS.has(incoming.pathname)) {
+      if (request.method !== "POST") {
+        return errorResponse(405, "method_not_allowed", "Only POST is supported for image endpoints");
+      }
+
+      const parsed = await readRequestJson(request, maxBodyBytes);
+      if (parsed instanceof Response) return parsed;
+
+      const admissionLease = admissionGates.gateway.tryAcquire();
+      if (!admissionLease) return splitBranchBusyResponse("gateway");
+
+      return relaySplitUpstream(
+        fetchImpl,
+        request,
+        targetUrl(gatewayBase, incoming, "gateway"),
+        requestHeaders(request.headers, {
+          channel: "third-party-gateway",
+          canonicalModel: null,
+          provider: null,
+          reason: "standalone-image-gateway",
+        }, options.gatewayAdmissionToken, ""),
+        parsed.raw,
+        admissionLease,
+        { status: 503, code: "gateway_unavailable", message: "Third-party gateway unavailable" },
+      );
+    }
+    if (SEARCH_PATHS.has(incoming.pathname)) {
+      if (request.method !== "POST") {
+        return errorResponse(405, "method_not_allowed", "Only POST is supported for search endpoints");
+      }
+
+      const parsed = await readRequestJson(request, maxBodyBytes);
+      if (parsed instanceof Response) return parsed;
+
+      const admissionLease = admissionGates.gateway.tryAcquire();
+      if (!admissionLease) return splitBranchBusyResponse("gateway");
+
+      return relaySplitUpstream(
+        fetchImpl,
+        request,
+        targetUrl(gatewayBase, incoming, "gateway"),
+        searchRequestHeaders(request.headers, options.gatewayAdmissionToken),
+        parsed.raw,
+        admissionLease,
+        { status: 503, code: "gateway_unavailable", message: "Third-party gateway unavailable" },
+      );
     }
     if (!RESPONSE_PATHS.has(incoming.pathname)) {
       return errorResponse(404, "not_found", "Split bridge endpoint not found");
@@ -315,6 +509,11 @@ export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBrid
       return errorResponse(400, "unknown_model", "Requested model is not in the split catalog");
     }
 
+    const admissionBranch = splitAdmissionBranchForChannel(decision.channel);
+    if (!admissionBranch) {
+      return errorResponse(400, "unknown_model", "Requested model is not in the split catalog");
+    }
+
     const isGateway = decision.channel === "third-party-gateway" || decision.channel === "official-native-account";
     const target = targetUrl(isGateway ? gatewayBase : nativeBase, incoming, isGateway ? "gateway" : "native");
     const canonical = canonicalBody(parsed.raw, parsed.body, decision);
@@ -329,27 +528,20 @@ export function createSplitBridgeHandler(options: SplitBridgeOptions): SplitBrid
           replayMiss: typeof parsed.body.previous_response_id === "string",
         },
       ));
-    try {
-      const upstream = await fetchImpl(target, {
-        method: "POST",
-        headers: requestHeaders(request.headers, decision, options.gatewayAdmissionToken, requestedModel),
-        body: upstreamBody,
-        signal: request.signal,
-      });
-      // Do not inspect or buffer upstream.body: this keeps SSE backpressure and cancellation.
-      return new Response(upstream.body, {
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers: responseHeaders(upstream.headers),
-      });
-    } catch (error) {
-      if (request.signal.aborted) throw error;
-      return errorResponse(
-        isGateway ? 503 : 502,
-        isGateway ? "gateway_unavailable" : "native_upstream_unavailable",
-        isGateway ? "Third-party gateway unavailable" : "Native upstream unavailable",
-      );
-    }
+    const admissionLease = admissionGates[admissionBranch].tryAcquire();
+    if (!admissionLease) return splitBranchBusyResponse(admissionBranch);
+
+    return relaySplitUpstream(
+      fetchImpl,
+      request,
+      target,
+      requestHeaders(request.headers, decision, options.gatewayAdmissionToken, requestedModel),
+      upstreamBody,
+      admissionLease,
+      isGateway
+        ? { status: 503, code: "gateway_unavailable", message: "Third-party gateway unavailable" }
+        : { status: 502, code: "native_upstream_unavailable", message: "Native upstream unavailable" },
+    );
   };
 }
 

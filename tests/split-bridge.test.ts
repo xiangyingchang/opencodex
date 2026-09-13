@@ -334,10 +334,89 @@ describe("Provider Split Bridge", () => {
         responsesHttp: true,
         responsesCompactHttp: true,
         responsesWebSocketFallback: true,
+        imagesHttp: true,
+        searchHttp: true,
       },
       gatewayAdmissionConfigured: true,
     });
     expect(calls).toHaveLength(0);
+  });
+
+  test("routes standalone image generation and edits to the gateway without model classification", async () => {
+    const requests: { url: string; body: unknown; headers: Headers }[] = [];
+    const { handler, calls } = makeBridge(async (input, init) => {
+      const request = new Request(input, init);
+      requests.push({ url: request.url, body: await request.json(), headers: request.headers });
+      return jsonResponse({ created: 1, data: [{ b64_json: "aGVsbG8=" }] });
+    });
+    const headers = {
+      authorization: "Bearer caller-credential",
+      "chatgpt-account-id": "caller-account",
+      "x-request-id": "image-request",
+    };
+
+    const generations = await handler(new Request("http://127.0.0.1:10101/v1/images/generations", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify({ prompt: "a cat", model: "gpt-image-2" }),
+    }));
+    const edits = await handler(new Request("http://127.0.0.1:10101/v1/images/edits", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify({ prompt: "add gold ink", images: [{ image_url: "data:image/png;base64,aGk=" }] }),
+    }));
+
+    expect(generations.status).toBe(200);
+    expect(edits.status).toBe(200);
+    expect(calls.map(call => call.url)).toEqual([
+      "http://gateway.example/v1/images/generations",
+      "http://gateway.example/v1/images/edits",
+    ]);
+    expect(requests.map(request => new URL(request.url).pathname)).toEqual([
+      "/v1/images/generations",
+      "/v1/images/edits",
+    ]);
+    expect(requests[0]?.body).toEqual({ prompt: "a cat", model: "gpt-image-2" });
+    expect(requests[1]?.body).toMatchObject({ prompt: "add gold ink" });
+    const forwarded = requests[0]?.headers;
+    expect(forwarded?.get("x-opencodex-bridge-admission")).toBe("test-gateway-admission");
+    expect(forwarded?.get("x-request-id")).toBe("image-request");
+    expect(forwarded?.has("authorization")).toBe(false);
+    expect(forwarded?.has("chatgpt-account-id")).toBe(false);
+  });
+
+  test("routes hosted search to the gateway with official auth context and bridge admission", async () => {
+    const requests: { url: string; body: unknown; headers: Headers }[] = [];
+    const { handler, calls } = makeBridge(async (input, init) => {
+      const request = new Request(input, init);
+      requests.push({ url: request.url, body: await request.json(), headers: request.headers });
+      return jsonResponse({ results: [{ title: "official result" }] });
+    });
+
+    const response = await handler(postRequest("unknown/model", "/v1/alpha/search?source=codex", {
+      authorization: "Bearer chatgpt-credential",
+      "chatgpt-account-id": "acct-search",
+      session_id: "session-search",
+      "x-codex-turn-metadata": "turn-search",
+      "x-request-id": "search-request",
+      "x-opencodex-bridge-admission": "forged-by-client",
+      "x-custom": "must-not-forward",
+    }, {
+      query: "kangaroo sanctuary",
+    }));
+
+    expect(response.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe("http://gateway.example/v1/alpha/search?source=codex");
+    expect(requests[0]?.body).toEqual({ model: "unknown/model", query: "kangaroo sanctuary" });
+    const forwarded = requests[0]?.headers;
+    expect(forwarded?.get("authorization")).toBe("Bearer chatgpt-credential");
+    expect(forwarded?.get("chatgpt-account-id")).toBe("acct-search");
+    expect(forwarded?.get("session_id")).toBe("session-search");
+    expect(forwarded?.get("x-codex-turn-metadata")).toBe("turn-search");
+    expect(forwarded?.get("x-request-id")).toBe("search-request");
+    expect(forwarded?.get("x-opencodex-bridge-admission")).toBe("test-gateway-admission");
+    expect(forwarded?.has("x-custom")).toBe(false);
   });
 
   test("rejects a Responses WebSocket upgrade with 426 without calling upstream", async () => {
@@ -413,6 +492,8 @@ describe("Provider Split Bridge", () => {
 
     expect((await handler(new Request("http://127.0.0.1:10101/v1/models"))).status).toBe(404);
     expect((await handler(new Request("http://127.0.0.1:10101/v1/responses"))).status).toBe(405);
+    expect((await handler(new Request("http://127.0.0.1:10101/v1/images/generations"))).status).toBe(405);
+    expect((await handler(new Request("http://127.0.0.1:10101/v1/alpha/search"))).status).toBe(405);
     expect(calls).toHaveLength(0);
   });
 

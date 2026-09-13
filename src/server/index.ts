@@ -159,6 +159,7 @@ import {
 import {
   hasSplitBridgeAdmission,
   readSplitBridgeAdmissionToken,
+  splitBridgeTrafficBranch,
   SPLIT_BRIDGE_ACCOUNT_SELECTOR_HEADER,
   SPLIT_BRIDGE_ADMISSION_TOKEN_FILE_ENV,
 } from "./bridge-admission";
@@ -206,6 +207,7 @@ import {
 import { SYSTEM_RESTART_CAPABILITY_VERSION } from "../lib/system-restart-contract";
 import { LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION } from "../lib/local-provider-reload-contract";
 import { createReadinessGate, type ReadinessGate } from "./readiness";
+import { createSplitAdmissionGates, type SplitAdmissionLimits } from "./split-admission";
 
 export const MAX_WS_FRAME_BYTES = 50 * 1024 * 1024;
 const WEBSOCKET_IDLE_TIMEOUT_SECONDS = 0;
@@ -458,6 +460,8 @@ export interface StartServerDeps {
   readinessGate?: ReadinessGate;
   /** Split activation's owner-only gateway token; omitted for legacy-local mode. */
   splitBridgeAdmissionToken?: string | null;
+  /** Test-only per-branch limits; production uses the fixed bounded defaults. */
+  splitAdmissionLimits?: SplitAdmissionLimits;
 }
 
 function inspectStartupOwnership(deps: StartServerDeps): OwnershipInspection {
@@ -519,6 +523,9 @@ const config = runModelRenameStartupMigration(runAlibabaRegionStartupMigration(r
     throw new Error("split routing requires a valid split bridge admission token file");
   }
   const splitBridgeAdmissionToken = splitModeActive ? configuredSplitBridgeAdmissionToken : undefined;
+  const splitAdmissionGates = splitModeActive
+    ? createSplitAdmissionGates(deps.splitAdmissionLimits)
+    : null;
   setLiveStateStoreConfig(config);
   applyProxyEnv(config);
   assertServerAuthConfig(config);
@@ -716,8 +723,12 @@ const config = runModelRenameStartupMigration(runAlibabaRegionStartupMigration(r
     policy: RequestPolicyView,
     work: (lease: ActiveTurnLease) => Promise<Response>,
   ): Promise<Response> {
-    const lease = tryAdmitTurn();
-    if (!lease) return serverBusyResponse(req, "active turns", policy);
+    const splitBranch = splitBridgeTrafficBranch(req, splitBridgeAdmissionToken);
+    const admissionGate = splitAdmissionGates && splitBranch
+      ? splitAdmissionGates[splitBranch]
+      : undefined;
+    const lease = tryAdmitTurn(admissionGate);
+    if (!lease) return serverBusyResponse(req, admissionGate ? `${splitBranch} split branch` : "active turns", policy);
     let response: Response;
     try {
       response = await work(lease);
@@ -881,6 +892,12 @@ const config = runModelRenameStartupMigration(runAlibabaRegionStartupMigration(r
           port: healthPort,
           restartCapability: SYSTEM_RESTART_CAPABILITY_VERSION,
           providerReloadCapability: LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION,
+          ...(splitAdmissionGates ? {
+            admission: {
+              native: splitAdmissionGates.native.metrics(),
+              gateway: splitAdmissionGates.gateway.metrics(),
+            },
+          } : {}),
         }, 200, req, policy);
         const challenge = req.headers.get(LOCAL_ATTESTATION_CHALLENGE_HEADER);
         if (challenge) {

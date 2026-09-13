@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -345,4 +345,80 @@ describe("CLI status JSON", () => {
     expect(target.healthUrl).toBe("http://127.0.0.1:10100/healthz");
     expect(target.dashboardUrl).toBe("http://localhost:10100/");
   });
+});
+
+test("split admission derives from bridge capabilities, not gateway health", async () => {
+  const opencodexHome = mkdtempSync(join(tmpdir(), "ocx-status-admission-"));
+  const prevOpenCodexHome = process.env.OPENCODEX_HOME;
+  const prevTokenFile = process.env.OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE;
+  try {
+    process.env.OPENCODEX_HOME = opencodexHome;
+    const configPath = join(opencodexHome, "config.json");
+    writeFileSync(configPath, JSON.stringify({
+      port: 10100,
+      providers: {
+        openai: {
+          adapter: "openai-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          authMode: "forward",
+        },
+      },
+      defaultProvider: "openai",
+      codexRoutingMode: "split",
+      codexAutoStart: false,
+    }), "utf8");
+
+    // Create a valid admission token so the local check passes.
+    const admissionPath = join(opencodexHome, "split-admission-token");
+    writeFileSync(admissionPath, "test-admission-token-value", "utf8");
+    chmodSync(admissionPath, 0o600);
+    process.env.OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE = admissionPath;
+
+    const { collectStatus } = await import("../src/cli/status");
+
+    // Mock gateway /healthz: live, but no splitAdmissionConfigured field.
+    const mockGatewayHealth = async (target: { port: number; hostname?: string; source: string; healthUrl: string; dashboardUrl: string }) => ({
+      ok: true as const,
+      url: target.healthUrl,
+      message: "ok (mock)",
+      label: `${target.healthUrl} ok (mock)`,
+    });
+
+    const mockBridgeHealth = async () => true;
+    const mockBridgeTransport = async () => ({ transportReady: true, gatewayAdmissionConfigured: true });
+    const mockSplitServiceStatus = () => ({ supported: true, installed: true, loaded: true, matchesPlist: true, pid: 4242, plistPath: "/tmp/test.plist" });
+    const mockCatalogGen = () => "generation-test";
+
+    const result = await collectStatus({
+      checkProxyHealth: mockGatewayHealth,
+      checkSplitBridgeHealth: mockBridgeHealth,
+      checkSplitBridgeTransport: mockBridgeTransport,
+      catalogGenerationForStatus: mockCatalogGen,
+      splitBridgeServiceStatusFn: mockSplitServiceStatus,
+    });
+
+    // Regression: gateway health omits splitAdmissionConfigured; the bridge
+    // capabilities result is the authority for admission and transport state.
+    expect(result.json.splitBridge.readiness).not.toBe("configuration-invalid");
+    expect(result.json.splitBridge.gatewayAdmissionConfigured).toBe(true);
+    expect(result.json.splitBridge.gatewayReachable).toBe(true);
+    expect(result.json.splitBridge.desiredMode).toBe("split");
+
+    const missingAdmission = await collectStatus({
+      checkProxyHealth: mockGatewayHealth,
+      checkSplitBridgeHealth: mockBridgeHealth,
+      checkSplitBridgeTransport: async () => ({ transportReady: true, gatewayAdmissionConfigured: false }),
+      catalogGenerationForStatus: mockCatalogGen,
+      splitBridgeServiceStatusFn: mockSplitServiceStatus,
+    });
+    expect(missingAdmission.json.splitBridge.nativeTransportReady).toBe(true);
+    expect(missingAdmission.json.splitBridge.gatewayAdmissionConfigured).toBe(false);
+    expect(missingAdmission.json.splitBridge.readiness).toBe("configuration-invalid");
+  } finally {
+    if (prevOpenCodexHome === undefined) delete process.env.OPENCODEX_HOME;
+    else process.env.OPENCODEX_HOME = prevOpenCodexHome;
+    if (prevTokenFile === undefined) delete process.env.OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE;
+    else process.env.OCX_SPLIT_GATEWAY_ADMISSION_TOKEN_FILE = prevTokenFile;
+    rmSync(opencodexHome, { recursive: true, force: true });
+  }
 });

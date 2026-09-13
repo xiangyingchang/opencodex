@@ -19,6 +19,8 @@ import { loadConfig, saveConfig } from "../src/config";
 import { startServer } from "../src/server";
 import { clearRequestLogsForTests, getRequestLogEntries } from "../src/server/request-log";
 import { handleSearch, SEARCH_RESPONSE_MAX_BYTES } from "../src/server/search";
+import { createSplitBridgeHandler } from "../src/split-bridge";
+import type { ProviderSplitCatalog } from "../src/providers/split-map";
 import type { OcxConfig } from "../src/types";
 import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
@@ -29,6 +31,15 @@ const originalFetch = globalThis.fetch;
 const TEST_DIR = join(import.meta.dir, ".tmp-server-search-test");
 let isolatedCodexHome: IsolatedCodexHome | null = null;
 const DIRECT_CHATGPT_TOKEN = fakeChatGptJwt({ chatgpt_account_id: "acct-123" });
+const SPLIT_SEARCH_CATALOG: ProviderSplitCatalog = {
+  generation: "split-search-test-1",
+  officialModels: new Set(["gpt-test"]),
+  officialAccountSlugs: new Set(),
+  officialAccountNamespaces: new Set(),
+  officialAccountModels: new Set(),
+  officialApiKeyModels: new Set(),
+  thirdPartyModels: new Set(),
+};
 
 beforeEach(() => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
@@ -180,6 +191,53 @@ test("POST /v1/alpha/search relays to the ChatGPT forward provider with forwarde
   } finally {
     await server.stop(true);
     await upstream.stop(true);
+  }
+});
+
+test("split bridge composes 10101 to 10100 to the official search upstream", async () => {
+  const captured: CapturedRequest[] = [];
+  const officialUpstream = fakeSearchUpstream(captured);
+  saveConfig({ ...forwardConfig(), codexRoutingMode: "split" } as OcxConfig);
+
+  const gateway = startServer(0, { splitBridgeAdmissionToken: "split-search-admission" });
+  const bridge = createSplitBridgeHandler({
+    catalog: SPLIT_SEARCH_CATALOG,
+    nativeBaseUrl: "https://native.example",
+    gatewayBaseUrl: gateway.url.toString(),
+    gatewayAdmissionToken: "split-search-admission",
+  });
+  try {
+    const response = await bridge(new Request("http://127.0.0.1:10101/v1/alpha/search?source=codex", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${DIRECT_CHATGPT_TOKEN}`,
+        "chatgpt-account-id": "acct-123",
+        session_id: "split-search-session",
+        "x-opencodex-bridge-admission": "client-forged-value",
+      },
+      body: JSON.stringify({
+        id: "split-search",
+        model: "gpt-test",
+        commands: { search_query: [{ q: "OpenAI news" }] },
+      }),
+    }));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ encrypted_output: "ciphertext", output: "search result" });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].path).toBe("/alpha/search");
+    expect(captured[0].headers.get("authorization")).toBe(`Bearer ${DIRECT_CHATGPT_TOKEN}`);
+    expect(captured[0].headers.get("chatgpt-account-id")).toBe("acct-123");
+    expect(captured[0].headers.get("session_id")).toBe("split-search-session");
+    expect(captured[0].body).toEqual({
+      id: "split-search",
+      model: "gpt-test",
+      commands: { search_query: [{ q: "OpenAI news" }] },
+    });
+  } finally {
+    await gateway.stop(true);
+    await officialUpstream.stop(true);
   }
 });
 

@@ -29,11 +29,24 @@ export type HealthCheck = {
   splitAdmissionConfigured?: boolean;
 };
 
+export type SplitBridgeCapability = {
+  transportReady: boolean;
+  gatewayAdmissionConfigured: boolean;
+};
+
+/**
+ * Keep accepting the pre-capability boolean test/dependency contract. A legacy
+ * boolean proves transport only; admission remains false until capabilities
+ * provide explicit evidence.
+ */
+export type SplitBridgeTransportResult = SplitBridgeCapability | boolean;
+
 export interface StatusCollectionDeps {
   readonly checkProxyHealth?: (target: ListenTarget) => Promise<HealthCheck>;
   readonly checkSplitBridgeHealth?: (expectedPid?: number | null) => Promise<boolean>;
-  readonly checkSplitBridgeTransport?: (expectedCatalogGeneration?: string | null) => Promise<boolean>;
+  readonly checkSplitBridgeTransport?: (expectedCatalogGeneration?: string | null) => Promise<SplitBridgeTransportResult>;
   readonly catalogGenerationForStatus?: (config: OcxConfig) => string | null;
+  readonly splitBridgeServiceStatusFn?: () => ReturnType<typeof splitBridgeServiceStatus>;
 }
 
 export type CliStatusJson = {
@@ -186,23 +199,29 @@ async function checkSplitBridgeHealth(expectedPid?: number | null): Promise<bool
   }
 }
 
-async function checkSplitBridgeTransport(expectedCatalogGeneration?: string | null): Promise<boolean> {
+async function checkSplitBridgeTransport(expectedCatalogGeneration?: string | null): Promise<SplitBridgeCapability> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 400);
   try {
     const response = await fetch("http://127.0.0.1:10101/capabilities", { signal: controller.signal });
-    if (!response.ok) return false;
+    if (!response.ok) return { transportReady: false, gatewayAdmissionConfigured: false };
     const body = await response.json().catch(() => null) as {
-      transports?: { responsesHttp?: unknown; responsesCompactHttp?: unknown; responsesWebSocketFallback?: unknown };
+      transports?: { responsesHttp?: unknown; responsesCompactHttp?: unknown; responsesWebSocketFallback?: unknown; imagesHttp?: unknown; searchHttp?: unknown };
       catalogGeneration?: unknown;
+      gatewayAdmissionConfigured?: unknown;
     } | null;
     const transportReady = body?.transports?.responsesHttp === true
       && body.transports.responsesCompactHttp === true
-      && body.transports.responsesWebSocketFallback === true;
-    return transportReady
+      && body.transports.responsesWebSocketFallback === true
+      && body.transports.imagesHttp === true
+      && body.transports.searchHttp === true
       && (typeof expectedCatalogGeneration !== "string" || body.catalogGeneration === expectedCatalogGeneration);
+    return {
+      transportReady,
+      gatewayAdmissionConfigured: body?.gatewayAdmissionConfigured === true,
+    };
   } catch {
-    return false;
+    return { transportReady: false, gatewayAdmissionConfigured: false };
   } finally {
     clearTimeout(timer);
   }
@@ -283,12 +302,17 @@ export async function collectStatus(deps: StatusCollectionDeps = {}): Promise<Cl
       label: `${health.label} (legacy-local gateway)`,
     };
   const splitLifecycle = splitModeActive
-    ? splitBridgeServiceStatus()
+    ? (deps.splitBridgeServiceStatusFn ? deps.splitBridgeServiceStatusFn() : splitBridgeServiceStatus())
     : { supported: true, installed: true, loaded: true, matchesPlist: true, pid: null, plistPath: "" };
   const splitBridgeRunning = splitModeActive ? await checkSplitHealth(splitLifecycle.pid) : false;
   const routingInjected = splitModeActive && isCodexSplitBridgeRoutingInjected();
   const catalogGeneration = getCatalogGeneration(config);
-  const nativeTransportReady = splitModeActive ? await checkSplitTransport(catalogGeneration) : false;
+  const rawBridgeCapability = splitModeActive ? await checkSplitTransport(catalogGeneration) : null;
+  const bridgeCapability = typeof rawBridgeCapability === "boolean"
+    ? { transportReady: rawBridgeCapability, gatewayAdmissionConfigured: false }
+    : rawBridgeCapability;
+  const nativeTransportReady = bridgeCapability?.transportReady ?? false;
+  const bridgeAdmissionConfigured = bridgeCapability?.gatewayAdmissionConfigured ?? false;
   const splitBridge = deriveSplitBridgeStatus({
     desiredMode,
     splitBridgeRunning,
@@ -299,7 +323,7 @@ export async function collectStatus(deps: StatusCollectionDeps = {}): Promise<Cl
     routingInjected,
     configurationInvalid: configDiagnostics.source === "fallback" || configDiagnostics.error !== null,
     gatewayAdmissionConfigured: splitModeActive
-      ? splitBridgeAdmissionConfigured() && gatewayHealth.splitAdmissionConfigured === true
+      ? splitBridgeAdmissionConfigured() && bridgeAdmissionConfigured
       : true,
     launchAgentInstalled: splitLifecycle.installed,
     launchAgentLoaded: splitLifecycle.loaded,

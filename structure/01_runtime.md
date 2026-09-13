@@ -83,19 +83,22 @@ The server exposes `POST /api/stop` which restores native Codex config, stops an
 The split runtime boundary is two independent local data planes rather than an `if` branch inside the
 existing proxy. `com.opencodex.proxy` remains the third-party gateway on 10100; a separate
 `com.opencodex.split-bridge` process owns 10101 and dispatches bare official-native models directly to
-ChatGPT/Codex while forwarding third-party models to 10100. Account-qualified official rows preserve
-their selector and use 10100's existing exact-account auth path. The bare direct branch must not wait on
-gateway health, gateway admission, retry state, or gateway queues. Gateway-dependent branches are
-fail-closed when 10100 is unavailable. Both services have independent PIDs, logs, health state, launchd KeepAlive policy, and
-resource limits. The foreground entry is `ocx split-bridge start`; that dedicated command bypasses the
-ordinary CLI Codex-shim auto-restore hook.
+ChatGPT/Codex while forwarding third-party models, hosted search, and standalone Images requests to
+10100. Account-qualified official rows preserve their selector and use 10100's existing exact-account
+auth path. The bare direct branch must not wait on gateway health, gateway admission, retry state, or
+gateway queues. Gateway-dependent branches are fail-closed when 10100 is unavailable. Both services have
+independent PIDs, logs, health state, launchd KeepAlive policy, and resource limits. The foreground entry
+is `ocx split-bridge start`; that dedicated command bypasses the ordinary CLI Codex-shim auto-restore
+hook.
 
 Native base URLs and gateway base URLs use explicit route tables: the canonical native base
 `https://chatgpt.com/backend-api/codex` receives `/responses` and `/responses/compact`, while the
-gateway retains `/v1/responses` semantics. A WebSocket upgrade on 10101 receives `426 upgrade_required`
-and must fall back to HTTP; the split bridge does not claim native upstream WebSocket support. Official
-body normalization is shared with the forward `openai-responses` adapter, including stateful-field
-stripping, proxy reasoning/compaction cleanup, and replay call-id repair.
+gateway retains `/v1/responses`, `/v1/alpha/search`, and standalone Images semantics. A WebSocket
+upgrade on 10101 receives `426 upgrade_required` and must fall back to HTTP; the split bridge does not
+claim native upstream WebSocket support. Official body normalization is shared with the forward
+`openai-responses` adapter, including stateful-field stripping, proxy reasoning/compaction cleanup, and
+replay call-id repair. Hosted search preserves the official auth/session context while adding the
+bridge-only admission header required by 10100.
 
 The gateway branch injects an owner-only `x-opencodex-bridge-admission` value, and 10100 validates it in
 split admission mode; loopback's ordinary API-auth bypass is not an admission substitute. Status must
