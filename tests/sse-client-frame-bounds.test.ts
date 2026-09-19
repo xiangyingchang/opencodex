@@ -108,7 +108,9 @@ describe("client-facing SSE frame bounds", () => {
 
     expect(text.length).toBeLessThan(2048);
     expect(text).toContain("response.failed");
-    expect(text).toContain(`upstream SSE frame exceeded ${MAX_CLIENT_SSE_FRAME_BYTES} bytes`);
+    expect(text).toContain('"code":"upstream_reset"');
+    expect(text).toContain("Upstream response stream terminated unexpectedly");
+    expect(text).not.toContain(`upstream SSE frame exceeded ${MAX_CLIENT_SSE_FRAME_BYTES} bytes`);
     expect(text).toContain("data: [DONE]");
     expect(upstream.signal.aborted).toBe(true);
   });
@@ -154,7 +156,9 @@ describe("client-facing SSE frame bounds", () => {
 
     expect(text.length).toBeLessThan(2048);
     expect(text).toContain("response.failed");
-    expect(text).toContain("socket reset after partial frame");
+    expect(text).toContain('"code":"upstream_reset"');
+    expect(text).toContain("Upstream response stream terminated unexpectedly");
+    expect(text).not.toContain("socket reset after partial frame");
     expect(text).toContain("data: [DONE]");
     expect(upstream.signal.aborted).toBe(true);
   });

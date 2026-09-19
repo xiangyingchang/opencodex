@@ -47,6 +47,7 @@ import { legacyCustomModelCatalogSlugs } from "../src/codex/custom-model-catalog
 import { resetCodexModelEntitlementCacheForTests } from "../src/codex/model-entitlements";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../src/codex/catalog/native-models";
 import { saveCodexAccountCredential } from "../src/codex/account-store";
+import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
 
 // The canonical-bytes case spawns real syncs and runs ~2.5s in isolation, on this
 // tree and on a clean baseline alike. That is half of bun's 5s default, but full
@@ -362,8 +363,9 @@ test("convergence drops unsupported bare native rows and never qualifies them", 
 
 test("convergence projects the observed Daybreak row onto its selector and one bare row", async () => {
   writeCatalog([nativeEntry()]);
+  const liveMainToken = fakeChatGptJwt({ exp: Math.floor(Date.now() / 1000) + 3_600 });
   writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-    tokens: { access_token: "main-token", account_id: "main-chatgpt-account" },
+    tokens: { access_token: liveMainToken, account_id: "main-chatgpt-account" },
   }));
   writeFileSync(join(codexHome, "models_cache.json"), JSON.stringify({
     models: [{
@@ -422,8 +424,9 @@ test("convergence projects the observed Daybreak row onto its selector and one b
 
 test("Direct convergence does not borrow a Pool-only Daybreak grant for the bare row", async () => {
   writeCatalog([nativeEntry()]);
+  const liveMainToken = fakeChatGptJwt({ exp: Math.floor(Date.now() / 1000) + 3_600 });
   writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-    tokens: { access_token: "main-token", account_id: "main-chatgpt-account" },
+    tokens: { access_token: liveMainToken, account_id: "main-chatgpt-account" },
   }));
   saveCodexAccountCredential("side-account-id", {
     accessToken: "side-token",

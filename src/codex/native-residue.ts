@@ -70,6 +70,16 @@ type PathResult =
   | { kind: "path"; path: string; stat: Stats }
   | { kind: "indeterminate"; reason: string };
 
+type PathIdentity = {
+  lstat: Stats;
+  realpath: string;
+};
+
+type PathIdentityResult =
+  | { kind: "absent" }
+  | { kind: "path"; identity: PathIdentity }
+  | { kind: "indeterminate"; reason: string };
+
 type CatalogTarget = {
   path: string;
   configured: boolean;
@@ -83,6 +93,7 @@ type ConfigObservation = {
 type RolloutReference = {
   id: string;
   path: string;
+  provider: RolloutProvider;
 };
 
 const CONFIG_FILE_NAME = basename(CODEX_CONFIG_PATH);
@@ -91,8 +102,14 @@ const CATALOG_FILE_NAME = basename(DEFAULT_CATALOG_PATH);
 const MODELS_CACHE_FILE_NAME = basename(CODEX_MODELS_CACHE_PATH);
 const JOURNAL_FILE_NAME = "opencodex-journal.json";
 const ROUTED_CATALOG_DESCRIPTION_PREFIX = "Routed via opencodex → ";
-const MAX_ROLLOUT_INSPECTION_BYTES = 64 * 1024 * 1024;
+const MAX_ROLLOUT_RECORD_BYTES = 16 * 1024 * 1024;
 const ROLLOUT_READ_CHUNK_BYTES = 64 * 1024;
+type RolloutProvider = "openai" | "opencodex" | "custom";
+const KNOWN_ROLLOUT_PROVIDERS: ReadonlySet<RolloutProvider> = new Set([
+  "openai",
+  "opencodex",
+  "custom",
+]);
 
 function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
@@ -110,7 +127,36 @@ function sameStat(
   return left.dev === right.dev
     && left.ino === right.ino
     && left.size === right.size
-    && left.mtimeMs === right.mtimeMs;
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+function samePathIdentity(
+  left: Stats,
+  right: Stats,
+): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+function capturePathIdentity(path: string): PathIdentityResult {
+  let lstat: Stats;
+  try {
+    lstat = lstatSync(path);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return { kind: "absent" };
+    return { kind: "indeterminate", reason: errorReason(error) };
+  }
+
+  try {
+    return { kind: "path", identity: { lstat, realpath: realpathSync.native(path) } };
+  } catch (error) {
+    return { kind: "indeterminate", reason: `unresolvable path: ${errorReason(error)}` };
+  }
 }
 
 function resolveRegularFile(path: string): PathResult {
@@ -185,31 +231,73 @@ function rolloutSessionMetaPayload(
   return { kind: "payload", payload: record.payload as Record<string, unknown> };
 }
 
+type RolloutMetadata = {
+  first: Record<string, unknown> | undefined;
+  latest: Record<string, unknown> | undefined;
+  hasOpenCodexProvider: boolean;
+  providers: Set<RolloutProvider>;
+};
+
+function isKnownRolloutProvider(provider: string): provider is RolloutProvider {
+  return KNOWN_ROLLOUT_PROVIDERS.has(provider as RolloutProvider);
+}
+
 function consumeRolloutLines(
   surface: "history" | "history-backup",
   path: string,
+  referenceId: string,
   partial: string,
-  first: Record<string, unknown> | undefined,
-  latest: Record<string, unknown> | undefined,
-): NativeRoutedResidueResult | { kind: "continue"; partial: string; first: Record<string, unknown> | undefined; latest: Record<string, unknown> | undefined } {
+  metadata: RolloutMetadata,
+): NativeRoutedResidueResult | { kind: "continue"; partial: string } {
   let rest = partial;
   let newline = rest.indexOf("\n");
   while (newline !== -1) {
     const line = rest.slice(0, newline);
     rest = rest.slice(newline + 1);
+    if (Buffer.byteLength(line, "utf8") > MAX_ROLLOUT_RECORD_BYTES) {
+      return indeterminate(
+        surface,
+        path,
+        `rollout JSONL record exceeds the ${MAX_ROLLOUT_RECORD_BYTES} byte limit`,
+      );
+    }
     if (line.trim()) {
       const payload = rolloutSessionMetaPayload(line);
       if (payload.kind === "malformed") {
         return indeterminate(surface, path, payload.reason);
       }
       if (payload.payload !== null) {
-        first ??= payload.payload;
-        latest = payload.payload;
+        if (typeof payload.payload.id !== "string" || !payload.payload.id) {
+          return indeterminate(surface, path, "session_meta has no thread metadata");
+        }
+        const provider = payload.payload.model_provider;
+        if (typeof provider !== "string" || !provider) {
+          return indeterminate(surface, path, "session_meta has no provider metadata");
+        }
+        if (!isKnownRolloutProvider(provider)) {
+          return indeterminate(surface, path, "session_meta has unknown provider metadata");
+        }
+        metadata.providers.add(provider);
+        if (provider === "opencodex") {
+          if (payload.payload.id !== referenceId) {
+            return indeterminate(surface, path, "session_meta does not identify the referenced thread");
+          }
+          metadata.hasOpenCodexProvider = true;
+        }
+        metadata.first ??= payload.payload;
+        metadata.latest = payload.payload;
       }
     }
     newline = rest.indexOf("\n");
   }
-  return { kind: "continue", partial: rest, first, latest };
+  if (Buffer.byteLength(rest, "utf8") > MAX_ROLLOUT_RECORD_BYTES) {
+    return indeterminate(
+      surface,
+      path,
+      `rollout JSONL record exceeds the ${MAX_ROLLOUT_RECORD_BYTES} byte limit`,
+    );
+  }
+  return { kind: "continue", partial: rest };
 }
 
 function classifyToml(
@@ -429,11 +517,29 @@ function classifyReferencedRollout(
   surface: "history" | "history-backup",
   reference: RolloutReference,
 ): NativeRoutedResidueResult {
+  const originalReference = capturePathIdentity(reference.path);
+  if (originalReference.kind === "absent") {
+    return indeterminate(surface, reference.path, "referenced rollout is absent");
+  }
+  if (originalReference.kind === "indeterminate") {
+    return indeterminate(surface, reference.path, originalReference.reason);
+  }
+
   const resolved = resolveRegularFile(reference.path);
   if (resolved.kind === "absent") {
     return indeterminate(surface, reference.path, "referenced rollout is absent");
   }
   if (resolved.kind === "indeterminate") return indeterminate(surface, reference.path, resolved.reason);
+
+  let resolvedTargetRealpath: string;
+  try {
+    resolvedTargetRealpath = realpathSync.native(resolved.path);
+  } catch (error) {
+    return indeterminate(surface, reference.path, `unresolvable resolved rollout target: ${errorReason(error)}`);
+  }
+  if (resolvedTargetRealpath !== originalReference.identity.realpath) {
+    return indeterminate(surface, reference.path, "rollout reference resolved to a different target before it was observed");
+  }
 
   let handle: number;
   try {
@@ -442,20 +548,20 @@ function classifyReferencedRollout(
     return indeterminate(surface, resolved.path, `unreadable rollout: ${errorReason(error)}`);
   }
 
-  let first: Record<string, unknown> | undefined;
-  let latest: Record<string, unknown> | undefined;
+  const rolloutMetadata: RolloutMetadata = {
+    first: undefined,
+    latest: undefined,
+    hasOpenCodexProvider: false,
+    providers: new Set(),
+  };
   let partial = "";
   let totalRead = 0;
   try {
     const opened = fstatSync(handle);
-    if (opened.size > MAX_ROLLOUT_INSPECTION_BYTES) {
-      return indeterminate(
-        surface,
-        resolved.path,
-        `referenced rollout exceeds the ${MAX_ROLLOUT_INSPECTION_BYTES} byte inspection limit`,
-      );
+    if (!sameStat(resolved.stat, opened)) {
+      return indeterminate(surface, resolved.path, "rollout changed before it was observed");
     }
-    const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+    const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
     const buffer = Buffer.allocUnsafe(ROLLOUT_READ_CHUNK_BYTES);
     while (totalRead < opened.size) {
       const remaining = Math.min(buffer.length, opened.size - totalRead);
@@ -468,35 +574,29 @@ function classifyReferencedRollout(
       }
       totalRead += count;
       partial += decoder.decode(buffer.subarray(0, count), { stream: true });
-      const consumed = consumeRolloutLines(surface, resolved.path, partial, first, latest);
+      const consumed = consumeRolloutLines(
+        surface,
+        resolved.path,
+        reference.id,
+        partial,
+        rolloutMetadata,
+      );
       if (consumed.kind !== "continue") return consumed;
       partial = consumed.partial;
-      first = consumed.first;
-      latest = consumed.latest;
     }
     partial += decoder.decode();
-    const consumed = consumeRolloutLines(surface, resolved.path, partial, first, latest);
+    const consumed = consumeRolloutLines(
+      surface,
+      resolved.path,
+      reference.id,
+      `${partial}\n`,
+      rolloutMetadata,
+    );
     if (consumed.kind !== "continue") return consumed;
     partial = consumed.partial;
-    first = consumed.first;
-    latest = consumed.latest;
-    if (partial.trim()) {
-      const payload = rolloutSessionMetaPayload(partial);
-      if (payload.kind === "malformed") {
-        return indeterminate(surface, resolved.path, payload.reason);
-      }
-      if (payload.payload !== null) {
-        first ??= payload.payload;
-        latest = payload.payload;
-      }
-    }
     const after = fstatSync(handle);
     if (!sameStat(resolved.stat, after)) {
       return indeterminate(surface, resolved.path, "rollout changed while it was being observed");
-    }
-    const pathAfter = statSync(resolved.path);
-    if (!sameStat(resolved.stat, pathAfter)) {
-      return indeterminate(surface, resolved.path, "rollout pathname was replaced while it was being observed");
     }
   } catch (error) {
     if (errorCode(error) === "ENOENT") {
@@ -511,6 +611,56 @@ function classifyReferencedRollout(
     }
   }
 
+  let currentReferenceLstat: Stats;
+  try {
+    currentReferenceLstat = lstatSync(reference.path);
+  } catch (error) {
+    const reason = errorCode(error) === "ENOENT"
+      ? "referenced rollout is absent"
+      : `rollout reference path is unreadable: ${errorReason(error)}`;
+    return indeterminate(surface, reference.path, reason);
+  }
+  if (!samePathIdentity(originalReference.identity.lstat, currentReferenceLstat)) {
+    return indeterminate(surface, reference.path, "rollout reference path was replaced while it was being observed");
+  }
+
+  let currentReferenceRealpath: string;
+  try {
+    currentReferenceRealpath = realpathSync.native(reference.path);
+  } catch (error) {
+    return indeterminate(surface, reference.path, `unresolvable rollout reference path: ${errorReason(error)}`);
+  }
+  if (currentReferenceRealpath !== originalReference.identity.realpath) {
+    return indeterminate(surface, reference.path, "rollout reference path resolved to a different target while it was being observed");
+  }
+  if (currentReferenceRealpath !== resolvedTargetRealpath) {
+    return indeterminate(surface, reference.path, "rollout resolved pathname changed while it was being observed");
+  }
+
+  let currentResolvedRealpath: string;
+  try {
+    currentResolvedRealpath = realpathSync.native(resolved.path);
+  } catch (error) {
+    return indeterminate(surface, reference.path, `unresolvable resolved rollout target: ${errorReason(error)}`);
+  }
+  if (currentResolvedRealpath !== resolvedTargetRealpath) {
+    return indeterminate(surface, reference.path, "rollout resolved target pathname changed while it was being observed");
+  }
+
+  let currentResolvedStat: Stats;
+  try {
+    currentResolvedStat = statSync(resolved.path);
+  } catch (error) {
+    return indeterminate(surface, reference.path, `unreadable resolved rollout target: ${errorReason(error)}`);
+  }
+  if (!currentResolvedStat.isFile()) {
+    return indeterminate(surface, reference.path, "resolved rollout target is no longer a regular file");
+  }
+  if (!sameStat(resolved.stat, currentResolvedStat)) {
+    return indeterminate(surface, reference.path, "rollout target was replaced while it was being observed");
+  }
+
+  const { first, latest } = rolloutMetadata;
   if (!first || !latest) {
     return indeterminate(surface, resolved.path, "referenced rollout has no session_meta metadata");
   }
@@ -533,8 +683,15 @@ function classifyReferencedRollout(
       return indeterminate(surface, resolved.path, `${position} session_meta does not identify the referenced thread`);
     }
   }
-  const hasOpenCodexProvider = metadata.some(([, payload]) => payload.model_provider === "opencodex");
-  return hasOpenCodexProvider
+  if (!rolloutMetadata.hasOpenCodexProvider && rolloutMetadata.providers.size > 1) {
+    return indeterminate(surface, resolved.path, "rollout has mixed provider metadata");
+  }
+  if (!rolloutMetadata.hasOpenCodexProvider
+    && reference.provider !== "opencodex"
+    && (rolloutMetadata.providers.size !== 1 || !rolloutMetadata.providers.has(reference.provider))) {
+    return indeterminate(surface, resolved.path, "referenced rollout provider does not match history provider");
+  }
+  return rolloutMetadata.hasOpenCodexProvider
     ? { kind: "residue", surface, path: resolved.path }
     : { kind: "clean" };
 }
@@ -574,6 +731,7 @@ function classifyHistoryDatabase(path: string): NativeRoutedResidueResult {
       SELECT id, rollout_path, model_provider
       FROM threads
     `).all();
+    const references: RolloutReference[] = [];
     for (const row of rows) {
       if (typeof row.id !== "string" || !row.id || typeof row.rollout_path !== "string" || !row.rollout_path) {
         return indeterminate("history", resolved.path, "history row has an unknown rollout reference");
@@ -581,11 +739,12 @@ function classifyHistoryDatabase(path: string): NativeRoutedResidueResult {
       if (typeof row.model_provider !== "string" || !row.model_provider) {
         return indeterminate("history", resolved.path, "history row has no provider metadata");
       }
+      if (!isKnownRolloutProvider(row.model_provider)) {
+        return indeterminate("history", resolved.path, "history row has unknown provider metadata");
+      }
+      references.push({ id: row.id, path: row.rollout_path, provider: row.model_provider });
     }
-    const rollouts = classifyReferencedRollouts(
-      "history",
-      rows.map(row => ({ id: row.id, path: row.rollout_path })),
-    );
+    const rollouts = classifyReferencedRollouts("history", references);
     if (rollouts.kind !== "clean") return rollouts;
     const after = statSync(resolved.path);
     if (!sameStat(resolved.stat, after)) {
@@ -644,7 +803,13 @@ function classifyHistoryBackup(path: string, stateDatabasePath: string): NativeR
       || typeof candidate.rolloutPath !== "string" || !candidate.rolloutPath) {
       return indeterminate("history-backup", read.path, "history backup entry has an unknown rollout reference");
     }
-    references.push({ id: candidate.id, path: candidate.rolloutPath });
+    if (typeof candidate.modelProvider !== "string" || !candidate.modelProvider) {
+      return indeterminate("history-backup", read.path, "history backup entry has no provider metadata");
+    }
+    if (!isKnownRolloutProvider(candidate.modelProvider)) {
+      return indeterminate("history-backup", read.path, "history backup entry has unknown provider metadata");
+    }
+    references.push({ id: candidate.id, path: candidate.rolloutPath, provider: candidate.modelProvider });
   }
   const rollouts = classifyReferencedRollouts("history-backup", references);
   if (rollouts.kind !== "clean") return rollouts;

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../src/codex/catalog/native-models";
+import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
 
 const repoRoot = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
 
@@ -382,6 +383,7 @@ describe("Codex catalog sync hardening", () => {
 
   test("account sync preserves an observed gated native only after the mapped account confirms it", () => {
     const catalogPath = join(codexHome, "catalog.json");
+    const liveMainToken = fakeChatGptJwt({ exp: Math.floor(Date.now() / 1000) + 3_600 });
     writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
     writeFileSync(catalogPath, JSON.stringify({
       models: [nativeEntry("gpt-5.5", 0)],
@@ -395,7 +397,7 @@ describe("Codex catalog sync hardening", () => {
       }],
     }, null, 2) + "\n");
     writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
-      tokens: { access_token: "main-token", account_id: "main-account" },
+      tokens: { access_token: liveMainToken, account_id: "main-account" },
     }), "utf8");
 
     const r = runScript(codexHome, opencodexHome, `

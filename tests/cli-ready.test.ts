@@ -653,7 +653,7 @@ describe("handleStart readinessGate wiring (source-level)", () => {
     expect(startMatch, "startServer must be called with readinessGate among its deps in the retry path").not.toBeNull();
 
     const syncMatch = cliSource.match(
-      /syncCodexOnStartIfEnabled\s*\(\s*port\s*,\s*config\s*,\s*undefined\s*,\s*readinessGate\s*\)/,
+      /syncCodexOnStartIfEnabled\s*\(\s*port\s*,\s*config\s*,\s*undefined\s*,\s*readinessGate\s*(?:,|\))/,
     );
     expect(syncMatch, "syncCodexOnStartIfEnabled must receive readinessGate so the startup sync drives /readyz").not.toBeNull();
 

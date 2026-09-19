@@ -1,4 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   accountBoundNativeOpenAiSlugs,
   accountBoundNativeDisplayName,
@@ -26,10 +30,80 @@ import type { OcxConfig } from "../src/types";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../src/codex/catalog/native-models";
 import {
   resetCodexModelEntitlementCacheForTests,
-  seedCodexModelEntitlementsForTests,
+  resolveCodexModelEntitlements,
 } from "../src/codex/model-entitlements";
+import { MAIN_CODEX_ACCOUNT_ID } from "../src/codex/main-account";
+import { saveCodexAccountCredential } from "../src/codex/account-store";
+import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
 
-afterEach(() => resetCodexModelEntitlementCacheForTests());
+let fixtureRoot = "";
+let previousCodexHome: string | undefined;
+let previousOpencodexHome: string | undefined;
+
+beforeEach(() => {
+  previousCodexHome = process.env.CODEX_HOME;
+  previousOpencodexHome = process.env.OPENCODEX_HOME;
+  fixtureRoot = mkdtempSync(join(tmpdir(), "ocx-native-model-toggle-"));
+  const codexHome = join(fixtureRoot, "codex");
+  const opencodexHome = join(fixtureRoot, "opencodex");
+  mkdirSync(codexHome);
+  mkdirSync(opencodexHome);
+  process.env.CODEX_HOME = codexHome;
+  process.env.OPENCODEX_HOME = opencodexHome;
+  resetCodexModelEntitlementCacheForTests();
+});
+
+afterEach(() => {
+  resetCodexModelEntitlementCacheForTests();
+  if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+  else process.env.CODEX_HOME = previousCodexHome;
+  if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
+  else process.env.OPENCODEX_HOME = previousOpencodexHome;
+  rmSync(fixtureRoot, { recursive: true, force: true });
+});
+
+function roster(...slugs: string[]): Response {
+  return Response.json({
+    models: slugs.map(slug => ({ slug, supported_in_api: true, visibility: "list" })),
+  });
+}
+
+async function seedMainEntitlement(model: string): Promise<void> {
+  const accountId = "main-chatgpt-account";
+  const accessToken = fakeChatGptJwt({ exp: Math.floor(Date.now() / 1000) + 3_600 });
+  writeFileSync(join(process.env.CODEX_HOME!, "auth.json"), JSON.stringify({
+    tokens: { access_token: accessToken, account_id: accountId },
+  }), "utf8");
+  await resolveCodexModelEntitlements({ codexAccounts: [] }, {
+    credentials: [{
+      accountId: MAIN_CODEX_ACCOUNT_ID,
+      accessToken,
+      chatgptAccountId: accountId,
+      credentialIdentity: `main:${accountId}:${createHash("sha256").update(accessToken).digest("hex")}`,
+    }],
+    fetcher: (async () => roster(model)) as typeof fetch,
+  });
+}
+
+async function seedPoolEntitlement(model: string): Promise<void> {
+  const accountId = "pool-a";
+  const chatgptAccountId = "pool-chatgpt-account";
+  saveCodexAccountCredential(accountId, {
+    accessToken: "pool-access-token",
+    refreshToken: "pool-refresh-token",
+    expiresAt: Date.now() + 3_600_000,
+    chatgptAccountId,
+  });
+  await resolveCodexModelEntitlements({ codexAccounts: [] }, {
+    credentials: [{
+      accountId,
+      accessToken: "pool-access-token",
+      chatgptAccountId,
+      credentialIdentity: `pool:1:${chatgptAccountId}`,
+    }],
+    fetcher: (async () => roster(model)) as typeof fetch,
+  });
+}
 
 function makeConfig(overrides: Partial<OcxConfig> = {}): OcxConfig {
   return { port: 10100, providers: {}, defaultProvider: "openai", ...overrides } as OcxConfig;
@@ -70,7 +144,7 @@ describe("native GPT model toggles (bare slugs in disabledModels)", () => {
     expect(filtered.length).toBe(all.length - 1);
   });
 
-  test("nativeModelRows hides account-gated ids until an authenticated roster confirms them", () => {
+  test("nativeModelRows hides account-gated ids until an authenticated roster confirms them", async () => {
     const rows = nativeModelRows({ disabledModels: ["gpt-5.6-sol"] });
     expect(rows.map(r => r.slug)).toEqual(
       NATIVE_OPENAI_MODELS.filter(slug => !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug)),
@@ -80,13 +154,13 @@ describe("native GPT model toggles (bare slugs in disabledModels)", () => {
     // Known context metadata rides along for the dashboard.
     expect(rows.find(r => r.slug === "gpt-5.6-sol")?.contextWindow).toBe(272_000);
 
-    seedCodexModelEntitlementsForTests("main", ["gpt-daybreak-blue-latest"]);
+    await seedMainEntitlement("gpt-daybreak-blue-latest");
     expect(nativeModelRows({ disabledModels: [] }).map(row => row.slug))
       .toContain("gpt-daybreak-blue-latest");
   });
 
-  test("Direct bare rows use only main entitlement while Pool may use any eligible account", () => {
-    seedCodexModelEntitlementsForTests("pool-a", ["gpt-daybreak-blue-latest"]);
+  test("Direct bare rows use only main entitlement while Pool may use any eligible account", async () => {
+    await seedPoolEntitlement("gpt-daybreak-blue-latest");
     const direct = makeConfig({
       providers: { openai: { authMode: "forward", codexAccountMode: "direct" } },
     });

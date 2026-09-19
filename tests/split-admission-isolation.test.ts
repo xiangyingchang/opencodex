@@ -152,14 +152,10 @@ describe("split admission isolation", () => {
 
     const response = await handler(postRequest("gpt-5.6-luna"));
     expect(response.status).toBe(200);
-    let streamError: unknown;
-    try {
-      await response.arrayBuffer();
-    } catch (error) {
-      streamError = error;
-    }
-    expect(streamError).toBeInstanceOf(Error);
-    expect((streamError as Error).message).toBe("upstream stream failed");
+    const bodyText = await response.text();
+    expect(bodyText).toContain("response.failed");
+    expect(bodyText).toContain("Upstream response stream terminated unexpectedly");
+    expect(bodyText).not.toContain("upstream stream failed");
 
     const health = await handler(new Request("http://127.0.0.1:10101/healthz"));
     const body = await health.json() as { admission?: { native?: { active?: number } } };

@@ -1,18 +1,26 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
+  ftruncateSync,
+  futimesSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   truncateSync,
   unlinkSync,
+  writeSync,
   writeFileSync,
 } from "node:fs";
+import * as nodeFs from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -89,7 +97,7 @@ function sessionMeta(id: string, modelProvider: string): string {
 }
 
 function createHistoryDatabase(
-  modelProvider: "openai" | "opencodex",
+  modelProvider: string,
   rolloutProviders: string[] = [modelProvider],
 ): void {
   writeFileSync(
@@ -670,6 +678,66 @@ test("a referenced rollout with native first and latest metadata is clean", () =
   expect(classifyNativeRoutedResidue()).toEqual({ kind: "clean" });
 });
 
+test("a homogeneous custom-only rollout is clean", () => {
+  createHistoryDatabase("custom", ["custom", "custom"]);
+
+  expect(classifyNativeRoutedResidue()).toEqual({ kind: "clean" });
+});
+
+test("a mixed custom and openai rollout is indeterminate", () => {
+  createHistoryDatabase("custom", ["custom", "openai"]);
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "indeterminate",
+    surface: "history",
+    path: pathInCodexHome("rollout.jsonl"),
+    reason: "rollout has mixed provider metadata",
+  });
+});
+
+test("an unknown rollout provider remains indeterminate", () => {
+  createHistoryDatabase("openai", ["unknown-provider"]);
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "indeterminate",
+    surface: "history",
+    path: pathInCodexHome("rollout.jsonl"),
+    reason: "session_meta has unknown provider metadata",
+  });
+});
+
+test("an unknown history row provider is indeterminate with a clean openai rollout", () => {
+  createHistoryDatabase("unknown-provider", ["openai"]);
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "indeterminate",
+    surface: "history",
+    path: canonicalPathInCodexHome("state_5.sqlite"),
+    reason: "history row has unknown provider metadata",
+  });
+});
+
+test("a custom history row with an openai rollout is an indeterminate mismatch", () => {
+  createHistoryDatabase("custom", ["openai"]);
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "indeterminate",
+    surface: "history",
+    path: pathInCodexHome("rollout.jsonl"),
+    reason: "referenced rollout provider does not match history provider",
+  });
+});
+
+test("an opencodex history row with a clean native rollout remains residue", () => {
+  createHistoryDatabase("opencodex", ["openai"]);
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "residue",
+    surface: "history",
+    path: canonicalPathInCodexHome("state_5.sqlite"),
+  });
+});
+
 test("native-only metadata with a mismatched thread id is not routed residue", () => {
   createHistoryDatabase("openai");
   writeFileSync(pathInCodexHome("rollout.jsonl"), sessionMeta("thread-2", "openai") + "\n");
@@ -706,6 +774,26 @@ test("a routed rollout with a non-ASCII id split across the read chunk is residu
   });
 });
 
+test("a streamable rollout over 64 MiB with native boundary metadata is clean", () => {
+  createHistoryDatabase("openai");
+  const rolloutPath = pathInCodexHome("rollout.jsonl");
+  const first = `${sessionMeta("thread-1", "openai")}\n`;
+  const last = `${sessionMeta("thread-1", "openai")}\n`;
+  const filler = `${JSON.stringify({
+    type: "event",
+    payload: { text: "x".repeat(1024) },
+  })}\n`;
+  const minimumBytes = 64 * 1024 * 1024 + 1;
+  const fillerCount = Math.ceil(
+    (minimumBytes - Buffer.byteLength(first) - Buffer.byteLength(last))
+      / Buffer.byteLength(filler),
+  );
+  writeFileSync(rolloutPath, first + filler.repeat(fillerCount) + last);
+
+  expect(statSync(rolloutPath).size).toBeGreaterThan(64 * 1024 * 1024);
+  expect(classifyNativeRoutedResidue()).toEqual({ kind: "clean" });
+});
+
 test("an oversized referenced rollout is indeterminate without being loaded", () => {
   createHistoryDatabase("openai");
   truncateSync(pathInCodexHome("rollout.jsonl"), 64 * 1024 * 1024 + 1);
@@ -714,7 +802,7 @@ test("an oversized referenced rollout is indeterminate without being loaded", ()
     kind: "indeterminate",
     surface: "history",
     path: pathInCodexHome("rollout.jsonl"),
-    reason: expect.stringContaining("inspection limit"),
+    reason: expect.stringContaining("record"),
   });
 });
 
@@ -789,6 +877,77 @@ test("a manifest-referenced routed rollout is residue", () => {
     kind: "residue",
     surface: "history-backup",
     path: pathInCodexHome("rollout.jsonl"),
+  });
+});
+
+test("an unknown history backup provider is indeterminate with a clean openai rollout", () => {
+  writeFileSync(pathInCodexHome("rollout.jsonl"), sessionMeta("thread-1", "openai") + "\n");
+  writeFileSync(historyBackupPath(), JSON.stringify({
+    version: 1,
+    stateDbPath: join(realpathSync.native(codexHome), "state_5.sqlite"),
+    entries: {
+      "thread-1": {
+        id: "thread-1",
+        rolloutPath: pathInCodexHome("rollout.jsonl"),
+        modelProvider: "unknown-provider",
+        source: "cli",
+        hasUserEvent: 1,
+      },
+    },
+  }));
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "indeterminate",
+    surface: "history-backup",
+    path: historyBackupPath(),
+    reason: "history backup entry has unknown provider metadata",
+  });
+});
+
+test("a custom history backup provider with an openai rollout is an indeterminate mismatch", () => {
+  writeFileSync(pathInCodexHome("rollout.jsonl"), sessionMeta("thread-1", "openai") + "\n");
+  writeFileSync(historyBackupPath(), JSON.stringify({
+    version: 1,
+    stateDbPath: join(realpathSync.native(codexHome), "state_5.sqlite"),
+    entries: {
+      "thread-1": {
+        id: "thread-1",
+        rolloutPath: pathInCodexHome("rollout.jsonl"),
+        modelProvider: "custom",
+        source: "cli",
+        hasUserEvent: 1,
+      },
+    },
+  }));
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "indeterminate",
+    surface: "history-backup",
+    path: pathInCodexHome("rollout.jsonl"),
+    reason: "referenced rollout provider does not match history provider",
+  });
+});
+
+test("an opencodex history backup provider with a clean native rollout remains residue", () => {
+  writeFileSync(pathInCodexHome("rollout.jsonl"), sessionMeta("thread-1", "openai") + "\n");
+  writeFileSync(historyBackupPath(), JSON.stringify({
+    version: 1,
+    stateDbPath: join(realpathSync.native(codexHome), "state_5.sqlite"),
+    entries: {
+      "thread-1": {
+        id: "thread-1",
+        rolloutPath: pathInCodexHome("rollout.jsonl"),
+        modelProvider: "opencodex",
+        source: "cli",
+        hasUserEvent: 1,
+      },
+    },
+  }));
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "residue",
+    surface: "history-backup",
+    path: historyBackupPath(),
   });
 });
 
@@ -882,6 +1041,101 @@ symlinkTest("an unresolvable surface symlink is indeterminate", () => {
     kind: "indeterminate",
     surface: "config",
   });
+});
+
+symlinkTest("a referenced rollout symlink replaced during observation is indeterminate", () => {
+  createHistoryDatabase("openai");
+  const rolloutPath = pathInCodexHome("rollout.jsonl");
+  const originalTarget = pathInCodexHome("rollout-original.jsonl");
+  const replacementTarget = pathInCodexHome("rollout-replacement.jsonl");
+  const replacementLink = pathInCodexHome("rollout-replacement-link.jsonl");
+  renameSync(rolloutPath, originalTarget);
+  writeFileSync(replacementTarget, sessionMeta("thread-1", "openai") + "\n");
+  symlinkSync(originalTarget, rolloutPath);
+  symlinkSync(replacementTarget, replacementLink);
+
+  const originalReadSync = nodeFs.readSync;
+  let replaced = false;
+  const readSpy = spyOn(nodeFs, "readSync").mockImplementation((...args) => {
+    if (!replaced) {
+      replaced = true;
+      renameSync(replacementLink, rolloutPath);
+    }
+    return originalReadSync(...args);
+  });
+
+  try {
+    expect(classifyNativeRoutedResidue()).toMatchObject({
+      kind: "indeterminate",
+      surface: "history",
+      path: rolloutPath,
+    });
+    expect(replaced).toBe(true);
+  } finally {
+    readSpy.mockRestore();
+  }
+});
+
+symlinkTest("an in-place rollout rewrite with restored mtime is indeterminate", () => {
+  createHistoryDatabase("openai");
+  const rolloutPath = pathInCodexHome("rollout.jsonl");
+  const rolloutTargetPath = pathInCodexHome("rollout-target.jsonl");
+  renameSync(rolloutPath, rolloutTargetPath);
+  symlinkSync(rolloutTargetPath, rolloutPath);
+
+  const originalContent = readFileSync(rolloutTargetPath);
+  const replacementContent = Buffer.from(
+    originalContent.toString("utf8").replace("00:00:00", "01:00:00"),
+  );
+  expect(replacementContent.byteLength).toBe(originalContent.byteLength);
+  const initialStat = statSync(rolloutTargetPath);
+  const normalizeHandle = openSync(rolloutTargetPath, "r+");
+  try {
+    futimesSync(
+      normalizeHandle,
+      Math.floor(initialStat.atimeMs) / 1000,
+      Math.floor(initialStat.mtimeMs) / 1000,
+    );
+  } finally {
+    closeSync(normalizeHandle);
+  }
+  const originalStat = statSync(rolloutTargetPath);
+  let rewritten = false;
+  const originalReadSync = nodeFs.readSync;
+  const readSpy = spyOn(nodeFs, "readSync").mockImplementation((...args) => {
+    const count = originalReadSync(...args);
+    if (!rewritten) {
+      rewritten = true;
+      const handle = openSync(rolloutTargetPath, "r+");
+      try {
+        ftruncateSync(handle, 0);
+        expect(writeSync(handle, replacementContent, 0, replacementContent.byteLength, 0))
+          .toBe(replacementContent.byteLength);
+        futimesSync(handle, originalStat.atimeMs / 1000, originalStat.mtimeMs / 1000);
+      } finally {
+        closeSync(handle);
+      }
+    }
+    return count;
+  });
+
+  try {
+    expect(classifyNativeRoutedResidue()).toMatchObject({
+      kind: "indeterminate",
+      surface: "history",
+      path: realpathSync.native(rolloutTargetPath),
+    });
+    expect(rewritten).toBe(true);
+    const rewrittenStat = statSync(rolloutTargetPath);
+    expect(rewrittenStat.ino).toBe(originalStat.ino);
+    expect(rewrittenStat.size).toBe(originalStat.size);
+    // APFS may quantize futimesSync to the nearest millisecond; the ctime
+    // assertion is the identity signal that must catch the equal-length rewrite.
+    expect(Math.abs(rewrittenStat.mtimeMs - originalStat.mtimeMs)).toBeLessThanOrEqual(1);
+    expect(rewrittenStat.ctimeMs).not.toBe(originalStat.ctimeMs);
+  } finally {
+    readSpy.mockRestore();
+  }
 });
 
 test("an empty CODEX_HOME is clean and coordinator initialization succeeds", () => {

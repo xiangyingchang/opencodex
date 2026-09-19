@@ -341,11 +341,21 @@ function waitForBackgroundShellClose(entry: BackgroundShellEntry): Promise<boole
     // serializeMutation wait timers). The timer self-clears within the
     // 2-second grace window (or earlier on close), so a ref cannot keep the
     // process alive beyond that bound.
-    const timer = backgroundShellRuntime.setTimer(() => {
-      if (settled) return;
+    let timer: BackgroundShellTimer;
+    try {
+      timer = backgroundShellRuntime.setTimer(() => {
+        if (settled) return;
+        settled = true;
+        resolveWait(false);
+      }, CURSOR_BACKGROUND_SHELL_TERM_GRACE_MS);
+    } catch {
+      // A timer failure must not reject the shutdown drain. Treat it as an
+      // unresolved kill attempt so the caller can continue to stop the server;
+      // the child close event still owns final registry/lease release.
       settled = true;
       resolveWait(false);
-    }, CURSOR_BACKGROUND_SHELL_TERM_GRACE_MS);
+      return;
+    }
     void entry.closePromise.then(() => {
       if (settled) return;
       settled = true;

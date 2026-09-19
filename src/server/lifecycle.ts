@@ -140,7 +140,14 @@ export interface ShutdownPhaseRunResult {
 type ShutdownPhaseOutcome = "completed" | "timed-out" | "failed";
 
 function startShutdownPhase(phase: ShutdownPhase): Promise<void> {
-  return Promise.resolve().then(() => phase.run());
+  // Start cleanup synchronously so a phase detached after the absolute deadline is
+  // still actually attempted before the shutdown flight resolves. Promise.resolve()
+  // keeps both synchronous throws and async results in the same failure channel.
+  try {
+    return Promise.resolve(phase.run());
+  } catch (error) {
+    return Promise.reject(error);
+  }
 }
 
 /**
@@ -233,6 +240,7 @@ export function resetLifecycleDrainStateForTests(): void {
   for (const resolve of temporaryDrainWaiters) resolve();
   temporaryDrainWaiters.clear();
   shutdownDraining = false;
+  recyclingForExit = false;
   shutdownFlight = undefined;
   serverStopFlights = new WeakMap<ReturnType<typeof Bun.serve>, Promise<void>>();
   serverStartupReleaseFlights = new WeakMap<ReturnType<typeof Bun.serve>, Promise<void>>();
@@ -418,7 +426,14 @@ export function stopServerListener(
   if (existing) return existing;
   // Bun's Server.stop returns Promise<void>; fire-and-forget races a
   // follow-on listen and can leave the replacement seeing the old proxy.
-  const flight = Promise.resolve().then(() => server.stop(true));
+  let flight: Promise<void>;
+  try {
+    // Invoke stop before returning even when the caller has exhausted its
+    // deadline. The returned promise remains the shared completion flight.
+    flight = Promise.resolve(server.stop(true));
+  } catch (error) {
+    flight = Promise.reject(error);
+  }
   serverStopFlights.set(server, flight);
   return flight;
 }
@@ -430,7 +445,12 @@ export function releaseServerStartupLifecycle(
   if (!server) return Promise.resolve();
   const existing = serverStartupReleaseFlights.get(server);
   if (existing) return existing;
-  const flight = Promise.resolve().then(() => releaseServerStartupLifecycleImpl(server));
+  let flight: Promise<void>;
+  try {
+    flight = Promise.resolve(releaseServerStartupLifecycleImpl(server));
+  } catch (error) {
+    flight = Promise.reject(error);
+  }
   serverStartupReleaseFlights.set(server, flight);
   return flight;
 }

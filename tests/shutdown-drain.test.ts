@@ -274,7 +274,7 @@ describe("background shell shutdown drain", () => {
     const child = installShutdownShell();
     const fake = fakeServer();
     let settled = false;
-    const draining = drainAndShutdown(fake.server, 0).then(() => { settled = true; });
+    const draining = drainAndShutdown(fake.server, 3_000).then(() => { settled = true; });
     await Promise.resolve();
     await Promise.resolve();
     expect(settled).toBe(false);
@@ -305,6 +305,7 @@ describe("background shell shutdown drain", () => {
     expect(backgroundShellAdmissionMetrics().active).toBe(1);
     unresolvedChild.emit("close", 0, null);
     await resetBackgroundShellStateForTests();
+    resetLifecycleDrainStateForTests();
 
     const rejectedChild = installShutdownShell();
     setBackgroundShellRuntimeForTests({
