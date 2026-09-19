@@ -94,6 +94,7 @@ type RolloutReference = {
   id: string;
   path: string;
   provider: RolloutProvider;
+  allowMissingEmptyVscodePlaceholder: boolean;
 };
 
 const CONFIG_FILE_NAME = basename(CODEX_CONFIG_PATH);
@@ -519,7 +520,9 @@ function classifyReferencedRollout(
 ): NativeRoutedResidueResult {
   const originalReference = capturePathIdentity(reference.path);
   if (originalReference.kind === "absent") {
-    return indeterminate(surface, reference.path, "referenced rollout is absent");
+    return surface === "history" && reference.allowMissingEmptyVscodePlaceholder
+      ? { kind: "clean" }
+      : indeterminate(surface, reference.path, "referenced rollout is absent");
   }
   if (originalReference.kind === "indeterminate") {
     return indeterminate(surface, reference.path, originalReference.reason);
@@ -734,8 +737,16 @@ function classifyHistoryDatabase(path: string): NativeRoutedResidueResult {
     const uri = pathToFileURL(resolved.path).href + "?immutable=1";
     database = new Database(uri, constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI);
     database.exec("PRAGMA busy_timeout = 100");
-    const rows = database.query<{ id: string; rollout_path: string; model_provider: string }, []>(`
-      SELECT id, rollout_path, model_provider
+    const rows = database.query<{
+      id: string;
+      rollout_path: string;
+      model_provider: string;
+      source: string;
+      has_user_event: number;
+      tokens_used: number;
+      first_user_message: string | null;
+    }, []>(`
+      SELECT id, rollout_path, model_provider, source, has_user_event, tokens_used, first_user_message
       FROM threads
     `).all();
     const references: RolloutReference[] = [];
@@ -749,7 +760,16 @@ function classifyHistoryDatabase(path: string): NativeRoutedResidueResult {
       if (!isKnownRolloutProvider(row.model_provider)) {
         return indeterminate("history", resolved.path, "history row has unknown provider metadata");
       }
-      references.push({ id: row.id, path: row.rollout_path, provider: row.model_provider });
+      references.push({
+        id: row.id,
+        path: row.rollout_path,
+        provider: row.model_provider,
+        allowMissingEmptyVscodePlaceholder: row.model_provider === "openai"
+          && row.source === "vscode"
+          && row.has_user_event === 0
+          && row.tokens_used === 0
+          && (row.first_user_message === null || row.first_user_message === ""),
+      });
     }
     const rollouts = classifyReferencedRollouts("history", references);
     if (rollouts.kind !== "clean") return rollouts;
@@ -816,7 +836,12 @@ function classifyHistoryBackup(path: string, stateDatabasePath: string): NativeR
     if (!isKnownRolloutProvider(candidate.modelProvider)) {
       return indeterminate("history-backup", read.path, "history backup entry has unknown provider metadata");
     }
-    references.push({ id: candidate.id, path: candidate.rolloutPath, provider: candidate.modelProvider });
+    references.push({
+      id: candidate.id,
+      path: candidate.rolloutPath,
+      provider: candidate.modelProvider,
+      allowMissingEmptyVscodePlaceholder: false,
+    });
   }
   const rollouts = classifyReferencedRollouts("history-backup", references);
   if (rollouts.kind !== "clean") return rollouts;

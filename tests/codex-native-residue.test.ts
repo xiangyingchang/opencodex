@@ -96,8 +96,19 @@ function sessionMeta(id: string, modelProvider: string): string {
   });
 }
 
+type HistoryDatabaseRow = {
+  id: string;
+  modelProvider: string;
+  rolloutProviders?: string[];
+  rolloutPath?: string;
+  source?: string;
+  firstUserMessage?: string;
+  hasUserEvent?: number;
+  tokensUsed?: number;
+};
+
 function createHistoryDatabaseRows(
-  rows: Array<{ id: string; modelProvider: string; rolloutProviders: string[] }>,
+  rows: HistoryDatabaseRow[],
 ): void {
   const database = new Database(pathInCodexHome("state_5.sqlite"));
   database.exec(`
@@ -107,22 +118,33 @@ function createHistoryDatabaseRows(
       model_provider TEXT NOT NULL,
       source TEXT NOT NULL,
       first_user_message TEXT NOT NULL,
-      has_user_event INTEGER NOT NULL DEFAULT 0
+      has_user_event INTEGER NOT NULL DEFAULT 0,
+      tokens_used INTEGER NOT NULL DEFAULT 0
     )
   `);
   for (const row of rows) {
-    const rolloutPath = pathInCodexHome(
+    const rolloutPath = row.rolloutPath ?? pathInCodexHome(
       row.id === "thread-1" ? "rollout.jsonl" : `${row.id}.rollout.jsonl`,
     );
-    writeFileSync(
-      rolloutPath,
-      row.rolloutProviders.map(provider => sessionMeta(row.id, provider)).join("\n") + "\n",
-    );
+    if (row.rolloutProviders !== undefined) {
+      writeFileSync(
+        rolloutPath,
+        row.rolloutProviders.map(provider => sessionMeta(row.id, provider)).join("\n") + "\n",
+      );
+    }
     database.query(`
       INSERT INTO threads (
-        id, rollout_path, model_provider, source, first_user_message, has_user_event
-      ) VALUES (?, ?, ?, 'cli', 'routed history', 1)
-    `).run(row.id, rolloutPath, row.modelProvider);
+        id, rollout_path, model_provider, source, first_user_message, has_user_event, tokens_used
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      row.id,
+      rolloutPath,
+      row.modelProvider,
+      row.source ?? "cli",
+      row.firstUserMessage ?? "routed history",
+      row.hasUserEvent ?? 1,
+      row.tokensUsed ?? 0,
+    );
   }
   database.close();
 }
@@ -773,6 +795,110 @@ test("an authorized custom/openai row cannot mask another history mismatch", () 
   });
 });
 
+test("an empty vscode/openai placeholder with a missing rollout is clean", () => {
+  const missingPath = pathInCodexHome("missing-rollout.jsonl");
+  createHistoryDatabaseRows([{
+    id: "thread-1",
+    modelProvider: "openai",
+    rolloutPath: missingPath,
+    source: "vscode",
+    firstUserMessage: "",
+    hasUserEvent: 0,
+    tokensUsed: 0,
+  }]);
+
+  expect(lstatSync(missingPath, { throwIfNoEntry: false })).toBeUndefined();
+  expect(classifyNativeRoutedResidue()).toEqual({ kind: "clean" });
+});
+
+const missingPlaceholderBoundaries: Array<{
+  name: string;
+  row: Partial<HistoryDatabaseRow>;
+}> = [
+  { name: "a user event", row: { hasUserEvent: 1 } },
+  { name: "a non-zero tokens", row: { tokensUsed: 1 } },
+  { name: "a non-empty first message", row: { firstUserMessage: "hello" } },
+  { name: "a whitespace first message", row: { firstUserMessage: " " } },
+  { name: "a non-vscode source", row: { source: "cli" } },
+  { name: "a non-openai provider", row: { modelProvider: "custom" } },
+];
+
+for (const boundary of missingPlaceholderBoundaries) {
+  test(`a missing rollout with ${boundary.name} remains indeterminate`, () => {
+    const missingPath = pathInCodexHome("missing-rollout.jsonl");
+    createHistoryDatabaseRows([{
+      id: "thread-1",
+      modelProvider: "openai",
+      rolloutPath: missingPath,
+      source: "vscode",
+      firstUserMessage: "",
+      hasUserEvent: 0,
+      tokensUsed: 0,
+      ...boundary.row,
+    }]);
+
+    expect(classifyNativeRoutedResidue()).toMatchObject({
+      kind: "indeterminate",
+      surface: "history",
+      path: missingPath,
+    });
+  });
+}
+
+test("an allowed empty vscode/openai placeholder cannot mask another history mismatch", () => {
+  const missingPath = pathInCodexHome("missing-rollout.jsonl");
+  createHistoryDatabaseRows([
+    {
+      id: "thread-1",
+      modelProvider: "openai",
+      rolloutPath: missingPath,
+      source: "vscode",
+      firstUserMessage: "",
+      hasUserEvent: 0,
+      tokensUsed: 0,
+    },
+    { id: "thread-2", modelProvider: "openai", rolloutProviders: ["custom"] },
+  ]);
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "indeterminate",
+    surface: "history",
+    path: pathInCodexHome("thread-2.rollout.jsonl"),
+    reason: "referenced rollout provider does not match history provider",
+  });
+});
+
+test("an allowed empty vscode/openai placeholder cannot mask another disallowed missing row", () => {
+  const allowedMissingPath = pathInCodexHome("allowed-missing-rollout.jsonl");
+  const disallowedMissingPath = pathInCodexHome("disallowed-missing-rollout.jsonl");
+  createHistoryDatabaseRows([
+    {
+      id: "thread-1",
+      modelProvider: "openai",
+      rolloutPath: allowedMissingPath,
+      source: "vscode",
+      firstUserMessage: "",
+      hasUserEvent: 0,
+      tokensUsed: 0,
+    },
+    {
+      id: "thread-2",
+      modelProvider: "openai",
+      rolloutPath: disallowedMissingPath,
+      source: "cli",
+      firstUserMessage: "",
+      hasUserEvent: 0,
+      tokensUsed: 0,
+    },
+  ]);
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "indeterminate",
+    surface: "history",
+    path: disallowedMissingPath,
+  });
+});
+
 test("an opencodex history row with a clean native rollout remains residue", () => {
   createHistoryDatabase("opencodex", ["openai"]);
 
@@ -996,7 +1122,7 @@ test("an opencodex history backup provider with a clean native rollout remains r
   });
 });
 
-test("a missing manifest-referenced rollout is indeterminate", () => {
+test("a missing manifest-referenced rollout is indeterminate even with empty vscode/openai-like metadata", () => {
   writeFileSync(historyBackupPath(), JSON.stringify({
     version: 1,
     stateDbPath: join(realpathSync.native(codexHome), "state_5.sqlite"),
@@ -1005,8 +1131,8 @@ test("a missing manifest-referenced rollout is indeterminate", () => {
         id: "thread-1",
         rolloutPath: pathInCodexHome("missing-rollout.jsonl"),
         modelProvider: "openai",
-        source: "cli",
-        hasUserEvent: 1,
+        source: "vscode",
+        hasUserEvent: 0,
       },
     },
   }));
@@ -1245,7 +1371,8 @@ test("a checkpointed WAL-mode history database without sidecars is classified sa
     model_provider TEXT NOT NULL,
     source TEXT NOT NULL,
     first_user_message TEXT NOT NULL,
-    has_user_event INTEGER NOT NULL DEFAULT 0
+    has_user_event INTEGER NOT NULL DEFAULT 0,
+    tokens_used INTEGER NOT NULL DEFAULT 0
   )`);
   writeFileSync(
     pathInCodexHome("rollout.jsonl"),
