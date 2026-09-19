@@ -45,9 +45,20 @@ function commandResult(run: typeof runLaunchctl, args: string[]): ReturnType<typ
   return run(args);
 }
 
+function loadedFromPlist(run: typeof runLaunchctl, plistPath: string): boolean {
+  const result = commandResult(run, ["print", launchdGuiDomain() + "/com.opencodex.split-bridge"]);
+  return result.ok && `${result.stdout}\n${result.stderr}`.includes(`path = ${plistPath}`);
+}
+
 function bootstrap(run: typeof runLaunchctl, plistPath: string): void {
   const result = commandResult(run, ["bootstrap", launchdGuiDomain(), plistPath]);
-  if (!result.ok) throw new Error("launchctl could not bootstrap split bridge: " + (result.stderr || "operation failed"));
+  // launchctl can return status 5 after it has already registered the job. This
+  // is common during a bootout/bootstrap replacement on macOS: treating the raw
+  // exit code as authoritative makes repair report failure while the process is
+  // actually running. Confirm the postcondition before rolling back.
+  if (!result.ok && !waitForLoadedFromPlist(run, plistPath)) {
+    throw new Error("launchctl could not bootstrap split bridge: " + (result.stderr || "operation failed"));
+  }
 }
 
 function bootout(run: typeof runLaunchctl): void {
@@ -55,9 +66,33 @@ function bootout(run: typeof runLaunchctl): void {
   if (!result.ok && result.status !== 3 && result.status !== 112 && result.status !== 113) {
     throw new Error("launchctl could not stop split bridge: " + (result.stderr || "operation failed"));
   }
+  if (!waitForUnloaded(run)) {
+    throw new Error("launchctl did not finish stopping split bridge before replacement");
+  }
 }
 
 let plistWriteSequence = 0;
+const BOOTSTRAP_CONFIRM_ATTEMPTS = 20;
+const BOOTSTRAP_CONFIRM_DELAY_MS = 100;
+const BOOTOUT_SETTLE_ATTEMPTS = 20;
+const BOOTOUT_SETTLE_DELAY_MS = 100;
+
+function waitForLoadedFromPlist(run: typeof runLaunchctl, plistPath: string): boolean {
+  for (let attempt = 0; attempt < BOOTSTRAP_CONFIRM_ATTEMPTS; attempt += 1) {
+    if (loadedFromPlist(run, plistPath)) return true;
+    if (attempt + 1 < BOOTSTRAP_CONFIRM_ATTEMPTS) Bun.sleepSync(BOOTSTRAP_CONFIRM_DELAY_MS);
+  }
+  return false;
+}
+
+function waitForUnloaded(run: typeof runLaunchctl): boolean {
+  for (let attempt = 0; attempt < BOOTOUT_SETTLE_ATTEMPTS; attempt += 1) {
+    const result = commandResult(run, ["print", launchdGuiDomain() + "/com.opencodex.split-bridge"]);
+    if (!result.ok && (result.status === 3 || result.status === 112 || result.status === 113)) return true;
+    if (attempt + 1 < BOOTOUT_SETTLE_ATTEMPTS) Bun.sleepSync(BOOTOUT_SETTLE_DELAY_MS);
+  }
+  return false;
+}
 
 function writePlistAtomically(plistPath: string, content: string): void {
   const tempPath = `${plistPath}.ocx.${process.pid}.${++plistWriteSequence}.tmp`;

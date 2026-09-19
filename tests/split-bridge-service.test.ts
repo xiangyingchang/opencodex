@@ -75,6 +75,43 @@ describe("split bridge LaunchAgent lifecycle", () => {
     expect(calls.some(args => args[0] === "bootout")).toBe(true);
   });
 
+  test("accepts a bootstrap I/O error when launchd already loaded the current plist", () => {
+    root = mkdtempSync(join(tmpdir(), "ocx-split-service-bootstrap-race-"));
+    let active = false;
+    let expectedPlistPath = "";
+    let bootstrapCalls = 0;
+    const options: SplitBridgeLaunchAgentOptions = {
+      bunPath: "/tmp/bun",
+      cliPath: "/tmp/cli.ts",
+      nativeBaseUrl: "https://chatgpt.com/backend-api/codex",
+      gatewayBaseUrl: "http://127.0.0.1:10100/v1",
+      admissionTokenFile: join(root, "split-token"),
+      standardOutPath: join(root, "bridge.log"),
+      standardErrorPath: join(root, "bridge-error.log"),
+    };
+    writeFileSync(options.admissionTokenFile, "bridge-secret\n", { mode: 0o600 });
+    const launchctl = (args: string[]) => {
+      if (args[0] === "bootstrap") {
+        bootstrapCalls++;
+        active = true;
+        return { ok: false, stdout: "", stderr: "Bootstrap failed: 5: Input/output error", status: 5 };
+      }
+      if (args[0] === "bootout") {
+        const wasActive = active;
+        active = false;
+        return { ok: wasActive, stdout: "", stderr: wasActive ? "" : "not loaded", status: wasActive ? 0 : 3 };
+      }
+      return active
+        ? { ok: true, stdout: `path = ${expectedPlistPath}\npid = 7373\n--split-plist-digest=${splitBridgeLaunchAgentDigest(options)}`, stderr: "", status: 0 }
+        : { ok: false, stdout: "", stderr: "not loaded", status: 3 };
+    };
+    const deps = { home: root, configDir: join(root, "config"), launchctl, launchAgentOptions: options };
+    expectedPlistPath = join(root, "Library", "LaunchAgents", "com.opencodex.split-bridge.plist");
+
+    expect(installSplitBridgeService(deps)).toMatchObject({ installed: true, loaded: true, matchesPlist: true, pid: 7373 });
+    expect(bootstrapCalls).toBe(1);
+  });
+
   test("status rejects stale plist contents and load repairs the loaded job", () => {
     root = mkdtempSync(join(tmpdir(), "ocx-split-service-stale-"));
     let active = false;
