@@ -96,14 +96,9 @@ function sessionMeta(id: string, modelProvider: string): string {
   });
 }
 
-function createHistoryDatabase(
-  modelProvider: string,
-  rolloutProviders: string[] = [modelProvider],
+function createHistoryDatabaseRows(
+  rows: Array<{ id: string; modelProvider: string; rolloutProviders: string[] }>,
 ): void {
-  writeFileSync(
-    pathInCodexHome("rollout.jsonl"),
-    rolloutProviders.map(provider => sessionMeta("thread-1", provider)).join("\n") + "\n",
-  );
   const database = new Database(pathInCodexHome("state_5.sqlite"));
   database.exec(`
     CREATE TABLE threads (
@@ -115,12 +110,32 @@ function createHistoryDatabase(
       has_user_event INTEGER NOT NULL DEFAULT 0
     )
   `);
-  database.query(`
-    INSERT INTO threads (
-      id, rollout_path, model_provider, source, first_user_message, has_user_event
-    ) VALUES (?, ?, ?, 'cli', 'routed history', 1)
-  `).run("thread-1", pathInCodexHome("rollout.jsonl"), modelProvider);
+  for (const row of rows) {
+    const rolloutPath = pathInCodexHome(
+      row.id === "thread-1" ? "rollout.jsonl" : `${row.id}.rollout.jsonl`,
+    );
+    writeFileSync(
+      rolloutPath,
+      row.rolloutProviders.map(provider => sessionMeta(row.id, provider)).join("\n") + "\n",
+    );
+    database.query(`
+      INSERT INTO threads (
+        id, rollout_path, model_provider, source, first_user_message, has_user_event
+      ) VALUES (?, ?, ?, 'cli', 'routed history', 1)
+    `).run(row.id, rolloutPath, row.modelProvider);
+  }
   database.close();
+}
+
+function createHistoryDatabase(
+  modelProvider: string,
+  rolloutProviders: string[] = [modelProvider],
+): void {
+  createHistoryDatabaseRows([{
+    id: "thread-1",
+    modelProvider,
+    rolloutProviders,
+  }]);
 }
 
 function historyBackupPath(): string {
@@ -717,13 +732,43 @@ test("an unknown history row provider is indeterminate with a clean openai rollo
   });
 });
 
-test("a custom history row with an openai rollout is an indeterminate mismatch", () => {
-  createHistoryDatabase("custom", ["openai"]);
+test("an openai history row with a custom rollout is an indeterminate mismatch", () => {
+  createHistoryDatabase("openai", ["custom"]);
 
   expect(classifyNativeRoutedResidue()).toMatchObject({
     kind: "indeterminate",
     surface: "history",
     path: pathInCodexHome("rollout.jsonl"),
+    reason: "referenced rollout provider does not match history provider",
+  });
+});
+
+test("a custom history row with only native openai rollout metadata is clean", () => {
+  createHistoryDatabase("custom", ["openai", "openai"]);
+
+  expect(classifyNativeRoutedResidue()).toEqual({ kind: "clean" });
+});
+
+test("a custom history row with mixed openai and opencodex metadata remains residue", () => {
+  createHistoryDatabase("custom", ["openai", "opencodex"]);
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "residue",
+    surface: "history",
+    path: pathInCodexHome("rollout.jsonl"),
+  });
+});
+
+test("an authorized custom/openai row cannot mask another history mismatch", () => {
+  createHistoryDatabaseRows([
+    { id: "thread-1", modelProvider: "custom", rolloutProviders: ["openai", "openai"] },
+    { id: "thread-2", modelProvider: "openai", rolloutProviders: ["custom"] },
+  ]);
+
+  expect(classifyNativeRoutedResidue()).toMatchObject({
+    kind: "indeterminate",
+    surface: "history",
+    path: pathInCodexHome("thread-2.rollout.jsonl"),
     reason: "referenced rollout provider does not match history provider",
   });
 });

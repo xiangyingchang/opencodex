@@ -686,7 +686,14 @@ function classifyReferencedRollout(
   if (!rolloutMetadata.hasOpenCodexProvider && rolloutMetadata.providers.size > 1) {
     return indeterminate(surface, resolved.path, "rollout has mixed provider metadata");
   }
+  const authorizedCustomHistoryException = surface === "history"
+    && reference.provider === "custom"
+    && !rolloutMetadata.hasOpenCodexProvider
+    && metadata.every(([, payload]) => payload.model_provider === "openai")
+    && rolloutMetadata.providers.size === 1
+    && rolloutMetadata.providers.has("openai");
   if (!rolloutMetadata.hasOpenCodexProvider
+    && !authorizedCustomHistoryException
     && reference.provider !== "opencodex"
     && (rolloutMetadata.providers.size !== 1 || !rolloutMetadata.providers.has(reference.provider))) {
     return indeterminate(surface, resolved.path, "referenced rollout provider does not match history provider");
